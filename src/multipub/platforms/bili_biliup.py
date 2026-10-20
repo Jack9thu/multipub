@@ -1,0 +1,491 @@
+"""biliup 命令行（B站视频上传引擎）的安装、调用与输出解析。
+
+- 版本固定为 settings.biliup_version（默认 v1.3.1），装在 <tools_dir>/biliup/<版本>/；
+  settings.biliup_path 指定时直接用它，不下载。
+- 只有 `mpub setup` 会下载；已装好的版本永不自动更新。
+- 下载后计算压缩包 sha256：内置了 v1.3.1 各平台压缩包的校验值，不一致直接拒绝；
+  其他版本首次下载时记录（trust-on-first-use），写在二进制旁边的 install.json / *.sha256。
+- 命令行参数按 biliup v1.3.1 源码（crates/biliup-cli/src/cli.rs、
+  crates/biliup/src/uploader/bilibili.rs 的 Studio）核对过；全局参数必须写在子命令前面。
+
+本模块只依赖标准库（httpx 在下载时才导入），主进程可以导入。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import platform as _platform
+import re
+import subprocess
+import sys
+import tarfile
+import time
+import zipfile
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable
+
+from ..config import Settings
+
+GITHUB_DOWNLOAD = "https://github.com/biliup/biliup/releases/download/{version}/{asset}"
+
+# 2026-10-20 两次独立下载 github.com/biliup/biliup/releases/download/v1.3.1/ 核对过
+KNOWN_SHA256: dict[str, str] = {
+    "biliupR-v1.3.1-x86_64-windows.zip": "b177488823204e32db1fdb2a81c6bfcc4ffc58b2d47b14831ead4f83adc6401f",
+    "biliupR-v1.3.1-x86_64-linux.tar.xz": "e55cdefc66606fb326c738be45e5740b575c21e9ad9ed7c12f83897c8dd683d3",
+    "biliupR-v1.3.1-x86_64-linux-musl.tar.xz": "5ca2146a97061a478eb537569dea7fb84dc8bbcba77c32da6fa7d46409d8ae45",
+    "biliupR-v1.3.1-aarch64-linux.tar.xz": "b2526e8d7ea2d4689e77226b3fcbbff9c3506a6aa7e5d00baeddd87977ce72c3",
+    "biliupR-v1.3.1-arm-linux.tar.xz": "b027127a71f9d03c57a6543ffc8f521b5d78239a39fa90e4e0e84a852d7194d9",
+    "biliupR-v1.3.1-x86_64-macos.tar.xz": "bd46266cdf8b7fdd47a4c9a933f7e39c66edc1f898acb99de8fa66fc1457163d",
+    "biliupR-v1.3.1-aarch64-macos.tar.xz": "443b5e07f4b6eead71a6fad5a0b103e6959e23a10baafe343b5a40f36a97d594",
+}
+
+# (系统, 架构) -> 发布包后缀。Windows ARM 没有原生包，用 x86_64 版（系统自带转译）
+ASSET_SUFFIXES: dict[tuple[str, str], str] = {
+    ("windows", "x86_64"): "x86_64-windows.zip",
+    ("windows", "aarch64"): "x86_64-windows.zip",
+    ("linux", "x86_64"): "x86_64-linux.tar.xz",
+    ("linux", "aarch64"): "aarch64-linux.tar.xz",
+    ("linux", "arm"): "arm-linux.tar.xz",
+    ("macos", "x86_64"): "x86_64-macos.tar.xz",
+    ("macos", "aarch64"): "aarch64-macos.tar.xz",
+}
+
+SUBMIT_CHOICES = ("app", "web", "b-cut-android")
+LINE_CHOICES = ("bldsa", "cnbldsa", "andsa", "atdsa", "bda2", "cnbd", "anbd", "atbd",
+                "tx", "cntx", "antx", "attx", "txa", "alia", "estx", "akbd")
+
+
+class BiliupError(RuntimeError):
+    pass
+
+
+# ------------------------------------------------------------------ 平台与路径
+
+def normalize_platform(system: str | None = None, machine: str | None = None) -> tuple[str, str]:
+    s = (system or _platform.system()).strip().lower()
+    s = {"darwin": "macos", "win32": "windows", "cygwin": "windows"}.get(s, s)
+    m = (machine or _platform.machine()).strip().lower()
+    m = {"amd64": "x86_64", "x64": "x86_64", "arm64": "aarch64",
+         "armv7l": "arm", "armv6l": "arm", "armhf": "arm"}.get(m, m)
+    return s, m
+
+
+def asset_name(version: str, system: str | None = None, machine: str | None = None) -> str:
+    key = normalize_platform(system, machine)
+    try:
+        suffix = ASSET_SUFFIXES[key]
+    except KeyError as exc:
+        raise BiliupError(f"biliup 没有 {key[0]}-{key[1]} 的预编译包，请自行安装后在 config.toml 里设置 "
+                          "[platforms.bilibili] biliup_path") from exc
+    return f"biliupR-{version}-{suffix}"
+
+
+def download_url(version: str, asset: str, mirror: str = "") -> str:
+    url = GITHUB_DOWNLOAD.format(version=version, asset=asset)
+    if mirror:
+        url = mirror if mirror.endswith("/") else mirror + "/"
+        url += GITHUB_DOWNLOAD.format(version=version, asset=asset)
+    return url
+
+
+def exe_name(system: str | None = None) -> str:
+    return "biliup.exe" if normalize_platform(system)[0] == "windows" else "biliup"
+
+
+def install_dir(settings: Settings) -> Path:
+    return settings.tools_dir / "biliup" / settings.biliup_version
+
+
+def managed_path(settings: Settings) -> Path:
+    return install_dir(settings) / exe_name()
+
+
+def find_biliup(settings: Settings) -> Path | None:
+    if settings.biliup_path:
+        p = Path(settings.biliup_path).expanduser()
+        return p if p.is_file() else None
+    p = managed_path(settings)
+    return p if p.is_file() else None
+
+
+def read_install_info(settings: Settings) -> dict[str, Any] | None:
+    f = install_dir(settings) / "install.json"
+    try:
+        data = json.loads(f.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def binary_version(path: Path, timeout: float = 15) -> str | None:
+    """运行 `biliup --version`（纯本地，不联网）。注意不带参数的 biliup 会启动 Web 服务。"""
+    try:
+        proc = subprocess.run([str(path), "--version"], capture_output=True, timeout=timeout,
+                              **_no_window_kwargs())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"(\d+\.\d+\.\d+\S*)", proc.stdout.decode("utf-8", "replace"))
+    return f"v{m.group(1)}" if m else None
+
+
+def _no_window_kwargs() -> dict[str, Any]:
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}  # type: ignore[attr-defined]
+    return {}
+
+
+# ------------------------------------------------------------------ doctor / setup
+
+def doctor_items(settings: Settings) -> list[dict[str, Any]]:
+    if settings.biliup_path:
+        p = Path(settings.biliup_path).expanduser()
+        if not p.is_file():
+            return [{"name": "biliup", "ok": False, "detail": f"biliup_path 指向的文件不存在: {p}"}]
+        ver = binary_version(p)
+        return [{"name": "biliup", "ok": True,
+                 "detail": f"{p}（biliup_path，版本 {ver or '未知'}，不受 mpub setup 管理）"}]
+    exe = managed_path(settings)
+    if not exe.is_file():
+        return [{"name": "biliup", "ok": False,
+                 "detail": f"未安装 {settings.biliup_version}：运行 mpub setup（国内网络可设置 github_mirror）"}]
+    info = read_install_info(settings) or {}
+    detail = f"{settings.biliup_version} {exe}"
+    if info.get("archive_sha256"):
+        detail += f"；压缩包 sha256={info['archive_sha256'][:16]}…（{info.get('verified', 'tofu')}）"
+    expected = info.get("binary_sha256")
+    if expected and sha256_file(exe) != expected:
+        return [{"name": "biliup", "ok": False,
+                 "detail": f"{exe} 与安装时记录的 sha256 不一致（被替换或损坏）：删除该目录后重新 mpub setup"}]
+    return [{"name": "biliup", "ok": True, "detail": detail}]
+
+
+def install(settings: Settings, *, force: bool = False, transport: Any = None,
+            log: Callable[[str], None] | None = None) -> dict[str, Any]:
+    """下载并安装固定版本的 biliup。已安装则什么都不做（不自动更新）。"""
+    say = log or (lambda msg: print(msg, file=sys.stderr, flush=True))
+    if settings.biliup_path:
+        p = Path(settings.biliup_path).expanduser()
+        return {"name": "biliup", "ok": p.is_file(),
+                "detail": f"使用 biliup_path={p}" + ("" if p.is_file() else "（文件不存在）")}
+    dest = managed_path(settings)
+    if dest.is_file() and not force:
+        return {"name": "biliup", "ok": True, "detail": f"已安装 {settings.biliup_version}: {dest}"}
+
+    version = settings.biliup_version
+    try:
+        asset = asset_name(version)
+    except BiliupError as exc:
+        return {"name": "biliup", "ok": False, "detail": str(exc)}
+    url = download_url(version, asset, settings.github_mirror)
+    folder = install_dir(settings)
+    folder.mkdir(parents=True, exist_ok=True)
+    archive = folder / (asset + ".part")
+    say(f"下载 biliup {version}: {url}")
+    try:
+        digest = _download(url, archive, transport=transport)
+    except Exception as exc:  # noqa: BLE001 - 网络错误种类很多，统一转成提示
+        archive.unlink(missing_ok=True)
+        hint = "" if settings.github_mirror else "；国内网络可在 config.toml 设置 github_mirror"
+        return {"name": "biliup", "ok": False, "detail": f"下载失败: {type(exc).__name__}: {exc}{hint}"}
+
+    expected = KNOWN_SHA256.get(asset)
+    if expected and digest != expected:
+        archive.unlink(missing_ok=True)
+        return {"name": "biliup", "ok": False,
+                "detail": f"{asset} 的 sha256 不匹配（期望 {expected}，实际 {digest}），已删除，未安装"}
+    try:
+        _extract_binary(archive, dest, is_zip=asset.endswith(".zip"))
+    except (BiliupError, OSError, zipfile.BadZipFile, tarfile.TarError) as exc:
+        archive.unlink(missing_ok=True)
+        return {"name": "biliup", "ok": False, "detail": f"解压失败: {exc}"}
+    archive.unlink(missing_ok=True)
+
+    verified = "pinned" if expected else "tofu"
+    info = {
+        "version": version, "asset": asset, "url": url, "archive_sha256": digest,
+        "binary_sha256": sha256_file(dest), "verified": verified,
+        "installed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    (folder / "install.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    (folder / f"{asset}.sha256").write_text(f"{digest}  {asset}\n", encoding="utf-8")
+    note = "与内置校验值一致" if expected else "首次下载，已记录（trust-on-first-use，请自行核对）"
+    say(f"biliup 压缩包 sha256={digest}（{note}）")
+    return {"name": "biliup", "ok": True, "detail": f"已安装 {version}: {dest}；sha256={digest}（{note}）"}
+
+
+DOWNLOAD_DEADLINE = 30 * 60  # 整个下载最多 30 分钟
+
+
+def _download(url: str, dest: Path, *, transport: Any = None) -> str:
+    import httpx
+
+    h = hashlib.sha256()
+    deadline = time.monotonic() + DOWNLOAD_DEADLINE
+    timeout = httpx.Timeout(30.0, read=120.0)
+    with httpx.Client(follow_redirects=True, timeout=timeout, transport=transport,
+                      headers={"User-Agent": "multipub"}) as client:
+        with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            with dest.open("wb") as fh:
+                for chunk in resp.iter_bytes(1024 * 1024):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(f"超过 {DOWNLOAD_DEADLINE // 60} 分钟未下载完")
+                    fh.write(chunk)
+                    h.update(chunk)
+    return h.hexdigest()
+
+
+def _extract_binary(archive: Path, dest: Path, *, is_zip: bool) -> None:
+    """只解出 biliup 可执行文件本身（按文件名匹配，不信任压缩包里的路径）。"""
+    names = {"biliup", "biliup.exe"}
+    tmp = dest.with_name(dest.name + ".tmp")
+    if is_zip:
+        with zipfile.ZipFile(archive) as zf:
+            members = [m for m in zf.infolist() if not m.is_dir() and Path(m.filename).name.lower() in names]
+            if not members:
+                raise BiliupError("压缩包里没有 biliup 可执行文件")
+            member = min(members, key=lambda m: len(m.filename))
+            with zf.open(member) as src, tmp.open("wb") as out:
+                while chunk := src.read(1024 * 1024):
+                    out.write(chunk)
+    else:
+        with tarfile.open(archive, "r:*") as tf:
+            members = [m for m in tf.getmembers() if m.isfile() and Path(m.name).name in names]
+            if not members:
+                raise BiliupError("压缩包里没有 biliup 可执行文件")
+            member = min(members, key=lambda m: len(m.name))
+            src = tf.extractfile(member)
+            if src is None:
+                raise BiliupError("无法读取压缩包里的 biliup")
+            with src, tmp.open("wb") as out:
+                while chunk := src.read(1024 * 1024):
+                    out.write(chunk)
+    if sys.platform != "win32":
+        tmp.chmod(0o755)
+    os.replace(tmp, dest)
+
+
+# ------------------------------------------------------------------ 上传参数
+
+def creation_statement_for(options: dict[str, Any], ai_generated: bool) -> int | None:
+    """创作声明 id（来自 OmniPost 的用法，未在真实账号验证）：-1 无，1 AI，2 虚构演绎，3 营销，4 个人观点。"""
+    value = options.get("creation_statement")
+    if value not in (None, ""):
+        return int(value)
+    return 1 if ai_generated else None
+
+
+def build_upload_args(exe: Path, cookie_file: Path, post: Any) -> list[str]:
+    """拼 `biliup -u <file> upload ...`。字符串一律用 --opt=value，避免值以 - 开头被误解析。"""
+    o = post.options
+    title = post.title.strip()
+    desc = post.body.strip() or title  # B站简介不能为空：没写就用标题
+    copyright_ = int(o.get("copyright", 1))
+    args = [str(exe), "--rust-log", "info", "-u", str(cookie_file), "upload",
+            f"--title={title}", f"--desc={desc}", f"--tid={int(o['tid'])}",
+            f"--tag={','.join(post.tags)}", f"--copyright={copyright_}"]
+    if copyright_ == 2:
+        args.append(f"--source={str(o.get('source', '')).strip()}")
+    if o.get("tid_v2") not in (None, ""):
+        args.append(f"--tid-v2={int(o['tid_v2'])}")
+    if post.cover is not None:
+        args.append(f"--cover={post.cover}")
+    if post.schedule is not None:
+        args.append(f"--dtime={int(post.schedule.timestamp())}")  # 本地时间 -> epoch
+    if str(o.get("dynamic") or "").strip():
+        args.append(f"--dynamic={str(o['dynamic']).strip()}")
+    if o.get("no_reprint"):
+        args.append("--no-reprint=1")
+    if o.get("is_only_self"):
+        args.append("--is-only-self=1")
+    if o.get("selection_reply"):
+        args.append("--up-selection-reply")
+    if o.get("close_reply"):
+        args.append("--up-close-reply")
+    if o.get("close_danmu"):
+        args.append("--up-close-danmu")
+    extra = dict(o.get("extra_fields") or {})
+    statement = creation_statement_for(o, post.ai_generated)
+    if statement is not None and "creation_statement" not in extra:
+        extra["creation_statement"] = {"id": statement}
+    if extra:
+        args.append("--extra-fields=" + json.dumps(extra, ensure_ascii=False, separators=(",", ":")))
+    if o.get("line"):
+        args.append(f"--line={str(o['line']).lower()}")
+    if o.get("limit"):
+        args.append(f"--limit={int(o['limit'])}")
+    if o.get("submit"):
+        args.append(f"--submit={str(o['submit']).lower()}")
+    args += ["--", str(post.video)]
+    return args
+
+
+# ------------------------------------------------------------------ 输出解析
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+BV_RE = re.compile(r"\bBV[0-9A-Za-z]{10}\b")
+_AID_RE = re.compile(r'"aid"\s*:\s*(?:Number\()?(\d+)')
+# info 日志里是 message: "…"；错误报告里整段被 Debug 转义成 message: \"…\"
+_RESP_RE = re.compile(r'ResponseData \{ code: (-?\d+),.*?message: \\?"(.*?)\\?", ttl')
+UPLOADED_MARKERS = ("Upload completed", "All files uploaded successfully")
+SUBMIT_OK_MARKERS = ("投稿成功",)
+LOGIN_ERROR_MARKERS = ("credential validation failed", "credential refresh failed",
+                       "open cookies file", "账号未登录", "未知平台", "missing field `token_info`")
+
+
+def strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+@dataclass
+class UploadOutcome:
+    returncode: int | None  # None = 超时被杀
+    bvid: str | None = None
+    aid: str | None = None
+    response_code: int | None = None
+    response_message: str = ""
+    uploaded: bool = False  # 视频分片已全部传完（之后就是投稿请求）
+    submitted: bool = False  # 看到了投稿成功
+    login_error: bool = False
+    tail: list[str] = field(default_factory=list)
+
+    @property
+    def tail_text(self) -> str:
+        return " | ".join(line for line in self.tail if line.strip())[-600:]
+
+
+def parse_upload_output(lines: list[str], returncode: int | None) -> UploadOutcome:
+    out = UploadOutcome(returncode=returncode)
+    for raw in lines:
+        line = strip_ansi(raw)
+        if any(m in line for m in UPLOADED_MARKERS):
+            out.uploaded = True
+        if any(m in line for m in SUBMIT_OK_MARKERS):
+            out.submitted = True
+        if any(m in line for m in LOGIN_ERROR_MARKERS):
+            out.login_error = True
+        resp = _RESP_RE.search(line)
+        if resp:
+            out.response_code = int(resp.group(1))
+            out.response_message = resp.group(2)
+            if out.response_code == 0:
+                out.submitted = True
+                bv = BV_RE.search(line)
+                aid = _AID_RE.search(line)
+                out.bvid = bv.group(0) if bv else out.bvid
+                out.aid = aid.group(1) if aid else out.aid
+    if out.submitted and not out.bvid:
+        # 兜底：成功后在整段输出里找 BV 号
+        for raw in reversed(lines):
+            bv = BV_RE.search(strip_ansi(raw))
+            if bv:
+                out.bvid = bv.group(0)
+                break
+    out.tail = [strip_ansi(x) for x in lines[-12:]]
+    return out
+
+
+def video_url(bvid: str | None, aid: str | None) -> str | None:
+    if bvid:
+        return f"https://www.bilibili.com/video/{bvid}"
+    if aid:
+        return f"https://www.bilibili.com/video/av{aid}"
+    return None
+
+
+# ------------------------------------------------------------------ 运行
+
+LineHandler = Callable[[str | None], None]  # None 表示心跳（一段时间没有新输出）
+
+
+def biliup_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["NO_COLOR"] = "1"  # tracing 日志不要 ANSI 颜色
+    return env
+
+
+async def run_streaming(args: list[str], *, cwd: Path, timeout: float,
+                        on_line: LineHandler | None = None, heartbeat: float = 30) -> tuple[int | None, list[str]]:
+    """运行命令，逐行收集 stdout+stderr。超时杀进程并返回 (None, 已有输出)。"""
+    cwd.mkdir(parents=True, exist_ok=True)
+    proc = await asyncio.create_subprocess_exec(
+        *args, cwd=str(cwd), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT, env=biliup_env(), limit=1024 * 1024, **_no_window_kwargs())
+    assert proc.stdout is not None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    lines: list[str] = []
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None, lines
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=min(remaining, heartbeat))
+            except asyncio.TimeoutError:
+                if on_line:
+                    on_line(None)
+                continue
+            if not raw:
+                break
+            line = strip_ansi(raw.decode("utf-8", errors="replace")).rstrip("\r\n")
+            lines.append(line)
+            if on_line:
+                on_line(line)
+        try:
+            rc = await asyncio.wait_for(proc.wait(), timeout=max(1.0, deadline - loop.time()))
+        except asyncio.TimeoutError:
+            return None, lines
+        return rc, lines
+    finally:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
+
+
+async def renew(exe: Path, cookie_file: Path, *, cwd: Path, timeout: float = 90) -> tuple[bool, str]:
+    """biliup renew：用 refresh_token 刷新整份登录文件（会重写文件）。"""
+    rc, lines = await run_streaming([str(exe), "--rust-log", "info", "-u", str(cookie_file), "renew"],
+                                    cwd=cwd, timeout=timeout)
+    tail = " | ".join(x for x in lines[-5:] if x.strip())
+    return rc == 0, tail
+
+
+def run_interactive_login(settings: Settings, account: str) -> int:
+    """在当前终端里运行 `biliup -u <文件> login`（需要真实终端，二维码图片写在账号目录）。"""
+    exe = find_biliup(settings)
+    if exe is None:
+        print("未找到 biliup：先运行 mpub setup", file=sys.stderr)
+        return 1
+    cookie_file = settings.account_file("bilibili", account)
+    cookie_file.parent.mkdir(parents=True, exist_ok=True)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("biliup 交互式登录需要在真实终端（如 Windows Terminal）里运行；"
+              f"也可以直接执行: \"{exe}\" -u \"{cookie_file}\" login", file=sys.stderr)
+        return 2
+    print(f"即将运行 biliup 登录，推荐选择「扫码登录」。终端二维码显示不全时打开: "
+          f"{cookie_file.parent / 'qrcode.png'}", file=sys.stderr, flush=True)
+    started = time.time()
+    proc = subprocess.run([str(exe), "-u", str(cookie_file), "login"], cwd=str(cookie_file.parent))
+    if proc.returncode == 0 and cookie_file.is_file() and cookie_file.stat().st_mtime >= started - 1:
+        print(f"登录信息已保存: {cookie_file}", file=sys.stderr)
+    return proc.returncode
