@@ -1,0 +1,24 @@
+# 视频发布清单。路径相对于本文件所在目录。完整字段说明见 docs/manifest.md
+kind: video
+title: 第12期：三分钟讲清楚 XXX
+body: |
+  视频简介写在这里。
+  B站要求简介不能为空；抖音、小红书会把它作为作品描述。
+tags: [科技, 教程]
+video: video.mp4
+cover: cover.jpg            # 可选；B站/抖音/小红书封面
+# schedule: "2026-10-21 20:00"   # 可选，本地时间；抖音/小红书需晚于当前 2 小时以上
+ai_generated: false         # 内容含 AI 生成时设为 true，会在支持的平台勾选 AI 声明
+account: main               # 默认账号名（对应 mpub login <平台> --account main）
+
+platforms:
+  bilibili:
+    tid: 231                # 分区 id（231=计算机技术），见 docs/platforms.md
+    copyright: 1            # 1 自制，2 转载（转载必须填 source）
+    # source: https://...
+  douyin:
+    title: 三分钟讲清楚 XXX   # 抖音标题最多 30 字
+    # declaration: 内容由AI生成   # 抖音自主声明，选项文字需与页面一致；不填则不声明
+  xiaohongshu:
+    title: 3分钟学会XXX🔥     # 小红书标题最多 20 字
+  # zhihu: 知乎暂不支持视频，会自动跳过

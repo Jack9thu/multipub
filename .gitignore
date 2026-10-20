@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+# 登录凭据与运行数据默认在 %LOCALAPPDATA%\multipub，不在仓库里；以防万一：
+cookies/
+accounts/
+*.cookies.json
+verify_code.txt
+qrcode*.png
+.multipub/

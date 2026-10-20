@@ -1,0 +1,14 @@
+# 长文发布清单：Markdown 正文（目前只有知乎文章支持）。完整字段说明见 docs/manifest.md
+kind: article
+title: 一篇文章的标题（知乎最多 100 字）
+body_file: article.md        # Markdown，可引用本地图片（相对路径），发布时自动上传到知乎图床
+cover: cover.jpg             # 可选，文章题图
+tags: [人工智能]              # 知乎话题（尽力匹配，匹配不到会跳过并给出警告）
+ai_generated: false          # true 时创作声明设为"包含 AI 辅助创作"
+account: main
+
+platforms:
+  zhihu:
+    draft: false             # true 只保存草稿，返回编辑链接，由你手动点发布
+    # statement: none        # 创作声明: none / ai / spoiler / medical / fiction / finance
+    # column: c_123456789    # 发布到指定专栏（可选）

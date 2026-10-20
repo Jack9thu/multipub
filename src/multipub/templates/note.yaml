@@ -1,0 +1,22 @@
+# 图文发布清单：若干图片 + 一段文字。路径相对于本文件所在目录。完整字段说明见 docs/manifest.md
+#   B站 → 图文动态（opus）   抖音 → 图文   小红书 → 图文笔记   知乎 → 想法（或改成文章）
+kind: note
+title: 周末徒步路线分享       # 抖音/小红书图文标题最多 20 字；B站动态标题最多 20 字
+body: |
+  正文写在这里。
+  抖音、小红书正文最多 1000 字；B站动态正文最多 1000 字。
+tags: [徒步, 周末去哪儿]
+images:
+  - images/1.jpg
+  - images/2.jpg
+  - images/3.jpg
+# schedule: "2026-10-21 20:00"
+ai_generated: false
+account: main
+
+platforms:
+  bilibili: {}
+  douyin: {}
+  xiaohongshu: {}
+  zhihu:
+    as: pin                   # pin = 想法（默认）；article = 发成知乎文章（正文作为 Markdown，图片插在文末）
