@@ -111,6 +111,15 @@ platforms:
 - `mpub doctor`：报告安装路径、版本、压缩包 sha256；若二进制与安装时记录的 sha256 不一致则报错。
   使用 `biliup_path` 时会运行一次 `biliup --version`（纯本地；注意不带参数的 biliup 会启动 Web 服务，我们从不这样调用）。
 
+### 电脑上已经装了 biliup
+
+- multipub **不会自动使用** PATH 里的 biliup，也不会动它：`mpub setup` 照常把固定版本下载到
+  `<数据目录>\tools\biliup\<版本>\`，两份互不影响。`mpub doctor` 发现 PATH 里有 biliup 时会提示。
+- 想用已有的那份：config.toml 里 `[platforms.bilibili] biliup_path = 'D:\tools\biliup\biliup.exe'`，
+  之后 `mpub setup` 不再下载。上传参数是按 v1.3.1 核对的（已用真实二进制验证），版本差太多可能不认某些参数。
+- 以前用 biliup 登录得到的 `cookies.json` 可以直接复用（格式相同）：复制成
+  `<数据目录>\accounts\bilibili\<账号>.json`，再 `mpub check bilibili --account <账号>` 确认有效。
+
 ## validate() 检查的限制
 
 | 项 | 规则 | 级别 |

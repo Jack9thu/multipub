@@ -19,6 +19,7 @@ import json
 import os
 import platform as _platform
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -169,8 +170,12 @@ def doctor_items(settings: Settings) -> list[dict[str, Any]]:
                  "detail": f"{p}（biliup_path，版本 {ver or '未知'}，不受 mpub setup 管理）"}]
     exe = managed_path(settings)
     if not exe.is_file():
-        return [{"name": "biliup", "ok": False,
-                 "detail": f"未安装 {settings.biliup_version}：运行 mpub setup（国内网络可设置 github_mirror）"}]
+        detail = f"未安装 {settings.biliup_version}：运行 mpub setup（国内网络可设置 github_mirror）"
+        on_path = shutil.which("biliup") or shutil.which("biliupR")
+        if on_path:
+            detail += (f"；也可以直接用已安装的 {on_path}：在 config.toml 的 [platforms.bilibili] 写 "
+                       f"biliup_path（参数按 {settings.biliup_version} 核对过，版本差太多可能不兼容）")
+        return [{"name": "biliup", "ok": False, "detail": detail}]
     info = read_install_info(settings) or {}
     detail = f"{settings.biliup_version} {exe}"
     if info.get("archive_sha256"):
