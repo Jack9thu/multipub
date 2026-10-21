@@ -56,7 +56,7 @@ class Printer:
             self.info(f"{who} 请用手机 App 扫码登录，二维码图片: {event.get('path')} {event.get('note') or ''}")
         elif kind == "needs_input":
             self.info(f"{who} 需要输入: {event.get('message')}"
-                      + (f"（运行 mpub verify-code douyin <验证码>，或写入文件 {event["path"]}）" if event.get("path") else ""))
+                      + (f"（运行 mpub verify-code douyin <验证码>，或写入文件 {event['path']}）" if event.get("path") else ""))
         elif kind == "submit_started":
             self.info(f"{who} 已点击发布……")
         elif kind == "log":
