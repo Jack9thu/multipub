@@ -1,0 +1,70 @@
+# multipub 配置示例。复制到 <数据目录>\config.toml 后按需修改（文件可选，不存在就全用默认值）。
+#   Windows 默认数据目录: %LOCALAPPDATA%\multipub\config.toml
+#   可用环境变量 MULTIPUB_HOME 或命令行 --home 换数据目录
+# 下面每一项都是默认值；只需要保留你要改的那几行。
+# TOML 里的 Windows 路径用单引号（字面字符串），反斜杠不用转义：'C:\Program Files\...'
+
+# 下载 biliup 时拼在 GitHub URL 前面的镜像前缀，国内网络可设，例如 "https://ghfast.top/"。
+# v1.3.1 的发布包有内置 sha256 校验，镜像给错文件会被拒绝安装。
+github_mirror = ""
+
+# 同一次 mpub publish 里两个平台之间等待的秒数（降低风控）。命令行 --gap 可覆盖。
+gap_seconds = 30
+
+[browser]
+# chromium = patchright 自带的 Chromium（mpub setup 下载）
+# chrome / msedge = 本机已安装的 Chrome / Edge（不用下载内核，指纹更像真人）
+channel = "chromium"
+# 指定浏览器可执行文件，优先于 channel，例如:
+# executable_path = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+executable_path = ""
+# 发布时是否无头（不显示窗口）。命令行 publish --headed 可临时显示窗口。
+# 登录不受这一项影响：mpub login 默认显示窗口，加 --headless 才无头。
+headless = true
+
+[timeouts]
+# 各动作的总超时（秒），超时后 worker 连同浏览器一起被结束。
+login = 300            # 扫码登录（各平台实际等待扫码的时间比这个短 45~90 秒）
+check = 180            # mpub check
+publish_video = 3600   # 单个平台发一条视频；mpub publish --timeout 可临时覆盖
+publish_note = 900     # 单个平台发一条图文
+publish_article = 900  # 单个平台发一篇文章
+# 注意：抖音/小红书的「等待上传完成」默认取 publish_<kind> − 600 秒（见下），
+# 只给 --timeout 不会延长它；传大视频请直接调大这里的 publish_video。
+
+[platforms.bilibili]
+# biliup 版本（装在 <数据目录>\tools\biliup\<版本>\）。只有 v1.3.1 有内置 sha256，
+# 其他版本首次下载时记录校验值（trust-on-first-use）。改版本后运行 mpub setup。
+biliup_version = "v1.3.1"
+# 使用已有的 biliup 可执行文件，优先于自动安装；mpub setup 不会动它。
+# biliup_path = 'D:\tools\biliup.exe'
+biliup_path = ""
+# 是否允许 multipub 在浏览器模式里代为确认 B站《动态发布规范》弹窗（对所有账号生效）。
+# 请先阅读 https://t.bilibili.com/h5/dynamic/specification ，同意后再改成 true。
+# 也可以只对某条内容写 platforms.bilibili.confirm_rules: true（见 docs/manifest.md）。
+confirm_dynamic_rules = false
+
+[platforms.douyin]
+page_timeout = 300      # 选好视频后等待进入发布表单页（秒）
+# upload_timeout 默认 = timeouts.publish_<kind> − 600（最少 180），即视频 3000、图文 300
+# upload_timeout = 3000
+publish_timeout = 240   # 点击「发布」后等待跳转到作品管理页
+sms_timeout = 300       # 等待短信验证码（mpub verify-code douyin <验证码>）
+
+[platforms.xiaohongshu]
+# upload_timeout 默认 = timeouts.publish_<kind> − 600（最少 180）
+# upload_timeout = 3000
+publish_timeout = 240   # 点击「发布」后等待跳到成功页
+
+[platforms.zhihu]
+# 两次写请求（建草稿、登记图片、发布……）之间至少间隔的秒数；知乎对频率敏感，不建议调小，最低按 1 秒算。
+write_interval = 2.0
+# 每张图片等待知乎处理完成的最长秒数。
+image_timeout = 90
+
+# ---------------------------------------------------------------------------
+# 相关环境变量（不在本文件里设置）：
+#   MULTIPUB_HOME                 数据目录
+#   PLAYWRIGHT_DOWNLOAD_HOST      mpub setup 下载 Chromium 的镜像（见 docs/windows.md）
+#   DOUYIN_COOKIE_AUTH_HEADLESS   设为 false 时抖音 cookie 校验用有头浏览器（无头偶尔被误判为失效）
+#   SAU_XHS_CREATOR_BASE_URL      小红书创作者中心域名，例如 https://creator.rednote.com

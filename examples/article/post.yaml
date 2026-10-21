@@ -1,0 +1,17 @@
+# 长文示例：Markdown 正文发成知乎专栏文章（目前只有知乎支持 article）。字段说明见 docs/manifest.md
+# 先把 article.md 里引用的图片和 cover.jpg 放好（见 README.md），再运行:
+#   uv run mpub validate examples/article
+kind: article
+title: 用 Git 分支管理个人项目的五个习惯   # 知乎文章标题最多 100 字
+body_file: article.md          # Markdown；正文里的本地图片相对 article.md 所在目录，发布时自动传到知乎图床
+cover: cover.jpg               # 可选：文章题图
+tags: [Git, 编程]               # 知乎话题，尽力匹配前 3 个，匹配不到只警告
+ai_generated: false            # true 时创作声明为「包含 AI 辅助创作」
+account: main
+
+platforms:
+  zhihu:
+    draft: true                # 第一次建议先存草稿，到编辑页检查格式后手动点发布；确认没问题再改成 false
+    # statement: none          # 创作声明: none / ai / spoiler / medical / fiction / finance
+    # column: c_1234567890     # 发到自己的专栏
+    # toc: true                # 开启文章目录

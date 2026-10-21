@@ -56,6 +56,16 @@ ASSET_SUFFIXES: dict[tuple[str, str], str] = {
 }
 
 SUBMIT_CHOICES = ("app", "web", "b-cut-android")
+# 清单里的开关（必须是 true/false）-> biliup 参数
+VIDEO_FLAGS: dict[str, str] = {
+    "no_reprint": "--no-reprint=1",
+    "is_only_self": "--is-only-self=1",
+    "selection_reply": "--up-selection-reply",
+    "close_reply": "--up-close-reply",
+    "close_danmu": "--up-close-danmu",
+}
+# biliup Studio 注明「仅提交接口为app时可用」
+APP_ONLY_FLAGS = ("selection_reply", "close_reply", "close_danmu")
 LINE_CHOICES = ("bldsa", "cnbldsa", "andsa", "atdsa", "bda2", "cnbd", "anbd", "atbd",
                 "tx", "cntx", "antx", "attx", "txa", "alia", "estx", "akbd")
 
@@ -307,16 +317,10 @@ def build_upload_args(exe: Path, cookie_file: Path, post: Any) -> list[str]:
         args.append(f"--dtime={int(post.schedule.timestamp())}")  # 本地时间 -> epoch
     if str(o.get("dynamic") or "").strip():
         args.append(f"--dynamic={str(o['dynamic']).strip()}")
-    if o.get("no_reprint"):
-        args.append("--no-reprint=1")
-    if o.get("is_only_self"):
-        args.append("--is-only-self=1")
-    if o.get("selection_reply"):
-        args.append("--up-selection-reply")
-    if o.get("close_reply"):
-        args.append("--up-close-reply")
-    if o.get("close_danmu"):
-        args.append("--up-close-danmu")
+    # 开关只认真正的 true（validate 已拒绝 "false" 之类的字符串，这里再保险一次）
+    for key, flag in VIDEO_FLAGS.items():
+        if o.get(key) is True:
+            args.append(flag)
     extra = dict(o.get("extra_fields") or {})
     statement = creation_statement_for(o, post.ai_generated)
     if statement is not None and "creation_statement" not in extra:
@@ -340,14 +344,32 @@ BV_RE = re.compile(r"\bBV[0-9A-Za-z]{10}\b")
 _AID_RE = re.compile(r'"aid"\s*:\s*(?:Number\()?(\d+)')
 # info 日志里是 message: "…"；错误报告里整段被 Debug 转义成 message: \"…\"
 _RESP_RE = re.compile(r'ResponseData \{ code: (-?\d+),.*?message: \\?"(.*?)\\?", ttl')
-UPLOADED_MARKERS = ("Upload completed", "All files uploaded successfully")
-SUBMIT_OK_MARKERS = ("投稿成功",)
+# tracing 默认格式（NO_COLOR）："2026-10-20 12:03:01  INFO biliup::uploader::bilibili: 消息"。
+# 级别和 target 之前只允许时间戳字符，所以消息里回显的文件名（pre_upload: {"name":…}、
+# Upload completed: <文件>）伪造不了 target，也伪造不了下面按 target 锚定的标记
+_LOG_RE = re.compile(r"^[\d\-:T.+ ]*?\s*(TRACE|DEBUG|INFO|WARN|ERROR)\s+(biliup[\w:]*): (.*)$")
+UPLOADED_MARKERS = ("Upload completed:", "All files uploaded successfully")
+# biliup 自己的投稿成功日志（APP接口投稿成功 / Web 接口投稿成功 / BCUT接口投稿成功），整条消息完全匹配
+_SUBMIT_OK_RE = re.compile(r"(?:APP|Web|BCUT|客户端)?\s*接口投稿成功")
 LOGIN_ERROR_MARKERS = ("credential validation failed", "credential refresh failed",
                        "open cookies file", "账号未登录", "未知平台", "missing field `token_info`")
+_ECHO_MIN_LEN = 4  # 太短的回显串不做替换，免得把标记本身抹掉
 
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
+
+
+def echo_strings(*paths: Path | None) -> list[str]:
+    """biliup 会在输出里回显的用户文件名/路径（原样和 JSON 转义两种），解析前从非 tracing 行里抹掉。"""
+    out: set[str] = set()
+    for p in paths:
+        if p is None:
+            continue
+        for s in (str(p), p.as_posix(), p.name):
+            out.add(s)
+            out.add(json.dumps(s, ensure_ascii=False)[1:-1])
+    return sorted((s for s in out if len(s) >= _ECHO_MIN_LEN), key=len, reverse=True)
 
 
 @dataclass
@@ -355,10 +377,10 @@ class UploadOutcome:
     returncode: int | None  # None = 超时被杀
     bvid: str | None = None
     aid: str | None = None
-    response_code: int | None = None
+    response_code: int | None = None  # 最后一次投稿响应的 code
     response_message: str = ""
     uploaded: bool = False  # 视频分片已全部传完（之后就是投稿请求）
-    submitted: bool = False  # 看到了投稿成功
+    submitted: bool = False  # 投稿响应 code 0（没解析到响应时看 biliup 自己的「接口投稿成功」日志）
     login_error: bool = False
     tail: list[str] = field(default_factory=list)
 
@@ -367,31 +389,54 @@ class UploadOutcome:
         return " | ".join(line for line in self.tail if line.strip())[-600:]
 
 
-def parse_upload_output(lines: list[str], returncode: int | None) -> UploadOutcome:
+def parse_upload_output(lines: list[str], returncode: int | None, *, echo: list[str] | tuple[str, ...] = ()
+                        ) -> UploadOutcome:
+    """解析 biliup 输出。echo：会被回显的文件名/路径（echo_strings），避免文件名里的字样被当成状态。
+
+    - 投稿结果以投稿响应 ResponseData 为准（最后一条；code 非 0 时任何「投稿成功」字样都不算），
+      只认 biliup 投稿模块的 info 日志和非 tracing 的错误报告行。
+    - 上传完成 / 投稿成功标记必须是 biliup 自己的 tracing 日志，按 target 锚定。
+    - 登录错误只看非 INFO 的行（错误报告、WARN/ERROR），并先抹掉回显的文件名。
+    """
     out = UploadOutcome(returncode=returncode)
+    ok_marker = False
+    resp_lines: list[str] = []
     for raw in lines:
         line = strip_ansi(raw)
-        if any(m in line for m in UPLOADED_MARKERS):
-            out.uploaded = True
-        if any(m in line for m in SUBMIT_OK_MARKERS):
-            out.submitted = True
-        if any(m in line for m in LOGIN_ERROR_MARKERS):
+        log = _LOG_RE.match(line)
+        if log:
+            level, target, msg = log.group(1), log.group(2), log.group(3).strip()
+            if level == "INFO" and msg.startswith(UPLOADED_MARKERS):
+                out.uploaded = True
+            if level == "INFO" and _SUBMIT_OK_RE.fullmatch(msg):
+                ok_marker = True
+            resp_src = msg if (level == "INFO" and msg.startswith("ResponseData {")) else ""
+            login_src = "" if level in ("INFO", "DEBUG", "TRACE") else msg
+        else:
+            scrubbed = line
+            for s in echo:
+                scrubbed = scrubbed.replace(s, "<file>")
+            resp_src = login_src = scrubbed
+        if login_src and any(m in login_src for m in LOGIN_ERROR_MARKERS):
             out.login_error = True
-        resp = _RESP_RE.search(line)
+        resp = _RESP_RE.search(resp_src) if resp_src else None
         if resp:
             out.response_code = int(resp.group(1))
             out.response_message = resp.group(2)
+            resp_lines.append(resp_src)
             if out.response_code == 0:
-                out.submitted = True
-                bv = BV_RE.search(line)
-                aid = _AID_RE.search(line)
+                bv = BV_RE.search(resp_src)
+                aid = _AID_RE.search(resp_src)
                 out.bvid = bv.group(0) if bv else out.bvid
                 out.aid = aid.group(1) if aid else out.aid
+    if out.response_code is not None:
+        out.submitted = out.response_code == 0
+    else:
+        out.submitted = ok_marker
     if out.submitted and not out.bvid:
-        # 兜底：只在投稿响应相关的行里找 BV 号（视频文件名里也可能有 BV 字样）
-        for raw in reversed(lines):
-            line = strip_ansi(raw)
-            bv = BV_RE.search(line) if ("bvid" in line or "ResponseData" in line) else None
+        # 兜底：只在投稿响应行里找 BV 号（视频文件名里也可能有 BV 字样）
+        for src in reversed(resp_lines):
+            bv = BV_RE.search(src) if "bvid" in src else None
             if bv:
                 out.bvid = bv.group(0)
                 break

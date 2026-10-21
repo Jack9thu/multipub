@@ -1,0 +1,26 @@
+# 图文示例：几张图片 + 一段文字。字段说明见 docs/manifest.md
+#   B站 → 动态（opus）   抖音 → 图文   小红书 → 图文笔记   知乎 → 想法
+# 先把 images/1.jpg ~ 3.jpg 放好（见 README.md），再运行:
+#   uv run mpub validate examples/note
+kind: note
+title: 周末徒步路线分享           # 抖音必填；B站/抖音/小红书图文标题最多 20 字
+body: |
+  这周走了西山的一条环线，全程 12 公里，爬升 600 米，大约 5 小时。
+  路况：前半段石阶，后半段土路，雨后比较滑。
+  补给：山顶有小卖部，建议自带 2 升水。
+tags: [徒步, 周末去哪儿]
+images:
+  - images/1.jpg
+  - images/2.jpg
+  - images/3.jpg
+# schedule: "2026-10-25 20:00"   # B站动态 5 分钟~7 天；抖音/小红书 2 小时以上；知乎不支持
+ai_generated: false
+account: main
+
+platforms:
+  bilibili: {}                    # 默认浏览器模式；首次发动态会遇到《动态发布规范》确认，见 docs/platforms/bilibili.md
+  douyin: {}
+  xiaohongshu: {}
+  zhihu:
+    tags: []                      # 想法不关联话题：清掉顶层 tags，免得校验警告
+    as: pin                       # pin = 想法（默认）；article = 发成知乎文章（图片放在文末，需要标题）

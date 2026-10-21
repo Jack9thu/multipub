@@ -154,14 +154,15 @@ mpub login bilibili --account main
   原子替换、POSIX 下权限 600。视频（biliup `-u`）和图文（内存里转成浏览器 cookie）共用这一份。
 - 已有有效登录（nav 已登录 **且** biliup 令牌校验通过）时 `login` 直接返回「无需重新扫码」；要换号先删除该文件。
   只要其中一项不通过就重新扫码，避免「发布说要登录、登录说已登录」的死循环。
-- **备选：biliup 交互式登录**。需要真实终端（Windows Terminal 等），在账号目录里运行：
+- **备选：biliup 交互式登录**。需要真实终端（Windows Terminal 等）：
 
   ```
-  "<biliup 路径>" -u "<数据目录>\accounts\bilibili\main.json" login
+  mpub login bilibili --account main --interactive
   ```
 
-  选「扫码登录」；终端二维码显示不全时打开同目录的 `qrcode.png`。适配器里有 `run_interactive_login()` 封装
-  （检查 TTY、cwd 设为账号目录），但目前 CLI 只在 `interactive_login = True` 时调用它，见下方「需要的核心改动」。
+  它调用适配器的 `run_interactive_login()`：检查 TTY，在账号目录里运行
+  `"<biliup 路径>" -u "<数据目录>\accounts\bilibili\main.json" login`（不在真实终端里时只打印这条命令、退出码 2）。
+  选「扫码登录」；终端二维码显示不全时打开同目录的 `qrcode.png`。
 - **绝不从浏览器回写登录文件**：图文的浏览器模式只在内存里把 cookie 转成 `storage_state`
   （`http_only`/`secure` 的 0/1 转 bool，域 `.bilibili.com`，`sameSite: Lax`），不调用 `context.storage_state(path=...)`，
   否则会丢掉 `token_info`。
@@ -207,11 +208,12 @@ mpub login bilibili --account main
 | 投稿接口明确拒绝（`ResponseData { code: 非0 … }`） | `failed` / `platform_error` | 带 B站的 code 和 message |
 | 投稿接口返回服务端错误码 -500/-502/-503/-504 | `failed` / `unknown_outcome` | 稿件可能已建好，先去创作中心确认 |
 | 视频已传完（看到 `Upload completed` / `All files uploaded successfully`）后失败或超时 | `failed` / `unknown_outcome` | 先去创作中心确认，不要重发 |
-| 上传阶段失败 / 超时（还没传完） | `failed` / `platform_error` 或 `timeout` | 尚未投稿；因为已标记 submit_started，重发需要 `--force` |
+| 上传阶段失败 / 超时（还没传完） | `failed` / `platform_error` 或 `timeout` | 尚未投稿；因为已标记 submit_started，`retryable` 为 false，不会自动重试，需人确认后再发 |
 | 输出里是登录错误（`credential validation failed`、`账号未登录` 等）且没传完 | `needs_action` / `login_required` | 重新登录 |
 
-> 取舍：按约定在启动 biliup 前就标记 submit_started，所以「上传阶段就失败」也会被查重记录为结果未知，
-> 再发需要 `--force`。错误消息里会写明「尚未投稿」。
+> 取舍：按约定在启动 biliup 前就标记 submit_started，所以「上传阶段就失败」的结果也带 `submit_started: true`，
+> 不会被自动重试。错误消息里会写明「尚未投稿」；查重只拦截 `published` / `submitted` / `scheduled` 和
+> `unknown_outcome`，所以确认后直接重发即可（消息里提到的 `--force` 不是必需的）。
 
 ### 图文（动态）
 
