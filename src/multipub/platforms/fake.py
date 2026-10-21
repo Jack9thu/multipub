@@ -1,6 +1,6 @@
 """测试用假平台（MULTIPUB_ENABLE_FAKE=1 时注册）。行为由 options.fake 控制：
 
-    ok (默认) | fail | needs_action | hang | crash_after_submit
+    ok (默认) | fail | needs_action | hang | crash_after_submit | hang_after_submit
 """
 
 from __future__ import annotations
@@ -44,6 +44,8 @@ class FakeAdapter(PlatformAdapter):
         if mode == "hang":
             await asyncio.sleep(3600)
         self.ctx.mark_submit_started()
+        if mode == "hang_after_submit":
+            await asyncio.sleep(3600)
         if mode == "crash_after_submit":
             os._exit(9)
         return self.result(Status.PUBLISHED, kind=post.kind, url="https://example.com/p/1", item_id="1")

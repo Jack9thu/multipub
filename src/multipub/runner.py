@@ -22,6 +22,14 @@ from .models import ErrorCode, PlatformPost, Result, Status, now_iso
 
 EventHandler = Callable[[dict[str, Any]], None]
 
+
+class WorkerInterrupted(KeyboardInterrupt):
+    """主进程被 Ctrl+C / 终止时抛出：worker 进程树已结束，result 记录了中断时的状态。"""
+
+    def __init__(self, result: Result):
+        super().__init__(result.message)
+        self.result = result
+
 # worker 输出 result 之后、进程退出之前允许的收尾时间
 _GRACE_SECONDS = 15
 
@@ -39,6 +47,14 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         pass
     try:
         proc.kill()
+    except OSError:
+        pass
+
+
+def _close_stdin(proc: subprocess.Popen) -> None:
+    try:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
     except OSError:
         pass
 
@@ -75,6 +91,8 @@ def run_worker(
         "run_dir": str(run_dir),
         # worker 内部超时略短于外部硬超时，尽量让 worker 自己体面地结束并汇报
         "timeout": max(30, timeout - 30),
+        # stdin 管道一直开着；主进程一旦退出（被杀、关窗口），worker 读到 EOF 就自行取消并退出
+        "watch_parent": True,
         "post": post.to_dict() if post else None,
     }
     stderr_path = run_dir / f"{platform}-{action}.log"
@@ -96,8 +114,8 @@ def run_worker(
             **popen_kwargs,
         )
         assert proc.stdin is not None and proc.stdout is not None
-        proc.stdin.write(json.dumps(job, ensure_ascii=False).encode("utf-8"))
-        proc.stdin.close()
+        proc.stdin.write(json.dumps(job, ensure_ascii=False).encode("utf-8") + b"\n")
+        proc.stdin.flush()
 
         lines: queue.Queue[bytes | None] = queue.Queue()
 
@@ -113,45 +131,61 @@ def run_worker(
         result: Result | None = None
         submit_started = False
         eof = False
-        while not eof:
-            remaining = deadline - time.monotonic()
-            if result is not None:
-                remaining = min(remaining, _GRACE_SECONDS)
-            if remaining <= 0:
-                break
-            try:
-                raw = lines.get(timeout=remaining)
-            except queue.Empty:
-                break
-            if raw is None:
-                eof = True
-                break
-            text = raw.decode("utf-8", errors="replace").strip()
-            if not text:
-                continue
-            try:
-                event = json.loads(text)
-            except json.JSONDecodeError:
-                event = {"event": "log", "level": "debug", "message": text,
-                         "platform": platform, "account": account}
-            if not isinstance(event, dict):
-                continue
-            if event.get("event") == "submit_started":
-                submit_started = True
-            if event.get("event") == "result":
+        try:
+            while not eof:
+                remaining = deadline - time.monotonic()
+                if result is not None:
+                    remaining = min(remaining, _GRACE_SECONDS)
+                if remaining <= 0:
+                    break
                 try:
-                    result = Result.from_dict(event["result"])
-                except (KeyError, TypeError, ValueError):
-                    result = None
-                continue
-            if on_event:
-                on_event(event)
+                    raw = lines.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if raw is None:
+                    eof = True
+                    break
+                text = raw.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    event = json.loads(text)
+                except json.JSONDecodeError:
+                    event = {"event": "log", "level": "debug", "message": text,
+                             "platform": platform, "account": account}
+                if not isinstance(event, dict):
+                    continue
+                if event.get("event") == "submit_started":
+                    submit_started = True
+                if event.get("event") == "result":
+                    try:
+                        result = Result.from_dict(event["result"])
+                    except (KeyError, TypeError, ValueError):
+                        result = None
+                    continue
+                if on_event:
+                    on_event(event)
 
+        except BaseException:
+            # Ctrl+C / SIGTERM：先结束整棵进程树（浏览器、biliup），再把中断时的状态交给调用方记录
+            _close_stdin(proc)
+            _kill_tree(proc)
+            interrupted = result or Result(
+                platform=platform, account=account, action=action, status=Status.FAILED,
+                kind=post.kind.value if post else "",
+                message=("已中断，但已触发发布：结果未知，请先到平台后台确认，不要直接重发" if submit_started
+                         else "已中断（尚未触发发布）"),
+                error_code=(ErrorCode.UNKNOWN_OUTCOME if submit_started else ErrorCode.INTERNAL).value,
+                retryable=not submit_started, submit_started=submit_started,
+                started_at=started, finished_at=now_iso(),
+            )
+            raise WorkerInterrupted(interrupted) from None
         if proc.poll() is None:
             try:
                 proc.wait(timeout=5 if result is not None else 0.1)
             except subprocess.TimeoutExpired:
                 pass
+        _close_stdin(proc)
         _kill_tree(proc)
 
     if result is None:

@@ -31,7 +31,7 @@ from .manifest import (PLATFORMS, ManifestError, common_issues, load_manifest,
 from .models import (ErrorCode, Issue, Kind, PlatformPost, Result, Status,
                      now_iso)
 from .platforms import DISPLAY_NAMES, available, load_adapter
-from .runner import run_worker
+from .runner import WorkerInterrupted, run_worker
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_NEEDS_ACTION = 0, 1, 2, 3
 
@@ -370,6 +370,12 @@ def cmd_publish(args: argparse.Namespace, settings: Settings, out: Printer) -> i
                                     headless=not args.headed and settings.browser.headless,
                                     run_dir=run_dir / post.platform, post=post,
                                     timeout=args.timeout, on_event=out.event)
+        except WorkerInterrupted as exc:
+            # 被中断也要记账：已触发发布的记为结果未知，查重会拦住下一次
+            history.append(settings, exc.result, run_id=run_id, fingerprint=history.post_fingerprint(post),
+                           source=str(manifest.path), title=post.title)
+            out.info(format_result(exc.result))
+            raise
         except RuntimeError as exc:  # 账号被占用
             result = Result(platform=post.platform, account=post.account, action="publish",
                             status=Status.FAILED, kind=post.kind.value, message=str(exc),
@@ -494,12 +500,29 @@ COMMANDS = {
 }
 
 
+def _install_signal_handlers() -> None:
+    """把 SIGTERM（Windows 上还有 Ctrl+Break）当作 Ctrl+C 处理，保证子进程树被清理、中断被记账。"""
+    import signal
+
+    def handler(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):  # 非主线程等情况
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         except (AttributeError, ValueError):
             pass
+    _install_signal_handlers()
     args = build_parser().parse_args(argv)
     out = Printer(args.json)
     settings = load_settings(args.home)

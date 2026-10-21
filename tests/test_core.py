@@ -193,3 +193,32 @@ def test_json_outputs_for_simple_commands(home: Path, tmp_path: Path, capsys, mo
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     assert main(["publish", str(media), "--json"]) == 2
     assert json.loads(capsys.readouterr().out)["error"] == "confirmation_required"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="用 SIGTERM 模拟中断")
+def test_interrupted_publish_is_recorded_and_cleaned_up(home: Path, media: Path):
+    import os
+    import signal
+    import time
+
+    write_post(media, "kind: video\ntitle: t\nvideo: video.mp4\nplatforms:\n  fake: {fake: hang_after_submit}\n")
+    env = dict(os.environ, MULTIPUB_HOME=str(home), MULTIPUB_ENABLE_FAKE="1")
+    proc = subprocess.Popen([sys.executable, "-m", "multipub.cli", "publish", str(media), "--yes", "--json"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    deadline = time.monotonic() + 60
+    seen = b""
+    while b"submit_started" not in seen and time.monotonic() < deadline:
+        seen += proc.stderr.readline()
+    assert b"submit_started" in seen
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=30) == 130
+
+    rows = history.read(load_settings())
+    assert rows[-1]["status"] == "failed" and rows[-1]["error_code"] == "unknown_outcome"
+    assert rows[-1]["submit_started"] is True
+    # 查重会拦住下一次
+    assert history.find_previous(load_settings(), rows[-1]["fingerprint"]) is not None
+    # worker 不会残留
+    time.sleep(1)
+    ps = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
+    assert str(home) not in ps and not any("multipub.worker" in l and str(media) in l for l in ps.splitlines())

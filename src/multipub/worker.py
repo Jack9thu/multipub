@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+import threading
 import traceback
 from pathlib import Path
 from typing import Any
@@ -95,6 +97,28 @@ async def run_job(job: dict[str, Any], emit=stdout_emit) -> Result:
     return result
 
 
+async def _run_watching_parent(job: dict[str, Any]) -> Result:
+    """主进程退出时（stdin 读到 EOF）取消任务：适配器的 finally 会关浏览器、杀 biliup。"""
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    assert task is not None
+
+    def watch() -> None:
+        try:
+            while sys.stdin.buffer.read(4096):
+                pass
+        except (OSError, ValueError):
+            pass
+        print("主进程已退出，取消当前任务", file=sys.stderr, flush=True)
+        loop.call_soon_threadsafe(task.cancel)
+        killer = threading.Timer(20, lambda: os._exit(3))  # 清理卡住时强制退出
+        killer.daemon = True
+        killer.start()
+
+    threading.Thread(target=watch, daemon=True).start()
+    return await run_job(job)
+
+
 def main() -> int:
     # Windows 控制台默认 GBK；统一 UTF-8，父进程按 UTF-8 解码
     for stream in (sys.stdout, sys.stderr):
@@ -103,8 +127,15 @@ def main() -> int:
         except (AttributeError, ValueError):
             pass
     # Windows 上 asyncio 默认就是 Proactor 事件循环，patchright 启动浏览器子进程依赖它
-    job = json.loads(sys.stdin.read())
-    result = asyncio.run(run_job(job))
+    # 第一行是任务；runner 会让 stdin 保持打开，用 EOF 表示主进程已经不在了
+    job = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
+    if job.get("watch_parent"):
+        try:
+            result = asyncio.run(_run_watching_parent(job))
+        except asyncio.CancelledError:
+            return 3
+    else:
+        result = asyncio.run(run_job(job))
     stdout_emit({"event": "result", "result": result.to_dict()})
     return 0
 
