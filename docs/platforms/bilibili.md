@@ -329,10 +329,8 @@ mpub login bilibili --account main
 | HTTP 模式各接口字段 | `upload_bfs`（`file_up`/`biz`/`category`/`csrf`）、`create/dyn` 的 `dyn_req` 结构、错误码 4126021 / -101 / -352 | 高（字段）/ 低（能否通过风控） |
 | 动态链接格式 | `https://www.bilibili.com/opus/<dyn_id_str>` | 高 |
 
-## 需要的核心改动（未做，待合入）
+## 相关核心能力
 
-- `models.ErrorCode` 增加 `CONSENT_REQUIRED = "consent_required"`（需要用户本人同意平台规则/协议）。目前「动态发布规范」未同意时
-  用 `needs_action` + `validation` 代替，避免被误读成登录过期或验证码。
-- `mpub login bilibili --interactive`：在 CLI 里提供调用 `run_interactive_login()` 的入口（biliup 交互式登录兜底）。
-- 把 worker 的 `timeout` 放进 `JobContext`，让 biliup 的内部超时跟随 `mpub publish --timeout`（目前只跟随 `[timeouts] publish_video`；
-  `--timeout` 更短时由 worker 取消协程，biliup 进程同样会被杀掉）。
+- 「动态发布规范」未同意时返回 `needs_action`，`error_code` 为 `consent_required`。
+- `mpub login bilibili --interactive`：在真实终端里跑 biliup 自带的交互式登录（兜底）。
+- biliup 的内部超时跟随本次任务的总超时（`mpub publish --timeout` 或 `[timeouts] publish_video`）。

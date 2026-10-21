@@ -15,7 +15,7 @@ from typing import Any, Iterator
 from filelock import FileLock, Timeout
 
 from .config import Settings
-from .models import PlatformPost, Result, Status
+from .models import ErrorCode, PlatformPost, Result, Status
 
 
 def post_fingerprint(post: PlatformPost) -> str:
@@ -78,8 +78,8 @@ def find_previous(settings: Settings, fingerprint: str) -> dict[str, Any] | None
             continue
         if row.get("status") in _DONE:
             return row
-        if row.get("submit_started") and row.get("status") == Status.FAILED.value:
-            return row  # 结果未知，同样需要人确认
+        if row.get("status") == Status.FAILED.value and row.get("error_code") == ErrorCode.UNKNOWN_OUTCOME.value:
+            return row  # 已触发发布但结果未知，同样需要人确认
     return None
 
 

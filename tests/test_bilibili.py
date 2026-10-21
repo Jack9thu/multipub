@@ -1116,7 +1116,7 @@ async def test_spec_needs_consent_in_headless_before_submit(settings, fast_note)
     page = _FakePage(visible={".bili-dyn-publishing"})
     with pytest.raises(NeedsAction, match="confirm_dynamic_rules") as info:
         await pub._run(page, title="t", text="x", images=[], timer_pub_time=None, aigc=False, pic_mode=None)
-    assert not ctx.submit_started and info.value.code is ErrorCode.VALIDATION
+    assert not ctx.submit_started and info.value.code is ErrorCode.CONSENT_REQUIRED
     # 已同意（cookie 为 1）就不拦
     agreed = _FakePage(visible={".bili-dyn-publishing"}, cookies=[{"name": "dy_spec_agreed", "value": "1"}])
     assert await pub._spec_agreed(agreed)

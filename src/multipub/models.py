@@ -41,6 +41,7 @@ class ErrorCode(str, enum.Enum):
     CAPTCHA = "captcha"  # 平台弹出人机验证
     SMS_CODE_REQUIRED = "sms_code_required"
     RISK_CONTROL = "risk_control"  # 412 / 40352 等风控拦截
+    CONSENT_REQUIRED = "consent_required"  # 需要用户本人确认平台规范（如 B站《动态发布规范》）
     PLATFORM_ERROR = "platform_error"  # 平台返回了明确的失败
     UNKNOWN_OUTCOME = "unknown_outcome"  # 已点了发布但没拿到确定结果：先去后台确认，不要重发
     INTERNAL = "internal"
@@ -56,8 +57,10 @@ class PublishError(Exception):
     retryable: bool = False
 
     def __init__(self, message: str, *, code: ErrorCode | None = None,
-                 retryable: bool | None = None, evidence: list[str] | None = None):
+                 retryable: bool | None = None, evidence: list[str] | None = None,
+                 url: str | None = None):
         super().__init__(message)
+        self.url = url  # 例如风控验证页、草稿编辑页
         if code is not None:
             self.code = code
         if retryable is not None:

@@ -29,10 +29,11 @@ from .platforms.base import JobContext, stdout_emit
 
 
 def _failure(ctx: JobContext, status: Status, code: str, message: str,
-             retryable: bool, evidence: list[str] | None = None, kind: str = "") -> Result:
+             retryable: bool, evidence: list[str] | None = None, kind: str = "",
+             url: str | None = None) -> Result:
     return Result(
         platform=ctx.platform, account=ctx.account, action=ctx.action, status=status,
-        kind=kind, message=message, error_code=code,
+        kind=kind, message=message, error_code=code, url=url,
         # 已经触发过发布就绝不标记为可重试
         retryable=retryable and not ctx.submit_started,
         submit_started=ctx.submit_started,
@@ -53,6 +54,7 @@ async def run_job(job: dict[str, Any], emit=stdout_emit) -> Result:
         headless=bool(job.get("headless", settings.browser.headless)),
         run_dir=Path(job.get("run_dir") or settings.runs_dir / "adhoc"),
         emit=emit,
+        timeout=job.get("timeout"),
     )
     post = PlatformPost.from_dict(job["post"]) if job.get("post") else None
     kind = post.kind.value if post else ""
@@ -72,7 +74,8 @@ async def run_job(job: dict[str, Any], emit=stdout_emit) -> Result:
         timeout = job.get("timeout")
         result = await (asyncio.wait_for(coro, timeout) if timeout else coro)
     except PublishError as exc:
-        result = _failure(ctx, exc.status, exc.code.value, str(exc), exc.retryable, exc.evidence, kind)
+        result = _failure(ctx, exc.status, exc.code.value, str(exc), exc.retryable, exc.evidence, kind,
+                          getattr(exc, "url", None))
     except asyncio.TimeoutError:
         msg = "超时"
         if ctx.submit_started:

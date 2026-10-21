@@ -223,7 +223,7 @@ class BrowserNotePublisher:
         spec_pending = not timer_pub_time and not await self._spec_agreed(page)
         if spec_pending and not self.spec_consent:
             if self.ctx.headless:
-                raise NeedsAction(spec_needs_action_message(), code=ErrorCode.VALIDATION)
+                raise NeedsAction(spec_needs_action_message(), code=ErrorCode.CONSENT_REQUIRED)
             log("发布时会弹出《动态发布规范》确认框：请在浏览器窗口里阅读后点「确认并发送」", level="warning")
 
         if title:

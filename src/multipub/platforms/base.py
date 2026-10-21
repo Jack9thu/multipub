@@ -41,6 +41,7 @@ class JobContext:
     headless: bool
     run_dir: Path
     emit: EmitFn = stdout_emit
+    timeout: float | None = None  # 本次任务的总超时（秒），适配器可据此安排各步骤的期限
     submit_started: bool = False
     evidence: list[str] = field(default_factory=list)
 

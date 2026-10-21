@@ -177,8 +177,12 @@ def cmd_login(args: argparse.Namespace, settings: Settings, out: Printer) -> int
     settings.ensure_dirs()
     platform = normalize_platform(args.platform)
     cls = load_adapter(platform)
-    if cls.interactive_login:
-        return cls.run_interactive_login(settings, args.account)
+    if cls.interactive_login or args.interactive:
+        try:
+            return cls.run_interactive_login(settings, args.account)
+        except NotImplementedError:
+            out.info(f"{DISPLAY_NAMES[platform]}没有终端交互式登录，去掉 --interactive 即可")
+            return EXIT_USAGE
     headless = bool(args.headless)  # 登录默认有头，方便直接在浏览器窗口里扫码
     with history.account_lock(settings, platform, args.account):
         result = run_worker(settings, action="login", platform=platform, account=args.account,
@@ -423,6 +427,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("platform")
     s.add_argument("--account", default="default")
     s.add_argument("--headless", action="store_true", help="无头登录（只输出二维码图片，不弹窗口）")
+    s.add_argument("--interactive", action="store_true",
+                   help="在当前终端里跑平台自带的交互式登录（目前仅 B站：biliup login）")
 
     s = sub.add_parser("check", parents=[common], help="检查账号登录是否有效")
     s.add_argument("platforms", nargs="*", help="平台，省略表示全部")
