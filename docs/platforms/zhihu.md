@@ -29,7 +29,7 @@
 | `body` / `body_file` | Markdown（规则见下文） | 纯文本，一行一段，空行去掉 |
 | `images` | 正文里没引用到的图片依次追加在文末 | 最多 9 张 |
 | `cover` | 文章题图 | 忽略（警告） |
-| `tags` | 话题，尽力匹配前 3 个；匹配不到只警告 | 默认忽略；`tags_in_text: true` 时以 `#话题#` 文本附在正文末尾 |
+| `tags` | 话题，尽力匹配前 3 个；匹配不到只警告。没有同名话题时只采用名字互相包含的联想结果（如「徒步」→「徒步旅行」，message 里会说明），不相干的不加 | 默认忽略；`tags_in_text: true` 时以 `#话题#` 文本附在正文末尾 |
 | `ai_generated` | `true` 且没写 `statement` 时，创作声明为「包含 AI 辅助创作」 | 不生效（警告） |
 | `schedule` | 不支持（报错） | 不支持（报错） |
 
@@ -71,6 +71,7 @@ platforms:
 | 定时 | 设置了 `schedule` | error |
 | 文章标题 | 必填，≤100 字 | error |
 | 文章正文里的本地图片 | 文件必须存在；不支持 `data:` 内嵌图 | error |
+| 文章的 `images` | 文件必须存在（想法的图片由通用校验检查） | error |
 | 正文里的原始 HTML `<img>` | 不会上传到知乎图床（`*.zhimg.com` 的除外），可能显示不出来，请改用 `![](路径)` | warning |
 | 图片格式 | `.jpg .jpeg .png .gif .webp .bmp`；webp/bmp 自动转 JPEG | error |
 | GIF | 动图只保留第一帧（转成 JPEG） | warning |
@@ -94,7 +95,7 @@ platforms:
 | 开头的 YAML front matter（`---` … `---`） | 丢弃 |
 | 开头唯一的 `# 一级标题`（或与 `title` 相同） | 丢弃（标题是单独字段） |
 | 其余标题 | 正文里**最浅的一级** → `<h2>`，次一级 → `<h3>`，更深 → `<p><b>…</b></p>`（知乎只有两级标题） |
-| 段落里的单个换行 | 拆成多个 `<p>`（知乎一行一段） |
+| 段落里的单个换行 | 拆成多个 `<p>`（知乎一行一段）；粗体 / 斜体 / 删除线 / 链接**里面**的换行写成 `<br/>`，不拆段（否则标签交错） |
 | `**粗**` / `*斜*` / `~~删~~` / `` `代码` `` | `<b>` / `<i>` / `<del>` / `<code>` |
 | 代码块 | `<pre lang="python">…</pre>` |
 | 表格 | `<table data-draft-node="block" data-draft-type="table" data-size="normal" data-row-style="normal"><tbody>`，表头行放进 tbody（保留 `<th>`） |
@@ -108,7 +109,9 @@ platforms:
 
 1. 读本地文件，或**下载**正文里的远程图片（http/https，≤20MB，不带知乎 cookie）。已在 `*.zhimg.com` 的图片直接引用。
    远程图片没有用 `zhuanlan.zhihu.com/api/uploaded_images`（服务端抓取）接口，统一走下面的上传流程，少一个未验证接口。
-2. JPEG / PNG 原样上传；WebP、BMP、GIF（第一帧）等用 Pillow 转成 JPEG。
+2. JPEG / PNG 原样上传（手机的 Ultra HDR / 深度图照片 Pillow 识别为 MPO，也按 JPEG 原样上传）；WebP、BMP、GIF（第一帧）
+   等先按 EXIF 方向把像素转正，再用 Pillow 转成 JPEG（转码不保留 EXIF）。`data-rawwidth / rawheight` 按显示方向记
+   （EXIF 旋转 90° 的竖拍照片宽高互换）。超过约 1.8 亿像素的图片（Pillow 的解压炸弹保护）报 `validation`。
 3. `POST https://api.zhihu.com/images {"image_hash": md5, "source": "article"|"pin"}`：
    `state=1` 知乎已有，跳过上传；`state=2` 用返回的临时凭证 `PUT https://zhihu-pics-upload.zhimg.com/<object_key>`，
    阿里云 OSS v1 签名（bucket 是 `zhihu-pics`），签名头包含 `x-oss-date`、`x-oss-security-token`、`x-oss-user-agent`。
@@ -123,16 +126,23 @@ mpub login zhihu --account main --headless    # 无头：扫上报的二维码�
 mpub check zhihu --account main
 ```
 
-1. 已有登录文件且 `GET /api/v4/me` 正常 → 直接返回「已登录」（要换号先删除登录文件）。
+1. 已有登录文件、`GET /api/v4/me` 正常、且没有待完成的风控验证（见第 4 条）→ 直接返回「已登录」（要换号先删除登录文件）。
 2. 否则打开 `https://www.zhihu.com/signin`。登录页自己请求二维码接口（`/api/v3/account/api/login/qrcode`）时，
    拦截返回的 `link` 重新生成二维码 PNG（`<数据目录>/qrcode/zhihu-<账号>.png`）并上报 `qrcode` 事件；
    8 秒内没拦到就截取二维码区域（或整页）作为替代。二维码刷新会再次上报。
-3. 等到 `z_c0` cookie 出现（最长 `timeouts.login` − 45 秒，默认 255 秒），再打开一次首页补齐 `_xsrf` / `d_c0`，
-   保存 `storage_state` 到 `<数据目录>/accounts/zhihu/<账号>.json`，然后用接口校验一次。
+3. 等到 `z_c0` cookie 出现。最长等待 = 本次任务的总超时（`ctx.timeout`，即 `--timeout` 或 `timeouts.login` − 30）
+   − 45 秒，从任务开始算（默认 300 → 270 → 225 秒），留出收尾时间，免得扫完码被 worker 的总超时打断。
+   一拿到 `z_c0` 就先把 `storage_state` 存到 `<数据目录>/accounts/zhihu/<账号>.json`，再打开一次首页补齐
+   `_xsrf` / `d_c0` 并覆盖保存，然后用接口校验一次；首页刷新慢或任务超时也不会白扫一次码。
    登录浏览器的 User-Agent 记到 `accounts/zhihu/<账号>.ua.txt`（无头模式的 `HeadlessChrome` 改回 `Chrome`），
    之后发布请求沿用它，让登录和发布看起来是同一个浏览器；没有这个文件就用内置的 Windows Chrome UA。
 4. **风控验证**：发布或检查时遇到 40352，验证页地址会记到 `accounts/zhihu/<账号>.verify.txt`；
    下次 `mpub login zhihu`（有头）会**带着现有登录态**打开验证页，你完成验证、页面离开验证页后自动保存。
+   打开前仍先调一次 `/me`：登录已失效 → 改成正常扫码登录；`/me` 也被风控 → 用这次返回的新验证页地址
+   （旧地址里的 `session` 可能已过期）；`/me` 正常也照样打开验证页（读接口正常不代表发布接口已放行，
+   已放行的验证页会自动跳走，立即完成）。**无头模式**下验证页 20 秒内没自动放行就返回
+   `needs_action` / `risk_control`（`url` 是验证页），提示去掉 `--headless` 重来，不会傻等到超时。
+   之后任何一次发布成功（含只存草稿）都会删掉这个文件。
 
 登录文件也可以手动放：`storage_state` 格式、浏览器插件导出的 cookie 列表，或 `{"z_c0": "...", "_xsrf": "..."}` 都能读
 （UTF-8，可带 BOM）。
@@ -161,6 +171,7 @@ mpub check zhihu --account main
 | 文章发布成功但暂时查不到 | `submitted` | 同上 | 可能在审核中 |
 | 只存草稿 | `draft` | `https://zhuanlan.zhihu.com/p/<id>/edit` | 声明 / 专栏需在编辑页发布时自己选 |
 | 知乎明确拒绝发布文章（`code≠0`，或 HTTP 4xx 且不是登录失效 / 风控） | `failed` / `platform_error` | 编辑页链接 | 内容已在草稿箱，可修改后手动发布 |
+| 文章发布接口返回 200 但没有 `code` | 响应里带文章 id 且能查到 → `published`；否则 `failed` / `unknown_outcome` | 编辑页链接 | 不会拿草稿 id 去查（草稿和文章同一个 id，查到草稿不代表已发布） |
 | 想法发布成功 | `published` / `submitted` | `https://www.zhihu.com/pin/<id>` | 没拿到 id 时 `submitted` 且无链接 |
 | 想法被拒绝 | `failed` / `platform_error` | — | |
 
@@ -172,9 +183,9 @@ mpub check zhihu --account main
 | HTTP 403 + `error.code=40352`（验证页地址写进 message）、`zh-zse-ck` 挑战、HTTP 429 | `needs_action` / `risk_control` |
 | 发布前网络错误、5xx、图片处理超时 | `failed`（可重试） |
 | 发布请求已发出后超时 / 断网 / 5xx / 返回无法识别 | `failed` / `unknown_outcome`（**先去知乎确认，不要直接重发**） |
-| 建草稿之后出错 | 错误信息末尾带「草稿已保存：<编辑页链接>」（结果未知时是「文章编辑页：<链接>」） |
+| 建草稿之后出错 | 错误信息末尾带「草稿已保存：<编辑页链接>」（结果未知时是「文章编辑页：<链接>」），结果的 `url` 也是编辑页链接（风控时是验证页） |
 | 话题搜索 / 添加被风控（40352、429）或接口报错 | 只在 message 里警告，**继续发布**（登录失效除外：直接中止） |
-| 正文引用的图片找不到、远程图片下载失败（HTTP 非 200）或超过 20MB、文件不是图片 | `failed` / `validation` |
+| 正文引用的图片找不到、远程图片下载失败（HTTP 非 200）或超过 20MB、文件不是图片、分辨率过大 | `failed` / `validation` |
 
 发布接口只调用一次，绝不自动重试。发布结果不是干净的成功时（被拒、结果未知、没拿到 id），发布接口的原始响应会存成
 `<数据目录>/runs/<本次运行>/zhihu/zhihu-publish-response.txt`，路径在结果的 `evidence` 里（响应里没有 cookie）。
@@ -205,6 +216,8 @@ mpub check zhihu --account main
 | 写草稿正文 | `PATCH https://zhuanlan.zhihu.com/api/articles/<id>/draft` | 高 |
 | 封面 | 同一 PATCH，`titleImage` = 图片 `original_src`，`isTitleImageFullScreen: false` | 中 |
 | 话题 | `GET zhuanlan/api/autocomplete/topics` + `POST zhuanlan/api/articles/<id>/topics`（zhihu_obsidian 自己标注「不可用」） | 低 |
+| 图片方向 | 原样上传的 JPEG 带 EXIF 方向时，知乎图床 / 页面是否按 EXIF 转正（浏览器会；`data-rawwidth/height` 按显示方向写） | 低 |
+| 段内换行 | 标签内部的换行写成 `<br/>` 后知乎是否保留（zhihu_obsidian 的做法） | 中 |
 | 发布 | `POST https://www.zhihu.com/api/v4/content/publish`，`action: article / pin`，请求体字段合并自三个项目 | 中高 |
 | `pc_business_params` 的具体键 | 含 `title` / `content`、`commercial_report_info` 等 | 中 |
 | 专栏 | `data.column = {"column": ["c_…"]}`，并去掉 `pc_business_params.column` | 低 |

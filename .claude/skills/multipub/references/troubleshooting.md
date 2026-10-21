@@ -51,7 +51,7 @@
 | `正被另一个任务使用` | 同一平台同一账号已有任务在跑（可能是另一个终端）。等它结束 |
 | 抖音要短信验证码 | 看到 `needs_input` 后问用户要验证码，`uv run mpub verify-code douyin <验证码>`。默认等 5 分钟（config `[platforms.douyin] sms_timeout`）。不要同时用两个抖音账号发布（验证码文件共用） |
 | 抖音「自主声明设置失败」（`validation`） | `declaration` 必须与页面上的选项文字完全一致，或设为 `false` 不声明 |
-| 抖音/小红书某一步 `timeout` | 平台可能改版了：看截图停在哪一步；加 `--headed` 重试观察。上传大文件：调大 config `[timeouts] publish_video`（上传等待 = 它 − 600 秒），并加同样的 `--timeout` |
+| 抖音/小红书某一步 `timeout` | 平台可能改版了：看截图停在哪一步；加 `--headed` 重试观察。上传大文件：加大 `--timeout`（或 config `[timeouts] publish_video`；上传等待 = 任务超时 − 600 秒） |
 | 小红书发布页出现上次没发出去的内容 | 小红书可能恢复草稿；先在网页上清掉草稿再发 |
 | 小红书没有作品链接 | 正常：小红书不返回可分享链接，`item_id` 是笔记 ID，到「笔记管理」查看 |
 | 抖音 `submitted` 但没有链接 | 没监听到创建接口回执，到「作品管理」查看 |

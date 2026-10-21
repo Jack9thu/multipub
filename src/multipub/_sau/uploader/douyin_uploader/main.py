@@ -19,7 +19,7 @@ from multipub._sau import conf as sau_conf
 from multipub._sau.conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from multipub._sau.runtime import (CookieInvalid, Deadline, DeclarationFailed, Hooks, SauError, SmsCodeTimeout,
                                    SmsVerifyFailed, UploadFailed, close_quietly, fail_rejected, fail_step,
-                                   save_screenshot, save_state_quietly)
+                                   find_visible_text, publish_button_ready, save_screenshot, save_state_quietly)
 from multipub._sau.uploader.base_video import BaseVideoUploader
 from multipub._sau.utils.base_social_media import set_init_script
 from multipub._sau.utils.login_qrcode import build_login_qrcode_path
@@ -519,6 +519,10 @@ class DouYinBaseUploader(BaseVideoUploader):
         入口/弹窗异步渲染；且填完话题后残留的 mention-wrapper/semi-portal 浮层会盖住入口，
         必须先清浮层再点。失败返回 False。
 
+        multipub patch: 抖音组件常吞掉点击且不抛异常，所以不再"点完就算成功"：选项要真的变成选中状态、
+        点「确定」后弹窗要关闭（取不到选中状态时，改为核实入口处显示了所选声明），否则返回 False
+        （调用方拒绝发布）。
+
         Args:
             declaration: 声明类型文本（调用方显式传入）
         """
@@ -559,14 +563,24 @@ class DouYinBaseUploader(BaseVideoUploader):
             ).first
             if await option.count() == 0:
                 option = dialog.locator("label.semi-radio").filter(has_text=declaration).first
+            checked: bool | None = None  # None：不是 label.semi-radio 结构，选中状态无从判断
             if await option.count():
                 try:
                     await option.click(timeout=6000)
                 except Exception:
                     await _native_click(page, option)
+                await page.wait_for_timeout(400)
+                checked = await self._radio_checked(option)
+                if not checked:  # 普通点击被组件吞掉：派发完整原生事件再试一次
+                    await _native_click(page, option)
+                    await page.wait_for_timeout(400)
+                    checked = await self._radio_checked(option)
+                if not checked:
+                    douyin_logger.warning(_msg("🧾", f"点了「{declaration}」但选项没有变成选中状态"))
+                    return False
             else:
                 await dialog.get_by_text(declaration, exact=True).first.click(timeout=6000, force=True)
-            await page.wait_for_timeout(400)
+                await page.wait_for_timeout(400)
 
             # 确定：footer 的 primary 按钮
             confirm_btn = dialog.locator("button.semi-button-primary").filter(has_text="确定").first
@@ -574,19 +588,49 @@ class DouYinBaseUploader(BaseVideoUploader):
                 confirm_btn = dialog.get_by_role("button", name="确定").first
             if await confirm_btn.count() == 0:
                 confirm_btn = page.get_by_role("button", name="确定").first
-            try:
-                await confirm_btn.click(timeout=6000)
-            except Exception:
-                await _native_click(page, confirm_btn)
-            try:
-                await dialog.first.wait_for(state="hidden", timeout=6000)
-            except Exception:
-                pass
+            if not await self._dialog_closed_after(page, dialog, confirm_btn):
+                douyin_logger.warning(_msg("🧾", "点「确定」后声明弹窗没有关闭"))
+                return False
+            if checked is None and not await find_visible_text(page, [declaration], exclude=".semi-modal"):
+                douyin_logger.warning(_msg("🧾", f"声明弹窗已关闭，但页面上没有显示「{declaration}」"))
+                return False
             douyin_logger.success(_msg("🧾", f"自主声明已选择「{declaration}」"))
             return True
         except Exception as exc:
-            douyin_logger.warning(_msg("🧾", f"自主声明设置失败，跳过该步骤继续发布：{exc}"))
+            douyin_logger.warning(_msg("🧾", f"自主声明设置失败：{exc}"))
             return False
+
+    @staticmethod
+    async def _radio_checked(label) -> bool:
+        """multipub patch: Semi 单选项是否处于选中状态（label 带 semi-radio-checked，或内部 radio 已勾选）。"""
+        try:
+            if "semi-radio-checked" in (await label.get_attribute("class") or ""):
+                return True
+            radio = label.locator('input[type="radio"]').first
+            return bool(await radio.count() and await radio.is_checked())
+        except Exception:
+            return False
+
+    @staticmethod
+    async def _dialog_closed_after(page: Page, dialog, button) -> bool:
+        """multipub patch: 点按钮后弹窗关闭才算生效；普通点击没关掉就用原生事件再点一次。"""
+        for attempt in range(2):
+            clicked = False
+            if attempt == 0:
+                try:
+                    await button.click(timeout=6000)
+                    clicked = True
+                except Exception:
+                    pass
+            if not clicked:
+                clicked = await _native_click(page, button)
+            try:
+                await dialog.first.wait_for(state="hidden", timeout=6000)
+                return True
+            except Exception:
+                if not clicked:  # 按钮点不到，弹窗也没关
+                    return False
+        return False
 
     async def select_bgm(self, page: Page, bgm_name: str) -> bool:
         """为图文发布选择 BGM：可选增强功能，搜索无结果或异常均跳过不中断发布。"""
@@ -708,13 +752,21 @@ class DouYinBaseUploader(BaseVideoUploader):
                 await asyncio.sleep(0.5)
         await self._drain_publish_responses()
 
+    PUBLISH_CLICK_TIMEOUT_MS = 5000
+
     async def _click_publish(self, button, **click_kwargs) -> bool:
-        """受 PublishGuard 限制地点击最终「发布」；第一次点击前通知适配器。返回是否点击了。"""
+        """受 PublishGuard 限制地点击最终「发布」；第一次点击前通知适配器。返回是否点击了。
+
+        按钮不唯一 / 不可见 / 不可用时不点、不记账、不标记已提交（这样的点击不会生效：
+        force 点 disabled 按钮什么也不发生），继续在发布截止时间内等它变得可点。"""
         if not self.publish_guard.may_click():
+            return False
+        if not await publish_button_ready(button):
+            douyin_logger.debug(_msg("🧍", "发布按钮还不能点（不唯一、不可见或不可用），小人再等等"))
             return False
         self._before_publish_click()
         self.publish_guard.clicked()  # 先记账再点：点击抛异常时也可能已经触发
-        await button.click(**click_kwargs)
+        await button.click(timeout=self.PUBLISH_CLICK_TIMEOUT_MS, **click_kwargs)
         self.publish_guard.click_returned()
         return True
 
@@ -908,7 +960,7 @@ class DouYinVideo(DouYinBaseUploader):
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
         declaration: str | None = None,
-        sync_toutiao: bool = False,
+        sync_toutiao: bool | None = None,
         hooks: Hooks | None = None,
     ):
         super().__init__(
@@ -919,8 +971,8 @@ class DouYinVideo(DouYinBaseUploader):
             headless=headless,
             hooks=hooks,
         )
-        # multipub patch: 头条/西瓜同步开关改为显式开启（上游强制打开）
-        self.sync_toutiao = bool(sync_toutiao)
+        # multipub patch: 头条/西瓜同步开关改为显式设置（上游强制打开）：None 不碰，True 打开，False 关闭
+        self.sync_toutiao = None if sync_toutiao is None else bool(sync_toutiao)
         self._upload_retries = 0
         self.title = title
         self.file_path = file_path
@@ -939,7 +991,59 @@ class DouYinVideo(DouYinBaseUploader):
         if not await self.set_self_declaration(page, self.declaration):
             # multipub patch: 专门的异常类型，适配器据此提示检查声明文字（上游是 RuntimeError）
             await save_screenshot(page, self.hooks, "declaration")
-            raise DeclarationFailed(f"自主声明「{self.declaration}」设置失败，拒绝继续发布")
+            raise DeclarationFailed(
+                f"自主声明「{self.declaration}」设置失败（没能确认已选中），拒绝继续发布，作品没有发出。"
+                "请确认 platforms.douyin.declaration 与页面上的选项文字完全一致，或设为 false 不声明"
+            )
+
+    SYNC_SWITCH_SELECTOR = '[class^="info"] > [class^="first-part"] div div.semi-switch'  # 上游选择器
+    SYNC_SWITCH_LABEL_RE = re.compile("头条|西瓜")
+
+    async def apply_sync_toutiao(self, page: Page) -> None:
+        """multipub patch: 「同步到今日头条/西瓜视频」开关按调用方的显式设置打开或关闭，并核实。
+
+        只动旁边写着「头条/西瓜」的那个开关（选择器是上游的旧选择器，改版后可能命中别的开关）。
+        要求关闭却关不掉时拒绝发布（不能违背调用方的明确选择去同步）；要求打开却打不开只告警。
+        """
+        if self.sync_toutiao is None:
+            return
+        want = self.sync_toutiao
+        switch = page.locator(self.SYNC_SWITCH_SELECTOR).first
+        if not await switch.count():
+            douyin_logger.warning(_msg("😵", "没找到「同步到今日头条/西瓜」开关，" + ("未开启同步" if want else "无需关闭")))
+            return
+        try:
+            label = await switch.evaluate(
+                "el => { let n = el; for (let i = 0; i < 4 && n.parentElement; i++) n = n.parentElement;"
+                " return n.innerText || ''; }"
+            )
+        except Exception:
+            label = ""
+        if not self.SYNC_SWITCH_LABEL_RE.search(str(label or "")):
+            douyin_logger.warning(_msg("😵", "开关旁边没有「头条/西瓜」字样，可能是页面改版，没有改动它"))
+            return
+
+        async def is_on() -> bool:
+            return "semi-switch-checked" in (await switch.get_attribute("class") or "")
+
+        if await is_on() == want:
+            return
+        try:
+            await switch.locator("input.semi-switch-native-control").click()
+            await page.wait_for_timeout(500)
+            ok = await is_on() == want
+        except Exception:
+            ok = False
+        if ok:
+            douyin_logger.success(_msg("🔁", "已" + ("打开" if want else "关闭") + "「同步到今日头条/西瓜」"))
+        elif want:
+            douyin_logger.warning(_msg("😵", "没能打开「同步到今日头条/西瓜」开关，按不同步发布"))
+        else:
+            await save_screenshot(page, self.hooks, "sync-toutiao")
+            raise DeclarationFailed(
+                "「同步到今日头条/西瓜」开关处于打开状态且没能关闭（sync_toutiao: false），拒绝继续发布，作品没有发出。"
+                "请在网页上手动关闭后重发，或删掉 sync_toutiao 保持页面默认"
+            )
 
     async def _clear_blocking_overlays(self, page: Page) -> None:
         """清除会拦截点击的浮层：填完话题后残留的话题/@提及下拉(publish-mention-wrapper)
@@ -1044,6 +1148,26 @@ class DouYinVideo(DouYinBaseUploader):
 
     async def _platform_blocked_publish(self, page: Page) -> bool:
         return bool(await self.handle_auto_video_cover(page))
+
+    async def _wait_for_publish_form(self, page: Page, deadline: Deadline) -> None:
+        """multipub patch: 在上传截止时间内等发布表单（标题框）出现，期间照常检查上传失败。"""
+        title_input = page.locator('input[placeholder*="填写作品标题"]').first
+        failed_marker = page.locator('div.progress-div > div:has-text("上传失败")')
+        while not deadline.expired:
+            try:
+                if await title_input.count() and await title_input.is_visible():
+                    return
+                if await failed_marker.count():
+                    douyin_logger.error(_msg("😵", "检测到上传失败，小人准备重试"))
+                    await self.handle_upload_error(page)
+            except SauError:
+                raise
+            except Exception:
+                pass
+            douyin_logger.debug(_msg("🧍", "发布表单还没出来（视频可能还在上传），小人继续等"))
+            await asyncio.sleep(self.hooks.poll_interval)
+        await fail_step(page, self.hooks, deadline, after_submit=False,
+                        detail="发布表单（标题框）一直没有出现")
 
     async def handle_upload_error(self, page):
         # multipub patch: 重传次数有上限，超过后失败（上游会无限重传）
@@ -1304,13 +1428,17 @@ class DouYinVideo(DouYinBaseUploader):
                     douyin_logger.debug(_msg("🧍", "还没进到视频发布页面，小人继续等一会"))
                     await asyncio.sleep(0.5)
 
+        # multipub patch: 上传等待从这里开始计时：version_2 发布页要等视频传完才渲染表单，
+        # 等表单和等「重新上传」共用同一个 upload_timeout（上游在填表时固定等 120 秒，大文件会失败）
+        deadline = Deadline(self.hooks.upload_timeout, "等待视频上传完成")
+        await self._wait_for_publish_form(page, deadline)
+
         await asyncio.sleep(1)
         douyin_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_title_and_description(page, self.title, self.desc, self.tags)
         douyin_logger.info(_msg("🏷️", f"小人一共贴了 {len(self.tags)} 个话题"))
 
         # multipub patch: 带截止时间；重传次数有上限（handle_upload_error 抛 UploadFailed）
-        deadline = Deadline(self.hooks.upload_timeout, "等待视频上传完成")
         while True:
             if deadline.expired:
                 await fail_step(page, self.hooks, deadline, after_submit=False)
@@ -1346,11 +1474,8 @@ class DouYinVideo(DouYinBaseUploader):
         # 再设封面（放最后，关掉弹窗，避免残留浮层挡住发布按钮）
         await self.set_thumbnail(page)
 
-        # multipub patch: 头条/西瓜同步开关只在 sync_toutiao=True 时打开，否则保持页面默认
-        third_part_element = '[class^="info"] > [class^="first-part"] div div.semi-switch'
-        if self.sync_toutiao and await page.locator(third_part_element).count():
-            if "semi-switch-checked" not in await page.eval_on_selector(third_part_element, "div => div.className"):
-                await page.locator(third_part_element).locator("input.semi-switch-native-control").click()
+        # multipub patch: 头条/西瓜同步开关只按 sync_toutiao 显式设置（None 保持页面默认），见 apply_sync_toutiao
+        await self.apply_sync_toutiao(page)
 
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)

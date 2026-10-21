@@ -8,8 +8,7 @@
 - `--json` / `--home` 只能写在**子命令后面**（`mpub --json doctor` 是用法错误）。
 - `--home`：数据目录，默认 `%LOCALAPPDATA%\multipub`（或环境变量 `MULTIPUB_HOME`）。
 - `--json` 时：
-  - **stdout** 只有一个 JSON 对象（`indent=2` 多行），在命令结束时输出。例外：`setup` 没有 JSON 输出，`new`、`verify-code` 输出一行纯文本路径，
-    `login --interactive` 不输出 JSON。
+  - **stdout** 只有一个 JSON 对象（`indent=2` 多行），在命令结束时输出。例外：`login --interactive` 不输出 JSON。
   - **stderr**：进度。事件是单行 JSON（以 `{"event":` 开头），其余是普通中文提示行（如「→ 发布到 抖音/main ……」）。
 - 平台名不分大小写，别名：`bilibili|bili|b站|b`、`douyin|dy|抖音`、`xiaohongshu|xhs|小红书|rednote`、`zhihu|zh|知乎`。
 - `<post>`：`post.yaml` 的路径或其所在目录。
@@ -21,7 +20,7 @@
 |---|---|
 | 0 | 全部成功（`ok` / `published` / `submitted` / `scheduled` / `draft` / `dry_run` / `skipped`） |
 | 1 | 至少一个结果 `failed`；`doctor` 有核心检查项不通过；`setup` 有步骤失败 |
-| 2 | 用法错误、清单错误（`error: manifest`）、校验错误（`error: validation`）、`publish` 没加 `--yes` 又不在交互终端、交互确认时回答了「否」、`new` 目标已存在、`verify-code` 平台不是抖音、`login --interactive` 用在不支持的平台 |
+| 2 | 用法错误、清单错误（`error: manifest`）、校验错误（`error: validation`）、`publish` 没加 `--yes` 又不在交互终端（`error: confirmation_required`）、交互确认时回答了「否」、`new` 目标已存在、`verify-code` 平台不是抖音、`login --interactive` 用在不支持的平台 |
 | 3 | 没有失败，但至少一个结果 `needs_action` |
 
 ## 命令
@@ -47,7 +46,8 @@ mpub setup [--skip-browser]
 ```
 
 安装 patchright Chromium（`browser.channel = "chromium"` 且没设 `executable_path` 时；`--skip-browser` 跳过）、下载 biliup。
-已安装的会跳过，可重复运行。**会联网下载**。没有 JSON 输出（加了 `--json` 也只有 stderr 进度），看退出码：0 成功，1 有失败。
+已安装的会跳过，可重复运行。**会联网下载**。`--json` 输出 `{"ok": bool, "steps": [{"name", "ok", "detail"}]}`（下载进度在 stderr）；
+退出码 0 成功，1 有失败。
 
 ### login
 
@@ -98,8 +98,8 @@ mpub accounts [--json]
 mpub new <目录> --kind video|note|article [--force]
 ```
 
-在目录里生成 `post.yaml`（`article` 还会生成 `article.md`，已存在则不动）。stdout 输出 `post.yaml` 的路径（纯文本，加 `--json` 也一样）。
-`post.yaml` 已存在且没加 `--force`：stderr 提示，退出码 2。
+在目录里生成 `post.yaml`（`article` 还会生成 `article.md`，已存在则不动）。stdout 输出 `post.yaml` 的路径；`--json` 时为 `{"ok": true, "path": "...", "kind": "video"}`。
+`post.yaml` 已存在且没加 `--force`：退出码 2（`--json` 时 `{"ok": false, "error": "exists", "message": ...}`）。
 
 ### validate
 
@@ -167,8 +167,8 @@ mpub history [--limit N] [--json]      # 默认最近 30 条
 mpub verify-code douyin <验证码>
 ```
 
-把验证码写进 `<数据目录>\sau\verify_code.txt`（正在等待短信验证的抖音发布会读取它），stdout 输出该文件路径（纯文本）。
-平台不是抖音：退出码 2。
+把验证码写进 `<数据目录>\sau\verify_code.txt`（正在等待短信验证的抖音发布会读取它），stdout 输出该文件路径；`--json` 时为 `{"ok": true, "path": "..."}`。
+平台不是抖音：退出码 2（`--json` 时 `{"ok": false, "error": "unsupported", ...}`）。
 
 ## 数据结构
 
@@ -244,13 +244,13 @@ mpub verify-code douyin <验证码>
 | error_code | 常见 status | 含义 | 怎么办 |
 |---|---|---|---|
 | `login_required` | needs_action | 没有登录文件、登录失效、中途被踢回登录页 | `mpub login <平台> --account <账号>`，成功后只重发该平台（`--to`） |
-| `sms_code_required` | needs_action | 抖音短信验证码没在时限内提交，或 3 轮后仍未通过 | 发布进行中看到 `needs_input` 时就要验证码；已结束：`submit_started: false` 可重发，`true` 先去后台确认 |
-| `captcha` | needs_action | 页面停在人机验证（滑块、极验） | `submit_started: false`：加 `--headed` 重发，让用户在窗口里过验证；否则先去后台确认 |
+| `sms_code_required` | needs_action | 抖音短信验证码没在时限内提交，或 3 轮后仍未通过（只在点发布之前出现；点发布之后的验证以 `unknown_outcome` 返回） | 发布进行中看到 `needs_input` 时就要验证码；已结束：`submit_started: false` 可重发，`true` 先去后台确认 |
+| `captcha` | needs_action | 页面停在人机验证（滑块、极验）（抖音/小红书只在点发布之前出现；点发布之后的验证以 `unknown_outcome` 返回） | `submit_started: false`：加 `--headed` 重发，让用户在窗口里过验证；否则先去后台确认 |
 | `risk_control` | needs_action | 风控拦截：知乎 40352 / 429、B站 412 / -352 | 知乎：`mpub login zhihu --account <账号>`（有头）打开验证页完成验证；B站：别用 `mode: http`，稍后 `--headed` 重试；降低频率 |
 | `consent_required` | needs_action | B站动态需要确认《动态发布规范》，无头模式下发布前就停了（什么都没发） | 让用户选：阅读规范后在清单写 `platforms.bilibili.confirm_rules: true` 或 config `[platforms.bilibili] confirm_dynamic_rules = true`；或 `--headed` 重发并亲手点确认 |
 | `unknown_outcome` | failed | 已点发布，但超时 / 断网 / 进程异常，结果未知 | **绝不重试**。请用户去平台后台确认；确认没发出且用户要求时才 `--force` |
 | `platform_error` | failed | 平台明确拒绝（内容违规、参数不对、账号限制等），或上传失败 | 看 `message`（附平台原文）。`submit_started: true` 时先去后台确认；修改内容后由用户决定是否重发 |
-| `timeout` | failed | 发布动作之前某一步超时（页面改版、网络慢、上传太久） | 可在用户同意后重发；大文件调大 config `[timeouts] publish_video`（抖音/小红书的上传等待由它推算）并配合 `--timeout`；可加 `--headed` 观察 |
+| `timeout` | failed | 发布动作之前某一步超时（页面改版、网络慢、上传太久） | 可在用户同意后重发；大文件加大 `--timeout`（或 config `[timeouts] publish_video`；抖音/小红书的上传等待 = 任务超时 − 600 秒）；可加 `--headed` 观察 |
 | `validation` | failed / skipped | `failed`：发布前校验失败、抖音自主声明文字与页面不符、正文图片找不到。`skipped`：查重命中（同一内容已发过） | `failed`：改清单后重新 validate；`skipped`：告诉用户已经发过，用户明确要求才 `--force` |
 | `unsupported` | skipped | 平台不支持该内容类型 | 无需处理（知乎不支持视频；B站/抖音/小红书不支持文章） |
 | `internal` | failed | 环境问题或程序错误：缺 biliup、worker 崩溃、账号被另一个任务占用 | 看 `message` 和 `evidence` 里的日志：缺 biliup → `mpub setup`；「正被另一个任务使用」→ 等它结束；其余报告问题 |

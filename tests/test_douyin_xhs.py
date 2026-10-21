@@ -16,7 +16,7 @@ import pytest
 
 from multipub.config import Settings, load_settings
 from multipub.models import (ErrorCode, Kind, LoginRequired, PlatformPost,
-                             PublishError, Status, ValidationFailed)
+                             PublishError, Result, Status, ValidationFailed)
 from multipub.platforms import _sau_bridge as bridge
 from multipub.platforms.base import JobContext
 from multipub.platforms.douyin import DouyinAdapter, cover_slots, resolve_declaration
@@ -70,6 +70,8 @@ def login_file(ctx: JobContext) -> Path:
 
 
 class FakeLocator:
+    """按选择器字符串平铺查找：子定位器（locator / filter / nth）只看最后一级选择器。"""
+
     def __init__(self, page: "FakePage", key: str):
         self.page, self.key = page, key
 
@@ -77,11 +79,34 @@ class FakeLocator:
     def first(self) -> "FakeLocator":
         return self
 
+    last = first
+
+    def nth(self, index: int) -> "FakeLocator":
+        return self
+
+    def filter(self, **_: Any) -> "FakeLocator":
+        return self
+
+    def locator(self, selector: str) -> "FakeLocator":
+        return FakeLocator(self.page, selector)
+
+    def get_by_text(self, text: str, exact: bool = False) -> "FakeLocator":
+        return FakeLocator(self.page, f"text={text}")
+
+    def get_by_role(self, role: str, name: str = "", exact: bool = False) -> "FakeLocator":
+        return FakeLocator(self.page, f"role={role}:{name}")
+
     async def count(self) -> int:
-        return 1 if self.page.visible.get(self.key) else 0
+        return self.page.counts.get(self.key, 1) if self.page.visible.get(self.key) else 0
 
     async def is_visible(self) -> bool:
         return bool(self.page.visible.get(self.key))
+
+    async def is_enabled(self) -> bool:
+        return self.key not in self.page.disabled
+
+    async def is_checked(self) -> bool:
+        return self.page.attrs.get((self.key, "checked")) is not None
 
     async def click(self, **_: Any) -> None:
         if not self.page.visible.get(self.key):
@@ -94,12 +119,28 @@ class FakeLocator:
     async def fill(self, value: str, **_: Any) -> None:
         self.page.filled[self.key] = value
 
-    async def wait_for(self, state: str = "visible", timeout: float | None = None) -> None:
-        if not self.page.visible.get(self.key):
-            raise RuntimeError(f"等不到元素 {self.key}")
+    async def set_input_files(self, files: Any, **_: Any) -> None:
+        self.page.uploads.append(self.key)
 
-    async def get_attribute(self, name: str) -> None:
+    async def wait_for(self, state: str = "visible", timeout: float | None = None) -> None:
+        shown = bool(self.page.visible.get(self.key))
+        if shown != (state in ("visible", "attached")):
+            raise RuntimeError(f"等不到元素 {self.key} 变成 {state}")
+
+    async def get_attribute(self, name: str) -> str | None:
+        return self.page.attrs.get((self.key, name))
+
+    async def evaluate(self, *args: Any) -> Any:
+        return self.page.attrs.get((self.key, "evaluate"))
+
+    async def element_handle(self) -> "FakeLocator":
+        return self
+
+    async def scroll_into_view_if_needed(self, **_: Any) -> None:
         return None
+
+    async def bounding_box(self) -> None:
+        return None  # _native_click 退回到 locator.click()
 
 
 class FakeRequest:
@@ -134,6 +175,11 @@ class FakePage:
         self.listeners: dict[str, list[Any]] = {}
         self.clicks: list[str] = []
         self.filled: dict[str, str] = {}
+        self.uploads: list[str] = []
+        self.counts: dict[str, int] = {}  # 选择器命中多个元素
+        self.disabled: set[str] = set()
+        self.attrs: dict[tuple[str, str], Any] = {}  # (选择器, 属性) → 值
+        self.shown_texts: set[str] = set()  # find_visible_text 能看到的文字（输入区以外）
         self.keyboard = FakeKeyboard()
         self.url = "https://creator.example/publish"
 
@@ -146,6 +192,9 @@ class FakePage:
     def locator(self, selector: str) -> FakeLocator:
         return FakeLocator(self, selector)
 
+    def get_by_placeholder(self, text: str) -> FakeLocator:
+        return FakeLocator(self, f"placeholder={text}")
+
     def on(self, event: str, callback: Any) -> None:
         self.listeners.setdefault(event, []).append(callback)
 
@@ -153,7 +202,13 @@ class FakePage:
         for callback in self.listeners.get(event, []):
             callback(arg)
 
-    async def evaluate(self, *args: Any) -> None:
+    async def evaluate(self, script: str = "", arg: Any = None) -> Any:
+        if isinstance(arg, dict) and "texts" in arg:  # runtime.find_visible_text
+            for want in arg["texts"]:
+                for shown in sorted(self.shown_texts):
+                    if (shown == want) if arg["exact"] else (want in shown):
+                        return shown
+            return ""
         return None
 
     async def wait_for_load_state(self, *args: Any, **kwargs: Any) -> None:
@@ -247,6 +302,8 @@ def test_patches_md_and_license():
     for letter in "abcdefghi":
         assert re.search(rf"^### {letter}\. ", text, re.M), f"PATCHES.md 缺少第 {letter} 条"
     assert "MIT License" in (SAU_DIR / "LICENSE").read_text(encoding="utf-8")
+    omnipost = (SAU_DIR / "LICENSE-omnipost").read_text(encoding="utf-8")  # 移植了 omnipost 的函数
+    assert "Copyright (c) 2026 contributors of this repository" in omnipost and "LICENSE-omnipost" in text
     from multipub import _sau
 
     assert _sau.UPSTREAM_COMMIT == UPSTREAM_SHA
@@ -265,11 +322,17 @@ def test_vendored_source_invariants():
     # a. 不再默认 AI 声明
     assert 'self.declaration = "内容由AI生成"' not in dy_src
     assert "self.declaration = DOUYIN_AI_DECLARATION" not in dy_src
-    # b. 头条/西瓜开关只在 sync_toutiao 时打开
-    assert "if self.sync_toutiao and await page.locator(third_part_element).count()" in dy_src
-    # c. 来源转载只在 apply_declarations 里有条件调用
+    # b. 头条/西瓜开关只按显式的 sync_toutiao 设置（没写时不碰）
+    assert "self.sync_toutiao = None if sync_toutiao is None else bool(sync_toutiao)" in dy_src
+    assert "if self.sync_toutiao is None:\n            return" in dy_src
+    assert "third_part_element" not in dy_src  # 上游无条件打开开关的那段已删除
+    # c. 来源转载只在 apply_declarations 里有条件调用，设置不上就拒绝发布
     assert xhs_src.count("await self.check_original_declaration(page)") == 1
-    assert "if self.repost_source:\n            await self.check_original_declaration(page)" in xhs_src
+    assert "if self.repost_source and not await self.check_original_declaration(page):" in xhs_src
+    # d. 抖音视频：等发布表单与等上传完成共用 upload_timeout（不再固定等 120 秒）
+    steps = dy_src[dy_src.index("async def _upload_video_steps"):]
+    assert steps.index("await self._wait_for_publish_form(page, deadline)") < steps.index(
+        "await self.fill_title_and_description(")
     # d. 最终发布按钮只经 _click_publish（PublishGuard）点击
     for src in (dy_src, xhs_src):
         assert "publish_button.click(" not in src
@@ -300,7 +363,7 @@ def test_vendored_source_invariants():
 def test_vendored_defaults(sau):
     _, dy, xhs = sau
     v = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json")
-    assert v.declaration is None and v.sync_toutiao is False
+    assert v.declaration is None and v.sync_toutiao is None
     note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json")
     assert note.ai_generated is False and note.repost_source == ""
     assert note.title == "正文"  # 未填标题时用正文前 20 字（上游行为）
@@ -622,6 +685,253 @@ async def test_xhs_ai_declaration_failure_is_reported(sau, tmp_path: Path):
     assert page.clicks == [] and plain.declaration_warnings == []
 
 
+async def test_publish_click_waits_for_enabled_unique_button(sau, tmp_path: Path):
+    """按钮不可用 / 不唯一时不点、不记账、不标记已提交（这样的点击不会生效）。"""
+    import asyncio
+
+    _, dy, xhs = sau
+    from multipub._sau.runtime import StepTimeout
+
+    # 小红书：按钮一开始不可用，过一会儿才可点 → 只点一次且成功；不会把次数花在点不动的按钮上
+    marked: list[int] = []
+    note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题",
+                               hooks=_fast_hooks(tmp_path, publish_timeout=5, reclick_gap=0.05,
+                                                 before_publish_click=lambda: marked.append(1)))
+    page = FakePage({XHS_PUBLISH: True}, success_after_click=XHS_PUBLISH)
+    page.disabled.add(XHS_PUBLISH)
+
+    async def enable_later() -> None:
+        await asyncio.sleep(0.4)
+        page.disabled.discard(XHS_PUBLISH)
+
+    task = asyncio.ensure_future(enable_later())
+    await note._publish_until_success(page, "图文")
+    await task
+    assert page.clicks.count(XHS_PUBLISH) == 1 and note.publish_guard.clicks == 1 and marked == [1]
+
+    # 一直不可用：截止时间到按「发布前超时」处理（可重试），不是 unknown_outcome
+    marked.clear()
+    note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题",
+                               hooks=_fast_hooks(tmp_path, publish_timeout=0.3,
+                                                 before_publish_click=lambda: marked.append(1)))
+    page = FakePage({XHS_PUBLISH: True})
+    page.disabled.add(XHS_PUBLISH)
+    with pytest.raises(StepTimeout) as info:
+        await note._publish_until_success(page, "图文")
+    assert not info.value.after_submit and page.clicks == [] and marked == []
+
+    # 子串选择器命中多个按钮：改点文字完全一致的那个；仍不唯一就不点
+    note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", hooks=_fast_hooks(tmp_path))
+    page = FakePage({XHS_PUBLISH: True, "button": True}, success_after_click="button")
+    page.counts[XHS_PUBLISH] = 2
+    await note._publish_until_success(page, "图文")
+    assert page.clicks == ["button"]
+    note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题",
+                               hooks=_fast_hooks(tmp_path, publish_timeout=0.3))
+    page = FakePage({XHS_PUBLISH: True, "button": True})
+    page.counts.update({XHS_PUBLISH: 2, "button": 2})
+    with pytest.raises(StepTimeout) as info:
+        await note._publish_until_success(page, "图文")
+    assert not info.value.after_submit and page.clicks == [] and not note._publish_clicked
+
+    # 抖音视频用 force 点击：disabled / aria-disabled 的按钮不点（force 点上去什么也不会发生）
+    for attr in ("disabled", "aria-disabled"):
+        video = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json", hooks=_fast_hooks(tmp_path, publish_timeout=0.3))
+        page = FakePage({DY_PUBLISH: True})
+        page.attrs[(DY_PUBLISH, attr)] = "true"
+        with pytest.raises(StepTimeout) as info:
+            await video._publish_until_success(page, "视频", "**/manage**")
+        assert not info.value.after_submit and page.clicks == [] and video.publish_guard.clicks == 0
+
+
+async def test_douyin_form_wait_uses_upload_deadline(sau, tmp_path: Path):
+    """version_2 发布页要等视频传完才出表单：等表单用 upload_timeout，不再固定 120 秒。"""
+    _, dy, _ = sau
+    from multipub._sau.runtime import Deadline, StepTimeout, UploadFailed
+
+    title = 'input[placeholder*="填写作品标题"]'
+    failed = 'div.progress-div > div:has-text("上传失败")'
+    hooks = _fast_hooks(tmp_path, poll_interval=0.01)
+    video = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json", hooks=hooks)
+    await video._wait_for_publish_form(FakePage({title: True}), Deadline(5, "等待视频上传完成"))
+
+    with pytest.raises(StepTimeout) as info:
+        await video._wait_for_publish_form(FakePage(), Deadline(0.2, "等待视频上传完成"))
+    assert info.value.step == "等待视频上传完成" and not info.value.after_submit
+
+    # 表单出来之前检测到上传失败：照常重传，次数用完报 UploadFailed
+    page = FakePage({failed: True})
+    with pytest.raises(UploadFailed):
+        await video._wait_for_publish_form(page, Deadline(5, "等待视频上传完成"))
+    assert len(page.uploads) == video.MAX_UPLOAD_RETRIES
+
+
+def _declaration_page(*, option_works: bool = True, confirm_closes: bool = True,
+                      radio: bool = True, shown: bool = False) -> FakePage:
+    dialog, option, confirm = ".semi-modal-content", "label.semi-radio", "button.semi-button-primary"
+    page = FakePage({"text=请选择自主声明": True, dialog: True, confirm: True, "text=内容由AI生成": True})
+    if radio:
+        page.visible[option] = True
+        page.attrs[(option, "class")] = "semi-radio"
+    if option_works:
+        page.on_click[option] = lambda p: p.attrs.__setitem__((option, "class"), "semi-radio semi-radio-checked")
+    if confirm_closes:
+        page.on_click[confirm] = lambda p: p.visible.__setitem__(dialog, False)
+    if shown:
+        page.shown_texts.add("内容由AI生成")
+    return page
+
+
+async def test_douyin_self_declaration_is_verified(sau, tmp_path: Path):
+    _, dy, _ = sau
+    from multipub._sau.runtime import DeclarationFailed
+
+    def video() -> Any:
+        return dy.DouYinVideo("t", "a.mp4", [], 0, "x.json", declaration="内容由AI生成",
+                              hooks=_fast_hooks(tmp_path))
+
+    v = video()
+    page = _declaration_page()
+    assert await v.set_self_declaration(page, "内容由AI生成") is True
+    assert page.clicks[-1] == "button.semi-button-primary"
+
+    # 点击被组件吞掉（选项没变成选中）：返回 False，apply_self_declaration 拒绝发布并截图
+    v = video()
+    page = _declaration_page(option_works=False)
+    assert await v.set_self_declaration(page, "内容由AI生成") is False
+    assert "button.semi-button-primary" not in page.clicks
+    with pytest.raises(DeclarationFailed) as info:
+        await v.apply_self_declaration(page)
+    assert "platforms.douyin.declaration" in str(info.value)
+    assert (tmp_path / "douyin-declaration.png").is_file()
+
+    # 选中了但点「确定」弹窗不关
+    assert await video().set_self_declaration(_declaration_page(confirm_closes=False), "内容由AI生成") is False
+
+    # 没有 label.semi-radio 结构：只能看关弹窗后入口处是否显示了所选声明
+    assert await video().set_self_declaration(_declaration_page(radio=False), "内容由AI生成") is False
+    assert await video().set_self_declaration(_declaration_page(radio=False, shown=True), "内容由AI生成") is True
+
+    # 弹窗根本没打开
+    assert await video().set_self_declaration(FakePage(), "内容由AI生成") is False
+
+
+async def test_douyin_sync_toutiao_tristate(sau, tmp_path: Path):
+    _, dy, _ = sau
+    from multipub._sau.runtime import DeclarationFailed
+
+    switch, native = dy.DouYinVideo.SYNC_SWITCH_SELECTOR, "input.semi-switch-native-control"
+
+    def page_with(on: bool, *, works: bool = True, label: str = "同步到今日头条/西瓜视频") -> FakePage:
+        page = FakePage({switch: True, native: True})
+        page.attrs[(switch, "class")] = "semi-switch" + (" semi-switch-checked" if on else "")
+        page.attrs[(switch, "evaluate")] = label
+        if works:
+            def toggle(p: FakePage) -> None:
+                cls = p.attrs[(switch, "class")]
+                p.attrs[(switch, "class")] = ("semi-switch" if "checked" in cls else "semi-switch semi-switch-checked")
+            page.on_click[native] = toggle
+        return page
+
+    def video(sync: bool | None) -> Any:
+        return dy.DouYinVideo("t", "a.mp4", [], 0, "x.json", sync_toutiao=sync, hooks=_fast_hooks(tmp_path))
+
+    page = page_with(True)
+    await video(None).apply_sync_toutiao(page)  # 没写：不碰
+    assert page.clicks == []
+
+    page = page_with(True)
+    await video(False).apply_sync_toutiao(page)  # 显式 false：把开着的开关关掉
+    assert page.clicks == [native] and "checked" not in page.attrs[(switch, "class")]
+
+    page = page_with(False)
+    await video(False).apply_sync_toutiao(page)  # 本来就关着
+    assert page.clicks == []
+
+    with pytest.raises(DeclarationFailed) as info:  # 关不掉：拒绝发布（不能违背明确选择去同步）
+        await video(False).apply_sync_toutiao(page_with(True, works=False))
+    assert "sync_toutiao" in str(info.value)
+
+    page = page_with(True, label="允许他人保存视频")  # 改版后选择器命中了别的开关：不动它
+    await video(False).apply_sync_toutiao(page)
+    assert page.clicks == []
+
+    page = page_with(False)
+    await video(True).apply_sync_toutiao(page)
+    assert "semi-switch-checked" in page.attrs[(switch, "class")]
+    await video(True).apply_sync_toutiao(page_with(False, works=False))  # 打不开只告警
+
+
+def _repost_page(*, closes: bool = True, shown: bool = True, entry: bool = True) -> FakePage:
+    source_input, confirm = "placeholder=请输入媒体名称", "role=button:确认"
+    page = FakePage({"text=添加内容类型声明": entry, "#publish-container div": True,
+                     source_input: True, confirm: True})
+
+    def on_confirm(p: FakePage) -> None:
+        if closes:
+            p.visible[source_input] = False
+        if shown:
+            p.shown_texts.add("来源：某日报")
+
+    page.on_click[confirm] = on_confirm
+    return page
+
+
+async def test_xhs_repost_declaration_verified_or_refused(sau, tmp_path: Path):
+    _, _, xhs = sau
+    from multipub._sau.runtime import DeclarationFailed
+
+    def note() -> Any:
+        return xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", repost_source="某日报",
+                                   hooks=_fast_hooks(tmp_path, platform="xiaohongshu"))
+
+    n = note()
+    page = _repost_page()
+    await n.apply_declarations(page)
+    assert page.filled["placeholder=请输入媒体名称"] == "某日报" and n.declaration_warnings == []
+
+    for bad in (_repost_page(entry=False), _repost_page(closes=False), _repost_page(shown=False)):
+        n = note()
+        with pytest.raises(DeclarationFailed) as info:  # 设置不上：拒绝发布，而不是当原创发出去
+            await n.apply_declarations(bad)
+        assert "repost_source" in str(info.value)
+    assert (tmp_path / "xiaohongshu-declaration.png").is_file()
+    assert await note().check_original_declaration(FakePage()) is False
+
+
+async def test_xhs_ai_declaration_is_verified(sau, tmp_path: Path):
+    _, _, xhs = sau
+    option = f"text={xhs.XHS_AI_DECLARATION}"
+
+    def note() -> Any:
+        return xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", ai_generated=True)
+
+    def page_with(closes: bool) -> FakePage:
+        page = FakePage({"text=添加内容类型声明": True, option: True})
+
+        def pick(p: FakePage) -> None:
+            p.shown_texts.add(xhs.XHS_AI_DECLARATION)
+            if closes:
+                p.visible[option] = False  # 面板收起
+
+        page.on_click[option] = pick
+        return page
+
+    n = note()
+    await n.apply_declarations(page_with(closes=True))
+    assert n.declaration_warnings == []
+
+    n = note()  # 点了但面板没收起：看到的文字可能只是选项本身，不能当成已选
+    await n.apply_declarations(page_with(closes=False))
+    assert n.declaration_warnings and xhs.XHS_AI_DECLARATION in n.declaration_warnings[0]
+
+    n = note()  # 已经显示为已选（例如恢复的草稿）：不再点，免得把它点掉
+    page = page_with(closes=True)
+    page.shown_texts.add(xhs.XHS_AI_DECLARATION)
+    await n.apply_declarations(page)
+    assert n.declaration_warnings == [] and option not in page.clicks
+
+
 async def test_cleanup_helpers_never_raise():
     from multipub._sau.runtime import close_quietly, save_state_quietly
 
@@ -815,7 +1125,7 @@ async def test_douyin_video_option_mapping(settings, media: Path, tmp_path: Path
     assert kw["publish_date"] == 0 and kw["publish_strategy"] == "immediate"
     assert kw["account_file"] == str(settings.account_file("douyin", "main"))
     assert kw["declaration"] == "内容由AI生成"  # ai_generated 且未显式声明
-    assert kw["sync_toutiao"] is False
+    assert kw["sync_toutiao"] is None  # 没写：不碰开关
     assert kw["collection_name"] == "合集A" and kw["productLink"] == "https://p" and kw["productTitle"] == "商品"
     # cover.jpg 是 1280x720 横图 → 横封面
     assert kw["thumbnail_landscape_path"] == str(media / "cover.jpg") and kw["thumbnail_portrait_path"] is None
@@ -823,6 +1133,7 @@ async def test_douyin_video_option_mapping(settings, media: Path, tmp_path: Path
     hooks = kw["hooks"]
     assert hooks.evidence_dir == ctx.run_dir and hooks.platform == "douyin"
     assert hooks.upload_timeout == settings.timeout_for("publish_video") - 600
+    assert hooks.sms_code_required is not None
 
     assert result.status is Status.SUBMITTED and result.submit_started
     assert result.item_id == "7400000000000000001"
@@ -841,6 +1152,16 @@ async def test_douyin_video_option_mapping(settings, media: Path, tmp_path: Path
     assert kw["declaration"] is None and kw["sync_toutiao"] is True
     assert kw["publish_date"] == when and kw["publish_strategy"] == "scheduled"
     assert result.status is Status.SCHEDULED and result.url is None and "作品管理" in result.message
+
+    # 显式 false 要传下去（上传器会关掉开着的开关），不能和"没写"混为一谈
+    await DouyinAdapter(ctx).publish(dy_video(media, options={"sync_toutiao": False}))
+    assert recorder.instances[-1].kwargs["sync_toutiao"] is False
+
+    # 本次任务的总超时（--timeout）决定上传等待
+    long_ctx, _ = make_ctx(settings, "douyin", tmp_path)
+    long_ctx.timeout = 10800
+    await DouyinAdapter(long_ctx).publish(dy_video(media))
+    assert recorder.instances[-1].kwargs["hooks"].upload_timeout == 10800 - 600
 
 
 async def test_douyin_note_option_mapping(settings, media: Path, tmp_path: Path, recorder):
@@ -898,15 +1219,19 @@ async def test_publish_prechecks_before_browser(settings, media: Path, tmp_path:
 @pytest.mark.parametrize("exc_name,after,expected", [
     ("StepTimeout", False, ("failed", ErrorCode.TIMEOUT, True)),
     ("StepTimeout", True, ("failed", ErrorCode.UNKNOWN_OUTCOME, False)),
-    ("SmsCodeTimeout", True, ("needs_action", ErrorCode.SMS_CODE_REQUIRED, False)),
+    ("SmsCodeTimeout", False, ("needs_action", ErrorCode.SMS_CODE_REQUIRED, False)),
+    # 点过发布之后的人机验证 / 短信验证：结果未知，必须是 unknown_outcome（发布记录据此拦住重发）
+    ("SmsCodeTimeout", True, ("failed", ErrorCode.UNKNOWN_OUTCOME, False)),
     ("CaptchaRequired", False, ("needs_action", ErrorCode.CAPTCHA, False)),
+    ("CaptchaRequired", True, ("failed", ErrorCode.UNKNOWN_OUTCOME, False)),
     ("LoginPageDetected", False, ("needs_action", ErrorCode.LOGIN_REQUIRED, False)),
     ("LoginPageDetected", True, ("failed", ErrorCode.UNKNOWN_OUTCOME, False)),
     ("CookieInvalid", False, ("needs_action", ErrorCode.LOGIN_REQUIRED, False)),
     ("UploadFailed", False, ("failed", ErrorCode.PLATFORM_ERROR, True)),
     ("PublishRejected", True, ("failed", ErrorCode.PLATFORM_ERROR, False)),
     ("DeclarationFailed", False, ("failed", ErrorCode.VALIDATION, False)),
-    ("SmsVerifyFailed", True, ("needs_action", ErrorCode.SMS_CODE_REQUIRED, False)),
+    ("SmsVerifyFailed", False, ("needs_action", ErrorCode.SMS_CODE_REQUIRED, False)),
+    ("SmsVerifyFailed", True, ("failed", ErrorCode.UNKNOWN_OUTCOME, False)),
 ])
 async def test_error_translation(settings, tmp_path: Path, exc_name, after, expected):
     from multipub._sau import runtime as rt
@@ -921,6 +1246,55 @@ async def test_error_translation(settings, tmp_path: Path, exc_name, after, expe
             raise exc
     err = info.value
     assert (err.status.value, err.code, err.retryable) == expected
+
+
+async def test_after_submit_verification_blocks_republish(settings, tmp_path: Path):
+    """点过发布后弹出人机/短信验证：结果未知，发布记录必须拦住不带 --force 的重发。"""
+    from multipub import history
+    from multipub._sau import runtime as rt
+
+    for i, exc in enumerate((rt.CaptchaRequired("等待视频发布成功 超过 240 秒（已点击发布，结果未知）；页面停在人机验证",
+                                                step="x", after_submit=True),
+                             rt.SmsCodeTimeout("300 秒内没有收到短信验证码", step="x", after_submit=True),
+                             rt.SmsVerifyFailed("验证码错误", step="x", after_submit=True))):
+        ctx, _ = make_ctx(settings, "douyin", tmp_path)
+        ctx.mark_submit_started()
+        with pytest.raises(PublishError) as info:
+            async with bridge.translate_errors(ctx):
+                raise exc
+        err = info.value
+        msg = str(err)
+        assert "后台确认" in msg and msg.count("已点击") == 1
+        if isinstance(exc, rt.SmsCodeTimeout):
+            assert "发布进行中" in msg and "mpub verify-code douyin" in msg
+        else:
+            assert "--headed" in msg
+        result = Result(platform="douyin", account="main", action="publish", status=err.status,
+                        error_code=err.code.value, submit_started=True, message=msg)
+        history.append(settings, result, run_id=f"r{i}", fingerprint=f"fp{i}")
+        assert history.find_previous(settings, f"fp{i}") is not None
+
+    # 点发布之前的短信超时：提示在发布进行中提交验证码（重新发布会重新发短信）
+    ctx, _ = make_ctx(settings, "douyin", tmp_path)
+    with pytest.raises(PublishError) as info:
+        async with bridge.translate_errors(ctx):
+            raise rt.SmsCodeTimeout("300 秒内没有收到短信验证码", step="x")
+    assert info.value.code is ErrorCode.SMS_CODE_REQUIRED and "发布进行中" in str(info.value)
+    assert "并重新发布" not in str(info.value)
+
+
+def test_sau_timeouts_follow_job_timeout(settings, tmp_path: Path):
+    assert bridge.sau_timeouts(settings, "douyin", Kind.VIDEO)["upload_timeout"] == \
+        settings.timeout_for("publish_video") - 600
+    assert bridge.sau_timeouts(settings, "douyin", Kind.VIDEO, 10800)["upload_timeout"] == 10200
+    assert bridge.sau_timeouts(settings, "douyin", Kind.NOTE, 300)["upload_timeout"] == 180  # 下限
+    ctx, events = make_ctx(settings, "douyin", tmp_path)
+    ctx.timeout = 7200
+    hooks = bridge.make_hooks(ctx, Kind.VIDEO, sms_message="抖音要求短信验证")
+    assert hooks.upload_timeout == 6600
+    hooks.sms_code_required(tmp_path / "verify_code.txt")
+    need = [e for e in events if e["event"] == "needs_input"][-1]
+    assert need["kind"] == "sms_code" and "300 秒内有效" in need["message"]
 
 
 async def test_error_translation_validation_and_passthrough(settings, tmp_path: Path):
@@ -966,10 +1340,20 @@ async def test_login_and_check_flow(settings, tmp_path: Path, sau, monkeypatch):
     monkeypatch.setattr(dy, "douyin_setup", fake_setup)
     result = await DouyinAdapter(ctx).login()
     assert result.status is Status.OK and ctx.account_file.is_file()
-    assert seen == {"handle": True, "headless": True, "login_timeout": settings.timeout_for("login") - 90}
+    # 扫码窗口 = 任务超时（worker 拿到的是 timeouts.login − 30）− 120 秒，留出 cookie 校验、抓二维码的时间
+    assert seen == {"handle": True, "headless": True, "login_timeout": settings.timeout_for("login") - 30 - 120}
     qr_events = [e for e in events if e["event"] == "qrcode"]
     assert qr_events and qr_events[0]["path"] == str(settings.qrcode_dir / "douyin-main.png")
     assert not (settings.qrcode_dir / "douyin-main.png").exists()  # 登录结束后清理
+
+    # ctx.timeout（worker 的总超时）决定扫码窗口；二维码图片删不掉（如被看图软件占用）不影响登录结果
+    lctx, lev = make_ctx(settings, "douyin", tmp_path, action="login", account="alt")
+    lctx.timeout = 600
+    (settings.qrcode_dir / "douyin-alt.png").mkdir(parents=True)
+    (settings.qrcode_dir / "douyin-alt.png" / "x").write_text("占用", encoding="utf-8")
+    result = await DouyinAdapter(lctx).login()
+    assert result.status is Status.OK and seen["login_timeout"] == 600 - 120
+    assert any("删除二维码图片失败" in e.get("message", "") for e in lev if e["event"] == "log")
 
     async def timeout_setup(*args, **kwargs):
         return {"success": False, "status": "timeout", "message": "超时"}

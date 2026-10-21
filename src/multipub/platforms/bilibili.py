@@ -61,6 +61,11 @@ CONFIRM_RULES_CONFIG = "confirm_dynamic_rules"
 LOGIN_POLL_SECONDS = 2.0
 QR_MAX_REFRESH = 3
 
+# 视频：biliup 比本次任务的总超时早这么多秒被杀掉，好给出明确结果；剩余时间不到 VIDEO_MIN_BUDGET 就不启动
+VIDEO_TIMEOUT_MARGIN = 30
+VIDEO_MIN_BUDGET = 60
+TOKEN_PRECHECK_TIMEOUT = 10  # 上传前的令牌预检（每个网络阶段；整体最多两倍）
+
 
 def _login_hint(account: str) -> str:
     return f"运行 mpub login bilibili --account {account}"
@@ -175,21 +180,33 @@ class BilibiliAdapter(PlatformAdapter):
             err("platforms.bilibili.copyright", "只能是 1（自制）或 2（转载）")
         elif copyright_ == 2 and not str(o.get("source") or "").strip():
             err("platforms.bilibili.source", "转载（copyright: 2）必须填写转载来源 source")
-        if o.get("creation_statement") not in (None, "") and \
-                _as_int(o.get("creation_statement")) not in CREATION_STATEMENTS:
+        statement = o.get("creation_statement")
+        if statement not in (None, "") and _as_int(statement) not in CREATION_STATEMENTS:
             err("platforms.bilibili.creation_statement",
                 "只能是 -1（无）/ 1（AI）/ 2（虚构演绎）/ 3（营销）/ 4（个人观点）")
-        elif post.ai_generated and o.get("creation_statement") in (None, ""):
+        elif post.ai_generated and statement in (None, ""):
             warn("ai_generated", "将以创作声明 id=1（AI）提交；该字段未在真实账号验证，发布后请到稿件页确认")
+        elif post.ai_generated and _as_int(statement) != 1:
+            warn("platforms.bilibili.creation_statement",
+                 f"ai_generated 为 true，但创作声明设成了 {statement}（不是 1=AI），不会声明 AI 生成")
         if o.get("extra_fields") is not None and not isinstance(o.get("extra_fields"), dict):
             err("platforms.bilibili.extra_fields", "必须是映射（会作为 JSON 合并进投稿参数）")
 
-        from .bili_biliup import LINE_CHOICES, SUBMIT_CHOICES
+        from .bili_biliup import APP_ONLY_FLAGS, LINE_CHOICES, SUBMIT_CHOICES, VIDEO_FLAGS
 
+        for key in VIDEO_FLAGS:  # "false" / "no" 之类的字符串不能当成 true
+            if o.get(key) is not None and not isinstance(o[key], bool):
+                err(f"platforms.bilibili.{key}", f"只能是 true 或 false，收到 {o[key]!r}")
         if o.get("line") and str(o["line"]).lower() not in LINE_CHOICES:
             err("platforms.bilibili.line", f"上传线路只能是: {', '.join(LINE_CHOICES)}")
-        if o.get("submit") and str(o["submit"]).lower() not in SUBMIT_CHOICES:
+        submit = str(o.get("submit") or "app").lower()
+        if submit not in SUBMIT_CHOICES:
             err("platforms.bilibili.submit", f"投稿接口只能是: {', '.join(SUBMIT_CHOICES)}")
+        elif submit != "app":
+            ignored = [k for k in APP_ONLY_FLAGS if o.get(k) is True]
+            if ignored:
+                warn("platforms.bilibili.submit",
+                     f"{' / '.join(ignored)} 只在 app 投稿接口生效（biliup 注明），submit: {submit} 时不起作用")
         if o.get("limit") not in (None, "") and not 1 <= (_as_int(o.get("limit")) or 0) <= 64:
             err("platforms.bilibili.limit", "并发数应为 1~64 的整数")
 
@@ -292,11 +309,11 @@ class BilibiliAdapter(PlatformAdapter):
             nav = await bili_http.fetch_nav(client)
         return nav, extra
 
-    async def _token(self, cred: Any) -> dict[str, Any]:
+    async def _token(self, cred: Any, *, timeout: float = 30) -> dict[str, Any]:
         """校验 biliup 需要的 access_token（只读，与 biliup 上传前的校验相同）。"""
         from . import bili_http
 
-        async with bili_http.make_client(referer="https://www.bilibili.com/") as client:
+        async with bili_http.make_client(referer="https://www.bilibili.com/", timeout=timeout) as client:
             return await bili_http.oauth_token_info(client, str(cred.token_info["access_token"]),
                                                     cred.raw.get("platform"), account=self.ctx.account)
 
@@ -389,7 +406,10 @@ class BilibiliAdapter(PlatformAdapter):
         return self.result(Status.OK, message=message)
 
     # ================================================================ 发布
+    _t0: float | None = None  # publish() 开始的时刻（worker 的总超时也从这时算起）
+
     async def publish(self, post: PlatformPost) -> Result:
+        self._t0 = time.monotonic()
         errors = [i for i in self.validate(post) if i.level == "error"]
         if errors:
             raise ValidationFailed("；".join(f"{i.field}: {i.message}" for i in errors))
@@ -400,12 +420,11 @@ class BilibiliAdapter(PlatformAdapter):
         raise Unsupported(f"B站暂不支持 {post.kind.value}")
 
     def _video_timeout(self) -> float:
-        # 比 worker 的超时再早一点，自己杀掉 biliup 并给出明确结果。
-        # JobContext 目前没有 timeout 字段（见 docs「需要的核心改动」），有了就跟随 --timeout
-        job_timeout = getattr(self.ctx, "timeout", None)
-        if job_timeout:
-            return max(60.0, float(job_timeout) - 30)
-        return max(120.0, self.settings.timeout_for("publish_video") - 60)
+        """biliup 的期限：比 worker 的总超时（从 publish() 开始算）早 VIDEO_TIMEOUT_MARGIN 秒，
+        自己杀掉 biliup 并给出明确结果；扣掉发布前准备（令牌预检等）已经用掉的时间。"""
+        elapsed = time.monotonic() - self._t0 if self._t0 is not None else 0.0
+        total = float(self.ctx.timeout) if self.ctx.timeout else self.settings.timeout_for("publish_video") - 30
+        return total - elapsed - VIDEO_TIMEOUT_MARGIN
 
     async def _publish_video(self, post: PlatformPost) -> Result:
         from . import bili_biliup
@@ -417,13 +436,17 @@ class BilibiliAdapter(PlatformAdapter):
                                code=ErrorCode.INTERNAL)
         # 先做一次与 biliup 相同的只读令牌校验：登录失效时在"开始上传"之前就报 login_required
         try:
-            await self._token(cred)
+            await asyncio.wait_for(self._token(cred, timeout=TOKEN_PRECHECK_TIMEOUT), TOKEN_PRECHECK_TIMEOUT * 2)
         except LoginRequired:
             raise
-        except PublishError as exc:  # 网络 / 风控：交给 biliup 自己校验
-            self.ctx.log(f"预先校验登录令牌失败（{exc}），交给 biliup 处理", level="warning")
+        except (PublishError, asyncio.TimeoutError) as exc:  # 网络 / 风控：交给 biliup 自己校验
+            self.ctx.log(f"预先校验登录令牌失败（{str(exc) or '超时'}），交给 biliup 处理", level="warning")
         args = bili_biliup.build_upload_args(exe, self.account_file, post)
         timeout = self._video_timeout()
+        if timeout < VIDEO_MIN_BUDGET:
+            raise PublishError(f"剩余时间只有 {max(0, int(timeout))} 秒，不够上传视频，没有启动 biliup（尚未投稿）："
+                               "调大 --timeout 或 config.toml [timeouts] publish_video 后重试",
+                               code=ErrorCode.TIMEOUT, retryable=True)
         assert post.video is not None
         size_mb = post.video.stat().st_size / 1024 / 1024
         self.ctx.log(f"biliup 上传 {post.video.name}（{size_mb:.1f} MB），完成后自动投稿")
@@ -431,7 +454,9 @@ class BilibiliAdapter(PlatformAdapter):
         self.ctx.mark_submit_started()
         rc, lines = await bili_biliup.run_streaming(args, cwd=self.ctx.run_dir, timeout=timeout,
                                                     on_line=_ProgressLog(self.ctx), heartbeat=60)
-        outcome = bili_biliup.parse_upload_output(lines, rc)
+        # 文件名 / 路径 / 标题会被 biliup 回显（如 pre_upload、Upload completed、file <路径>），解析时抹掉
+        echo = bili_biliup.echo_strings(post.video, post.cover, self.account_file, post.title.strip())
+        outcome = bili_biliup.parse_upload_output(lines, rc, echo=echo)
         return self._video_result(post, outcome, timeout)
 
     def _video_result(self, post: PlatformPost, o: Any, timeout: float) -> Result:
@@ -449,26 +474,27 @@ class BilibiliAdapter(PlatformAdapter):
             if not url:
                 message += "；没解析到 BV 号，请到创作中心确认"
             return self.result(status, kind=post.kind, url=url, item_id=o.bvid or o.aid, message=message)
-        if o.returncode == 0:
-            return self.result(Status.SUBMITTED, kind=post.kind,
-                               message="biliup 正常退出但没解析到投稿结果，请到创作中心确认")
+        # 投稿响应的 code 优先于退出码和任何输出标记
         unknown = "视频已上传完，投稿请求结果未知：先到创作中心（member.bilibili.com）确认，不要直接重发"
         if o.response_code in (-500, -502, -503, -504):  # 服务端错误 / 超时：稿件可能已经建好
             raise PublishError(f"投稿接口返回服务端错误（{o.response_code}: {o.response_message}）；{unknown}",
                                code=ErrorCode.UNKNOWN_OUTCOME)
         if o.response_code not in (None, 0):
             raise PublishError(f"B站拒绝投稿（{o.response_code}: {o.response_message}）")
+        if o.returncode == 0:
+            return self.result(Status.SUBMITTED, kind=post.kind,
+                               message="biliup 正常退出但没解析到投稿结果，请到创作中心确认")
         if o.returncode is None:
             if o.uploaded:
                 raise PublishError(f"超时；{unknown}", code=ErrorCode.UNKNOWN_OUTCOME)
             raise PublishError(f"上传超过 {int(timeout)} 秒，已终止，尚未投稿；可在 config.toml [timeouts] "
-                               "调大 publish_video 后加 --force 重试", code=ErrorCode.TIMEOUT)
+                               "调大 publish_video 或加大 --timeout 后重新发布", code=ErrorCode.TIMEOUT)
         if o.login_error and not o.uploaded:
             raise LoginRequired(f"B站登录已失效（biliup: {o.tail_text[-200:]}）；{_login_hint(self.ctx.account)}")
         if o.uploaded:
             raise PublishError(f"biliup 退出码 {o.returncode}；{unknown}", code=ErrorCode.UNKNOWN_OUTCOME)
         raise PublishError(f"biliup 上传失败（退出码 {o.returncode}）：{o.tail_text}；"
-                           "尚未投稿，确认后可加 --force 重试")
+                           "尚未投稿，确认原因后可重新发布")
 
     async def _web_session(self) -> tuple[Any, dict[str, Any], dict[str, str]]:
         """准备网页登录态：nav 不通过且有 token 时，用 biliup renew 刷新一次 cookie 再试。"""
@@ -504,6 +530,7 @@ class BilibiliAdapter(PlatformAdapter):
         pic_mode = _as_int(post.options.get("pic_mode"))
         cred, nav, extra = await self._web_session()
         self.ctx.log(f"以 {nav.get('uname')} 的身份发布图文动态（{mode} 模式）")
+        warnings: list[str] = []
 
         if mode == "http":
             async with bili_http.make_client({**cred.cookie_dict, **extra}) as client:
@@ -525,10 +552,15 @@ class BilibiliAdapter(PlatformAdapter):
             data = await publisher.publish(
                 storage_state=bili_cookies.to_storage_state(cred, extra), title=title, text=text,
                 images=post.images, timer_pub_time=timer, aigc=post.ai_generated, pic_mode=pic_mode)
+            # 浏览器模式以发布请求里实际提交的选项为准（定时没生效就是已立即发布）
+            timer = getattr(publisher, "scheduled_at", timer)
+            warnings = list(getattr(publisher, "warnings", []))
 
         dyn_id = str(data["dyn_id_str"])
         url = bili_http.opus_url(dyn_id)
+        notes = "".join(f"；注意：{w}" for w in warnings)
         if timer:
             return self.result(Status.SCHEDULED, kind=post.kind, url=url, item_id=dyn_id,
-                               message=f"已定时，{post.schedule:%Y-%m-%d %H:%M} 发布（之前链接打不开）")
-        return self.result(Status.PUBLISHED, kind=post.kind, url=url, item_id=dyn_id, message="动态已发布")
+                               message=f"已定时，{datetime.fromtimestamp(timer):%Y-%m-%d %H:%M} 发布"
+                                       f"（之前链接打不开）{notes}")
+        return self.result(Status.PUBLISHED, kind=post.kind, url=url, item_id=dyn_id, message=f"动态已发布{notes}")

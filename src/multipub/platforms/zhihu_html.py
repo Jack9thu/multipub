@@ -4,7 +4,8 @@
 
 - 开头的一级标题丢弃（文章标题是单独字段）；其余标题按正文里最浅的一级对齐：
   最浅一级 → <h2>，次一级 → <h3>，更深 → <p><b>…</b></p>（知乎只有「标题」「小标题」两级）
-- 段落里的单个换行拆成多个 <p>（知乎编辑器一行一个段落）
+- 段落里的单个换行拆成多个 <p>（知乎编辑器一行一个段落）；粗体 / 链接等标签内部的换行写成 <br/>，
+  避免拆段后标签交错（<p><b>…</p><p>…</b></p>）
 - 粗体 <b>、斜体 <i>、删除线 <del>、行内代码 <code>、链接 <a href>
 - 代码块 <pre lang="python">…</pre>
 - 表格 <table data-draft-node="block" data-draft-type="table" …><tbody>，表头行也放进 tbody（保留 <th>）
@@ -31,6 +32,7 @@ TABLE_ATTRS = ('data-draft-node="block" data-draft-type="table" data-size="norma
 EQUATION_URL = "//www.zhihu.com/equation?tex="
 
 _BREAK = "\ue000"  # 段内换行占位符（私有区字符，正文里不会出现）
+_INNER_BREAK = "\ue001"  # 粗体 / 链接等行内标签里面的换行：不能拆段
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _FRONT_MATTER_RE = re.compile(r"\A\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
 _URL_RE = re.compile(r"https?://[^\s<>()\]]+")
@@ -201,7 +203,7 @@ class _Renderer:
         if kind == "heading":
             return self.heading(children, int(attrs.get("level", 1)))
         if kind == "block_text":  # 紧凑列表项里的文字：换行用 <br/>
-            return self.inline(children).replace(_BREAK, "<br/>")
+            return _breaks(self.inline(children), "<br/>")
         if kind == "block_code":
             info = str(attrs.get("info") or "").strip()
             lang = info.split()[0] if info else ""
@@ -233,7 +235,7 @@ class _Renderer:
             return f"<tr>{self.blocks(children)}</tr>"
         if kind == "table_cell":
             tag = "th" if attrs.get("head") else "td"
-            return f"<{tag}>{self.inline(children).replace(_BREAK, ' ')}</{tag}>"
+            return f"<{tag}>{_breaks(self.inline(children), ' ')}</{tag}>"
         if kind in ("blank_line", "footnotes"):  # 脚注列表由知乎根据 <sup> 自动生成
             return ""
         if children:
@@ -241,11 +243,12 @@ class _Renderer:
         return _text(str(tok.get("raw") or ""))
 
     def paragraph(self, children: list[dict[str, Any]]) -> str:
-        parts = [p.strip() for p in self.inline(children).split(_BREAK)]
+        # 只在段落顶层的换行处拆段；标签里面的换行（_INNER_BREAK）写成 <br/>
+        parts = [_breaks(p, "<br/>").strip() for p in self.inline(children).split(_BREAK)]
         return "".join(f"<p>{p}</p>" for p in parts if p)
 
     def heading(self, children: list[dict[str, Any]], level: int) -> str:
-        text = self.inline(children).replace(_BREAK, " ").strip()
+        text = _breaks(self.inline(children), " ").strip()
         depth = level - self.heading_base
         if depth <= 0:
             return f"<h2>{text}</h2>"
@@ -257,6 +260,10 @@ class _Renderer:
     def inline(self, tokens: list[dict[str, Any]]) -> str:
         return "".join(self.span(t) for t in tokens)
 
+    def nested(self, tokens: list[dict[str, Any]]) -> str:
+        """标签内部的行内内容：里面的换行标成 _INNER_BREAK，外层拆段时不会从标签中间断开。"""
+        return self.inline(tokens).replace(_BREAK, _INNER_BREAK)
+
     def span(self, tok: dict[str, Any]) -> str:
         kind = tok.get("type")
         children = tok.get("children") or []
@@ -267,16 +274,16 @@ class _Renderer:
         if kind in ("softbreak", "linebreak"):
             return _BREAK
         if kind == "strong":
-            return f"<b>{self.inline(children)}</b>"
+            return f"<b>{self.nested(children)}</b>"
         if kind == "emphasis":
-            return f"<i>{self.inline(children)}</i>"
+            return f"<i>{self.nested(children)}</i>"
         if kind == "strikethrough":
-            return f"<del>{self.inline(children)}</del>"
+            return f"<del>{self.nested(children)}</del>"
         if kind == "codespan":
             return f"<code>{html.escape(raw, quote=False)}</code>"
         if kind == "link":
             url = _safe_url(str(attrs.get("url") or ""))
-            return f'<a href="{_attr(url)}">{self.inline(children)}</a>'
+            return f'<a href="{_attr(url)}">{self.nested(children)}</a>'
         if kind == "image":
             return self.image(str(attrs.get("url") or ""), _plain(children))
         if kind == "inline_html":
@@ -289,7 +296,7 @@ class _Renderer:
             return (f'<sup data-text="{_attr(text)}" data-url="{_attr(url)}" data-draft-node="inline" '
                     f'data-draft-type="reference" data-numero="{index}">[{index}]</sup>')
         if children:
-            return self.inline(children)
+            return self.nested(children)
         return _text(raw)
 
     def image(self, url: str, alt: str) -> str:
@@ -301,6 +308,11 @@ class _Renderer:
         if is_zhimg(url):
             return f'<img src="{_attr(url)}" data-caption="{_attr(alt)}" data-size="normal"/>'
         raise ValueError(f"图片还没有上传到知乎: {url}")
+
+
+def _breaks(fragment: str, sep: str) -> str:
+    """把两种换行占位符都换成 sep（列表项 / 标题 / 表格单元格里不拆段）。"""
+    return fragment.replace(_BREAK, sep).replace(_INNER_BREAK, sep)
 
 
 def _plain(tokens: list[dict[str, Any]]) -> str:

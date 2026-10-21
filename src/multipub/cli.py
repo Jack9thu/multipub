@@ -158,19 +158,24 @@ def _browser_status(settings: Settings) -> tuple[bool, str]:
 
 def cmd_setup(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
     settings.ensure_dirs()
-    rc = EXIT_OK
+    steps: list[dict[str, Any]] = []
     if not args.skip_browser and settings.browser.channel == "chromium" and not settings.browser.executable_path:
-        out.info("安装 patchright Chromium（国内网络慢可先设置 PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright）……")
-        proc = subprocess.run([sys.executable, "-m", "patchright", "install", "chromium"])
-        if proc.returncode != 0:
-            out.info("Chromium 安装失败")
-            rc = EXIT_FAILED
+        out.info("安装 patchright Chromium……（下载失败时可改用本机 Chrome：config.toml 里 [browser] channel = \"chrome\"，见 docs/windows.md）")
+        # 子进程输出进度条；--json 时转到 stderr，保证 stdout 只有最终 JSON
+        proc = subprocess.run([sys.executable, "-m", "patchright", "install", "chromium"],
+                              stdout=sys.stderr if out.as_json else None)
+        steps.append({"name": "browser", "ok": proc.returncode == 0,
+                      "detail": "Chromium 已安装" if proc.returncode == 0 else f"Chromium 安装失败（退出码 {proc.returncode}）"})
     for name in PLATFORMS:
         for item in load_adapter(name).setup(settings):
-            out.info(f"  {'✔' if item['ok'] else '✘'} {name}.{item['name']}: {item.get('detail', '')}")
-            if not item["ok"]:
-                rc = EXIT_FAILED
-    return rc
+            steps.append({"name": f"{name}.{item['name']}", "ok": item["ok"], "detail": item.get("detail", "")})
+    ok = all(s["ok"] for s in steps)
+    if out.as_json:
+        out.emit_json({"ok": ok, "steps": steps})
+    else:
+        for s in steps:
+            print(f"  {'✔' if s['ok'] else '✘'} {s['name']}: {s['detail']}")
+    return EXIT_OK if ok else EXIT_FAILED
 
 
 def cmd_login(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
@@ -244,7 +249,10 @@ def cmd_new(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
     target.mkdir(parents=True, exist_ok=True)
     dest = target / "post.yaml"
     if dest.exists() and not args.force:
-        out.info(f"{dest} 已存在（--force 覆盖）")
+        if out.as_json:
+            out.emit_json({"ok": False, "error": "exists", "message": f"{dest} 已存在（--force 覆盖）"})
+        else:
+            out.info(f"{dest} 已存在（--force 覆盖）")
         return EXIT_USAGE
     shutil.copyfile(TEMPLATES / f"{args.kind}.yaml", dest)
     if args.kind == "article":
@@ -252,7 +260,10 @@ def cmd_new(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
         if not md.exists():
             md.write_text("# 标题会被忽略，以 post.yaml 的 title 为准\n\n正文，支持 **Markdown** 和本地图片：\n\n![说明](images/1.jpg)\n",
                           encoding="utf-8")
-    print(str(dest))
+    if out.as_json:
+        out.emit_json({"ok": True, "path": str(dest.resolve()), "kind": args.kind})
+    else:
+        print(str(dest))
     return EXIT_OK
 
 
@@ -333,7 +344,11 @@ def cmd_publish(args: argparse.Namespace, settings: Settings, out: Printer) -> i
 
     if pending and not args.yes:
         if not sys.stdin.isatty():
-            out.info("非交互环境需要加 --yes 才会真正发布（建议先 --dry-run 确认）")
+            msg = "非交互环境需要加 --yes 才会真正发布（建议先 --dry-run 确认）"
+            if out.as_json:
+                out.emit_json({"ok": False, "error": "confirmation_required", "message": msg})
+            else:
+                out.info(msg)
             return EXIT_USAGE
         names = "、".join(f"{DISPLAY_NAMES[p.platform]}/{p.account}" for p in pending)
         answer = input(f"即将发布「{pending[0].title or manifest.path.parent.name}」到 {names}，确认? [y/N] ")
@@ -397,12 +412,20 @@ def cmd_history(args: argparse.Namespace, settings: Settings, out: Printer) -> i
 def cmd_verify_code(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
     platform = normalize_platform(args.platform)
     if platform != "douyin":
-        out.info("目前只有抖音发布时可能需要短信验证码")
+        msg = "目前只有抖音发布时可能需要短信验证码"
+        if out.as_json:
+            out.emit_json({"ok": False, "error": "unsupported", "message": msg})
+        else:
+            out.info(msg)
         return EXIT_USAGE
+    # 与 multipub._sau.conf.verify_code_file() 一致：<数据目录>/sau/verify_code.txt
     path = settings.sau_home / "verify_code.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(args.code.strip(), encoding="utf-8")
-    print(str(path))
+    if out.as_json:
+        out.emit_json({"ok": True, "path": str(path)})
+    else:
+        print(str(path))
     return EXIT_OK
 
 

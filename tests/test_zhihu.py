@@ -254,6 +254,18 @@ def test_markdown_dialect():
     assert "<ul><li>甲</li><li>乙</li></ul>" in html and "<blockquote><p>引用</p></blockquote>" in html
 
 
+def test_soft_breaks_inside_inline_tags_do_not_split_paragraph():
+    # 换行在粗体 / 链接 / 斜体里面：不能拆成两个 <p>（否则标签交错），改成 <br/>
+    assert zm.render_article("**粗体跨\n两行**结束") == "<p><b>粗体跨<br/>两行</b>结束</p>"
+    assert zm.render_article("[链接文字\n第二行](https://x.com)") == \
+        '<p><a href="https://x.com">链接文字<br/>第二行</a></p>'
+    assert zm.render_article("前\n*斜\n体* 后\n~~删  \n除~~") == \
+        "<p>前</p><p><i>斜<br/>体</i> 后</p><p><del>删<br/>除</del></p>"
+    assert zm.render_article("- **甲\n乙**\n- 丙") == "<ul><li><b>甲<br/>乙</b></li><li>丙</li></ul>"
+    assert zm.render_article("正文\n\n**标\n题**\n---") == "<p>正文</p><h2><b>标 题</b></h2>"
+    assert "\ue000" not in zm.render_article("a **b\nc** d\ne") and "\ue001" not in zm.render_article("**b\nc**")
+
+
 def test_markdown_headings_kept_when_h1_used_as_sections():
     html = zm.render_article("# 第一章\n\n正文\n\n# 第二章\n\n## 一节\n", title="书名")
     assert html == "<h2>第一章</h2><p>正文</p><h2>第二章</h2><h3>一节</h3>"
@@ -426,6 +438,51 @@ def test_prepare_image_conversions():
     assert za.prepare_image(jpg, "d.jpg").data == jpg
     with pytest.raises(ValidationFailed):
         za.prepare_image(b"not an image", "e.png")
+
+
+def _exif(orientation: int) -> Image.Exif:
+    exif = Image.Exif()
+    exif[za.EXIF_ORIENTATION] = orientation
+    return exif
+
+
+def test_prepare_image_mpo_and_exif_orientation(monkeypatch):
+    # 手机 Ultra HDR / 深度图照片：Pillow 认成 MPO，按 JPEG 原样上传（保留 EXIF，不重新压缩）
+    buf = io.BytesIO()
+    Image.new("RGB", (80, 40), (255, 0, 0)).save(buf, "MPO", save_all=True, exif=_exif(6),
+                                                 append_images=[Image.new("RGB", (80, 40), (0, 255, 0))])
+    mpo = buf.getvalue()
+    with Image.open(io.BytesIO(mpo)) as im:
+        assert im.format == "MPO"
+    p = za.prepare_image(mpo, "pixel.jpg")
+    assert (p.mime, p.ext, p.converted_from, p.data) == ("image/jpeg", "jpg", "", mpo)
+    assert (p.width, p.height) == (40, 80)  # 竖拍：宽高按显示方向
+
+    buf = io.BytesIO()
+    Image.new("RGB", (80, 40)).save(buf, "JPEG", exif=_exif(6))
+    jpg = za.prepare_image(buf.getvalue(), "iphone.jpg")
+    assert jpg.data == buf.getvalue() and (jpg.width, jpg.height) == (40, 80)
+    buf = io.BytesIO()
+    Image.new("RGB", (80, 40)).save(buf, "JPEG", exif=_exif(3))  # 180° 不换宽高
+    assert (za.prepare_image(buf.getvalue(), "x.jpg").width, za.prepare_image(buf.getvalue(), "x.jpg").height) \
+        == (80, 40)
+
+    # 要转码的图（转码会丢 EXIF）：先把像素转正
+    src = Image.new("RGB", (80, 40), (255, 255, 255))
+    src.paste((255, 0, 0), (0, 0, 10, 10))  # 左上角红块
+    buf = io.BytesIO()
+    src.save(buf, "WEBP", lossless=True, exif=_exif(6))
+    webp = za.prepare_image(buf.getvalue(), "rot.webp")
+    assert webp.converted_from == "WEBP" and (webp.width, webp.height) == (40, 80)
+    with Image.open(io.BytesIO(webp.data)) as out:
+        assert out.size == (40, 80) and not out.getexif().get(za.EXIF_ORIENTATION)
+        r, g, b = out.convert("RGB").getpixel((35, 4))  # 顺时针转 90° 后红块在右上角
+        assert r > 200 and g < 80 and b < 80
+
+    # 解压炸弹：不是内部错误，而是 validation
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+    with pytest.raises(ValidationFailed, match="分辨率太大"):
+        za.prepare_image(image_bytes("PNG", (64, 48)), "huge.png")
 
 
 # ------------------------------------------------------------------ 图片上传
@@ -602,6 +659,43 @@ async def test_article_publish_unknown_outcome(env, media: Path, response):
     assert len(fake.find("POST", "www.zhihu.com", "/api/v4/content/publish")) == 1  # 不重试
     has_response = isinstance(response, httpx.Response)  # 超时没有响应，也就没有证据文件
     assert any(e.endswith("zhihu-publish-response.txt") for e in ctx.evidence) is has_response
+    assert info.value.url == "https://zhuanlan.zhihu.com/p/555/edit"  # 进 Result.url，skill 能直接给出链接
+
+
+@pytest.mark.parametrize("body", [{"message": "?"}, {"error": {"message": "参数错误"}}, {"data": {}}])
+async def test_unrecognized_publish_response_never_checks_draft_id(env, media: Path, body):
+    # 没有 code 也没有文章 id：不能拿草稿 id 去查（作者查自己的草稿可能也是 200）→ 结果未知，而不是「已发布」
+    ctx, _, fake = env
+    fake.publish_response = body
+    assert fake.article_visible
+    with pytest.raises(PublishError) as info:
+        await ZhihuAdapter(ctx).publish(article_post(media))
+    assert info.value.code is ErrorCode.UNKNOWN_OUTCOME and info.value.url.endswith("/p/555/edit")
+    assert not [r for r in fake.requests if r.url.path.startswith("/api/v4/articles/")]
+
+
+async def test_publish_without_code_but_with_id_is_verified(env, media: Path):
+    ctx, _, fake = env
+    fake.publish_response = {"data": {"result": json.dumps({"publish": {"id": "778"}})}}
+    result = await ZhihuAdapter(ctx).publish(article_post(media))
+    assert result.status is Status.PUBLISHED and result.url == "https://zhuanlan.zhihu.com/p/778"
+    assert fake.find("GET", "www.zhihu.com", "/api/v4/articles/778")
+
+    ctx2, _ = make_ctx(ctx.settings)
+    fake.article_visible = False
+    with pytest.raises(PublishError) as info:
+        await ZhihuAdapter(ctx2).publish(article_post(media))
+    assert info.value.code is ErrorCode.UNKNOWN_OUTCOME
+
+
+async def test_error_after_draft_carries_edit_url(env, media: Path):
+    ctx, _, fake = env
+    fake.overrides[("PATCH", "zhuanlan.zhihu.com", "/api/articles/555/draft")] = \
+        lambda r: (_ for _ in ()).throw(httpx.ConnectError("reset", request=r))
+    with pytest.raises(PublishError) as info:
+        await ZhihuAdapter(ctx).publish(article_post(media))
+    assert info.value.retryable and not ctx.submit_started
+    assert info.value.url == "https://zhuanlan.zhihu.com/p/555/edit" and "草稿已保存" in str(info.value)
 
 
 async def test_publish_risk_control_40352(env, media: Path, settings):
@@ -628,6 +722,20 @@ async def test_risk_before_publish_keeps_draft_url(env, media: Path):
     assert "草稿已保存：https://zhuanlan.zhihu.com/p/555/edit" in str(info.value)
     assert info.value.url.endswith("session=abc") and not ctx.submit_started
     assert not fake.find("POST", "www.zhihu.com", "/api/v4/content/publish")
+
+
+async def test_successful_publish_clears_stale_verify_file(env, media: Path, settings):
+    ctx, _, fake = env
+    verify = settings.accounts_dir / "zhihu" / "main.verify.txt"
+    verify.write_text("https://www.zhihu.com" + RISK_REDIRECT, encoding="utf-8")
+    fake.overrides[("POST", "www.zhihu.com", "/api/v4/content/publish")] = httpx.Response(
+        200, json={"code": 2000, "message": "发布失败"})
+    await ZhihuAdapter(ctx).publish(article_post(media))
+    assert verify.exists()  # 失败不删
+    fake.overrides.clear()
+    ctx2, _ = make_ctx(settings)
+    assert (await ZhihuAdapter(ctx2).publish(article_post(media))).status is Status.PUBLISHED
+    assert not verify.exists()  # 写接口能用 = 风控已解除
 
 
 async def test_topic_risk_control_does_not_block_publish(env, media: Path):
@@ -675,6 +783,19 @@ async def test_topic_and_cover_failures_do_not_block(env, media: Path):
     result = await ZhihuAdapter(ctx).publish(article_post(media))
     assert result.status is Status.PUBLISHED and calls["n"] == 2
     assert "话题「人工智能」没加上" in result.message and "封面没设置上" in result.message
+
+
+async def test_topic_without_exact_match_warns_or_skips(env, media: Path):
+    ctx, _, fake = env
+    names = {"人工智能": ["人工智能技术", "机器学习"], "不存在": ["露营"]}
+    fake.overrides[("GET", "zhuanlan.zhihu.com", "/api/autocomplete/topics")] = lambda r: httpx.Response(
+        200, json=[{"id": str(i), "name": n, "type": "topic"} for i, n in enumerate(names[r.url.params["token"]])])
+    result = await ZhihuAdapter(ctx).publish(article_post(media))
+    assert result.status is Status.PUBLISHED
+    added = [fake.json_body(r)["name"] for r in fake.find("POST", "zhuanlan.zhihu.com", "/api/articles/555/topics")]
+    assert added == ["人工智能技术"]  # 包含关系：采用，但要说出来
+    assert "话题「人工智能」没有同名的，已改用「人工智能技术」" in result.message
+    assert "没找到话题「不存在」（最接近的是「露营」，没有添加）" in result.message  # 不相干：不挂
 
 
 async def test_publish_login_expired(env, media: Path):
@@ -815,6 +936,43 @@ async def test_login_fresh_context_when_cookie_invalid(env, settings, monkeypatc
     monkeypatch.setattr(ZhihuAdapter, "_browser_login", fake_browser)
     assert (await ZhihuAdapter(ctx).login()).status is Status.OK
     assert calls == [(None, "")]
+
+
+async def test_login_with_pending_verify_checks_api_first(env, settings, monkeypatch):
+    ctx, _, fake = env
+    ctx.action = "login"
+    verify = settings.accounts_dir / "zhihu" / "main.verify.txt"
+    verify.write_text("https://www.zhihu.com/account/unhuman?session=old", encoding="utf-8")
+    calls: list[tuple[Any, str]] = []
+
+    async def fake_browser(self, state, verify_url):
+        calls.append((state, verify_url))
+        fake.overrides.clear()
+        return storage_state()
+
+    monkeypatch.setattr(ZhihuAdapter, "_browser_login", fake_browser)
+    # me() 本身被风控：用最新的验证页地址（旧地址的 session 可能过期）
+    fake.overrides[("GET", "www.zhihu.com", "/api/v4/me")] = httpx.Response(
+        403, json={"error": {"code": 40352, "redirect": RISK_REDIRECT}})
+    assert (await ZhihuAdapter(ctx).login()).status is Status.OK
+    assert calls[-1][1] == "https://www.zhihu.com" + RISK_REDIRECT and calls[-1][0] is not None
+    assert not verify.exists()
+
+    # 登录已失效：验证页没意义，直接重新扫码（干净的上下文）
+    verify.write_text("https://www.zhihu.com/account/unhuman?session=old", encoding="utf-8")
+    fake.overrides[("GET", "www.zhihu.com", "/api/v4/me")] = httpx.Response(401, json={})
+    assert (await ZhihuAdapter(ctx).login()).status is Status.OK
+    assert calls[-1] == (None, "") and not verify.exists()
+
+
+def test_login_wait_follows_job_timeout(settings):
+    ctx, _ = make_ctx(settings, action="login")
+    adapter = ZhihuAdapter(ctx)
+    assert adapter._login_wait() == settings.timeout_for("login") - 30 - zh.LOGIN_RESERVE  # 同 runner 的 worker 超时
+    ctx.timeout = 600
+    assert adapter._login_wait() == 600 - zh.LOGIN_RESERVE
+    ctx.timeout = 50
+    assert adapter._login_wait() == 60
 
 
 class _Resp:
@@ -965,6 +1123,76 @@ async def test_browser_login_flow_with_fake_browser(settings, fake, monkeypatch)
     assert fake.find("GET", "www.zhihu.com", "/api/v4/me")[-1].headers["user-agent"] == ua
 
 
+
+def _patch_browser(monkeypatch, browser: Any, opened: list | None = None) -> None:
+    import contextlib
+
+    import multipub.browser as browser_mod
+
+    @contextlib.asynccontextmanager
+    async def fake_open_context(_settings, *, headless, storage_state=None, **kw):
+        if opened is not None:
+            opened.append((headless, storage_state))
+        yield browser
+
+    real_sleep = zh.asyncio.sleep
+
+    async def fast_sleep(_seconds: float) -> None:
+        await real_sleep(0)
+
+    async def no_snapshot(*a: Any, **k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(browser_mod, "open_context", fake_open_context)
+    monkeypatch.setattr(browser_mod, "snapshot", no_snapshot)
+    monkeypatch.setattr(zh.asyncio, "sleep", fast_sleep)
+
+
+async def test_browser_login_saves_state_before_homepage_refresh(settings, fake, monkeypatch):
+    browser = _LoginContext()
+    account_file = settings.account_file("zhihu", "main")
+    saved_at_refresh: list[bool] = []
+    goto = browser.page.goto
+
+    async def slow_home(url: str, **kw: Any) -> None:
+        if url == za.WWW_HOME:
+            saved_at_refresh.append(account_file.is_file())
+            raise TimeoutError("首页太慢")
+        await goto(url, **kw)
+
+    browser.page.goto = slow_home
+    _patch_browser(monkeypatch, browser)
+    ctx, _ = make_ctx(settings, action="login")
+    assert (await ZhihuAdapter(ctx).login()).status is Status.OK
+    assert saved_at_refresh == [True]  # 扫完码先存一份，首页刷新失败 / 任务超时也不白扫
+
+
+class _VerifyContext(_LoginContext):
+    """带旧登录态打开验证页，页面一直停在验证页（需要人操作）。"""
+
+    async def cookies(self, url: str) -> list[dict[str, str]]:
+        self.polls += 1
+        return [{"name": "z_c0", "value": Z_C0}]
+
+
+async def test_headless_verify_fails_fast_with_risk_control(env, settings, monkeypatch):
+    ctx, events, fake = env
+    ctx.action = "login"
+    verify = settings.accounts_dir / "zhihu" / "main.verify.txt"
+    verify.write_text("https://www.zhihu.com" + RISK_REDIRECT, encoding="utf-8")
+    browser = _VerifyContext()
+    opened: list[tuple[bool, Any]] = []
+    _patch_browser(monkeypatch, browser, opened)
+    monkeypatch.setattr(zh, "VERIFY_HEADLESS_WAIT", 0)
+    with pytest.raises(NeedsAction) as info:
+        await ZhihuAdapter(ctx).login()
+    assert info.value.code is ErrorCode.RISK_CONTROL and "去掉 --headless" in str(info.value)
+    assert info.value.url == "https://www.zhihu.com" + RISK_REDIRECT
+    assert opened[0][1] is not None and browser.page.gotos == ["https://www.zhihu.com" + RISK_REDIRECT]
+    assert browser.polls < 5 and verify.exists()  # 没有傻等到超时；验证页地址留着下次用
+    assert "response" not in browser.page.handlers  # 过验证不需要二维码
+
+
 def test_normalize_user_agent():
     assert za.normalize_user_agent(HEADLESS_UA).count("HeadlessChrome") == 0
     assert za.normalize_user_agent("curl/8.0") == "" and za.normalize_user_agent(None) == ""
@@ -1027,6 +1255,11 @@ def test_validate_article_rules(media: Path):
     conflict = article_post(media, extra_top="ai_generated: true\n", zhihu="    statement: fiction\n    draft: true\n")
     warns = issues_of(conflict)["warning"]
     assert any("以 statement 为准" in w for w in warns) and any("只存草稿时" in w for w in warns)
+
+
+    gone = article_post(media)
+    gone.images = [media / "images" / "nope.jpg"]
+    assert any(e.startswith("images: 文件不存在") for e in issues_of(gone)["error"])  # common_issues 不查文章的图
 
 
 def test_validate_note_and_kind_rules(media: Path):

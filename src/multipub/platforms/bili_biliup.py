@@ -345,12 +345,16 @@ _AID_RE = re.compile(r'"aid"\s*:\s*(?:Number\()?(\d+)')
 # info 日志里是 message: "…"；错误报告里整段被 Debug 转义成 message: \"…\"
 _RESP_RE = re.compile(r'ResponseData \{ code: (-?\d+),.*?message: \\?"(.*?)\\?", ttl')
 # tracing 默认格式（NO_COLOR）："2026-10-20 12:03:01  INFO biliup::uploader::bilibili: 消息"。
-# 级别和 target 之前只允许时间戳字符，所以消息里回显的文件名（pre_upload: {"name":…}、
-# Upload completed: <文件>）伪造不了 target，也伪造不了下面按 target 锚定的标记
-_LOG_RE = re.compile(r"^[\d\-:T.+ ]*?\s*(TRACE|DEBUG|INFO|WARN|ERROR)\s+(biliup[\w:]*): (.*)$")
+# Linux/macOS 上多线程进程取不到本地时区，时间戳会是 "<unknown time>"。
+# 行首只允许时间戳，所以消息里回显的文件名（pre_upload: {"name":…}、Upload completed: <文件>）
+# 伪造不了级别和 target，也伪造不了下面按 target 锚定的标记
+_LOG_RE = re.compile(r"^(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+\S*|<unknown time>)?\s*"
+                     r"(TRACE|DEBUG|INFO|WARN|ERROR)\s+(biliup[\w:]*): (.*)$")
 UPLOADED_MARKERS = ("Upload completed:", "All files uploaded successfully")
+# 投稿请求所在模块（crates/biliup/src/uploader/bilibili.rs）：投稿响应和「接口投稿成功」只认它
+SUBMIT_TARGET = "biliup::uploader::bilibili"
 # biliup 自己的投稿成功日志（APP接口投稿成功 / Web 接口投稿成功 / BCUT接口投稿成功），整条消息完全匹配
-_SUBMIT_OK_RE = re.compile(r"(?:APP|Web|BCUT|客户端)?\s*接口投稿成功")
+_SUBMIT_OK_RE = re.compile(r"(?:APP|Web|BCUT)\s*接口投稿成功")
 LOGIN_ERROR_MARKERS = ("credential validation failed", "credential refresh failed",
                        "open cookies file", "账号未登录", "未知平台", "missing field `token_info`")
 _ECHO_MIN_LEN = 4  # 太短的回显串不做替换，免得把标记本身抹掉
@@ -360,16 +364,24 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def echo_strings(*paths: Path | None) -> list[str]:
-    """biliup 会在输出里回显的用户文件名/路径（原样和 JSON 转义两种），解析前从非 tracing 行里抹掉。"""
+def echo_strings(*items: Path | str | None) -> list[str]:
+    """biliup 可能在输出里回显的用户内容（文件名/路径、标题；原样和 JSON 转义两种），
+    匹配登录错误 / 投稿响应前先抹掉，免得其中的字样被当成状态。"""
     out: set[str] = set()
-    for p in paths:
-        if p is None:
+    for item in items:
+        if item is None:
             continue
-        for s in (str(p), p.as_posix(), p.name):
+        forms = (str(item), item.as_posix(), item.name) if isinstance(item, Path) else (str(item),)
+        for s in forms:
             out.add(s)
             out.add(json.dumps(s, ensure_ascii=False)[1:-1])
     return sorted((s for s in out if len(s) >= _ECHO_MIN_LEN), key=len, reverse=True)
+
+
+def _scrub(text: str, echo: list[str] | tuple[str, ...]) -> str:
+    for s in echo:
+        text = text.replace(s, "<file>")
+    return text
 
 
 @dataclass
@@ -391,12 +403,13 @@ class UploadOutcome:
 
 def parse_upload_output(lines: list[str], returncode: int | None, *, echo: list[str] | tuple[str, ...] = ()
                         ) -> UploadOutcome:
-    """解析 biliup 输出。echo：会被回显的文件名/路径（echo_strings），避免文件名里的字样被当成状态。
+    """解析 biliup 输出。echo：会被回显的文件名/路径/标题（echo_strings），避免其中的字样被当成状态。
 
     - 投稿结果以投稿响应 ResponseData 为准（最后一条；code 非 0 时任何「投稿成功」字样都不算），
-      只认 biliup 投稿模块的 info 日志和非 tracing 的错误报告行。
-    - 上传完成 / 投稿成功标记必须是 biliup 自己的 tracing 日志，按 target 锚定。
-    - 登录错误只看非 INFO 的行（错误报告、WARN/ERROR），并先抹掉回显的文件名。
+      只认投稿模块（SUBMIT_TARGET）的 INFO 日志和非 tracing 的错误报告行。
+    - 上传完成 / 投稿成功标记必须是 biliup 自己的 tracing 日志：消息以固定前缀开头 / 整条完全匹配，
+      投稿成功还要求 target 是投稿模块。只有没解析到投稿响应时才看投稿成功标记。
+    - 登录错误只看非 INFO 的行（错误报告、WARN/ERROR），并先抹掉回显的内容。
     """
     out = UploadOutcome(returncode=returncode)
     ok_marker = False
@@ -406,17 +419,16 @@ def parse_upload_output(lines: list[str], returncode: int | None, *, echo: list[
         log = _LOG_RE.match(line)
         if log:
             level, target, msg = log.group(1), log.group(2), log.group(3).strip()
+            submit_mod = target == SUBMIT_TARGET
             if level == "INFO" and msg.startswith(UPLOADED_MARKERS):
                 out.uploaded = True
-            if level == "INFO" and _SUBMIT_OK_RE.fullmatch(msg):
+            if level == "INFO" and submit_mod and _SUBMIT_OK_RE.fullmatch(msg):
                 ok_marker = True
-            resp_src = msg if (level == "INFO" and msg.startswith("ResponseData {")) else ""
-            login_src = "" if level in ("INFO", "DEBUG", "TRACE") else msg
-        else:
-            scrubbed = line
-            for s in echo:
-                scrubbed = scrubbed.replace(s, "<file>")
-            resp_src = login_src = scrubbed
+            resp_src = msg if (level == "INFO" and submit_mod and msg.startswith("ResponseData {")) else ""
+            login_src = "" if level in ("INFO", "DEBUG", "TRACE") else _scrub(msg, echo)
+        else:  # 错误报告：抹掉回显内容后再判断；投稿响应的 message 仍取原文（可能引用了标题）
+            login_src = _scrub(line, echo)
+            resp_src = line if _RESP_RE.search(login_src) else ""
         if login_src and any(m in login_src for m in LOGIN_ERROR_MARKERS):
             out.login_error = True
         resp = _RESP_RE.search(resp_src) if resp_src else None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import hashlib
 import io
@@ -362,7 +363,7 @@ def test_build_upload_args_full(media: Path, tmp_path: Path):
     when = (datetime.now() + timedelta(hours=3)).replace(second=0, microsecond=0)
     post = video_post(media, body="", cover=cover, schedule=when, ai_generated=True, title="-以横线开头",
                       options={"tid": 231, "tid_v2": 2001, "copyright": 2, "source": "https://example.com/a",
-                               "dynamic": "新视频！", "no_reprint": 1, "close_reply": True, "line": "BDA2",
+                               "dynamic": "新视频！", "no_reprint": True, "close_reply": True, "line": "BDA2",
                                "limit": 5, "submit": "web", "extra_fields": {"foo": 1}})
     exe, cookie = Path("/opt/biliup"), tmp_path / "账号.json"
     args = bb.build_upload_args(exe, cookie, post)
@@ -386,6 +387,22 @@ def test_build_upload_args_minimal(media: Path):
     args = bb.build_upload_args(Path("biliup"), Path("c.json"), post)
     assert "--copyright=1" in args
     assert not any(a.startswith(("--source", "--cover", "--dtime", "--extra-fields", "--dynamic")) for a in args)
+
+
+def test_build_upload_args_flags_need_real_true(media: Path):
+    """"false" / "no" / 1 这类值不能打开 仅自己可见 / 关闭评论（validate 也会报错）。"""
+    opts = {"tid": 231, "is_only_self": "false", "close_reply": "no", "selection_reply": "false",
+            "no_reprint": 1, "close_danmu": False}
+    args = bb.build_upload_args(Path("biliup"), Path("c.json"), video_post(media, options=opts))
+    assert not [a for a in args if a.startswith(("--is-only-self", "--up-", "--no-reprint"))]
+    issues = BilibiliAdapter.validate(video_post(media, options=opts))
+    assert {"platforms.bilibili.is_only_self", "platforms.bilibili.close_reply", "platforms.bilibili.selection_reply",
+            "platforms.bilibili.no_reprint"} <= errors_of(issues)
+    assert "platforms.bilibili.close_danmu" not in errors_of(issues)
+    on = {"tid": 231, "is_only_self": True, "close_danmu": True, "close_reply": None}
+    args = bb.build_upload_args(Path("biliup"), Path("c.json"), video_post(media, options=on))
+    assert "--is-only-self=1" in args and "--up-close-danmu" in args and "--up-close-reply" not in args
+    assert not errors_of(BilibiliAdapter.validate(video_post(media, options=on)))
 
 
 SUCCESS_LINES = [
@@ -423,6 +440,69 @@ def test_parse_upload_output_login_error():
     assert o.login_error and not o.uploaded and o.response_code is None
 
 
+TRICKY = Path("/data/第一次投稿成功 账号未登录.mp4")  # 文件名里带「投稿成功」和登录错误字样
+
+
+def tricky_upload_lines(video: Path = TRICKY) -> list[str]:
+    name = json.dumps(video.name, ensure_ascii=False)
+    return [
+        "2026-10-20 12:00:00  INFO biliup_cli::uploader: user: 测试UP",
+        f'2026-10-20 12:00:02  INFO biliup::uploader::line: pre_upload: {{"name":{name},"size":1024}}',
+        f"2026-10-20 12:03:00  INFO biliup_cli::uploader: Upload completed: {video.name} => cost 1.00s, 1.00 MB/s.",
+        "2026-10-20 12:03:00  INFO biliup_cli::uploader: All files uploaded successfully, checkpoint removed",
+        f"2026-10-20 12:03:00  WARN biliup_cli::uploader: 未搜索到匹配的视频文件：{video.name}",
+    ]
+
+
+REJECT_21070 = ('2026-10-20 12:03:01  INFO biliup::uploader::bilibili: ResponseData { code: 21070, data: None, '
+                'message: "请勿重复提交", ttl: Some(1) }')
+
+
+def test_parse_upload_output_file_name_is_not_a_marker():
+    echo = bb.echo_strings(TRICKY)
+    # 上传完了，投稿被明确拒绝：不能因为文件名里有「投稿成功」就当成功
+    o = bb.parse_upload_output(tricky_upload_lines() + [REJECT_21070, "Error: 未知错误"], 1, echo=echo)
+    assert not o.submitted and o.uploaded and o.response_code == 21070 and not o.login_error
+    # 上传后网络出错、没有投稿响应
+    o = bb.parse_upload_output(tricky_upload_lines() + ["Error: connection reset"], 1, echo=echo)
+    assert not o.submitted and o.uploaded and o.response_code is None and not o.login_error
+    # 还没开始传就失败（错误报告里带路径）
+    o = bb.parse_upload_output(["Error: 未知错误", f"╰─▶ file {TRICKY}", "    No such file or directory"], 1,
+                               echo=echo)
+    assert not o.submitted and not o.uploaded and not o.login_error
+    # 不传 echo 时，错误报告里的路径会被误认成登录错误：这正是要传 echo 的原因
+    assert bb.parse_upload_output([f"╰─▶ file {TRICKY}"], 1).login_error
+
+
+def test_parse_upload_output_success_marker_rules():
+    ok = "2026-10-20 12:03:01  INFO biliup::uploader::bilibili: Web 接口投稿成功"
+    # 没有可解析的投稿响应时才看 biliup 自己的「接口投稿成功」，且 target 必须是投稿模块
+    assert bb.parse_upload_output(SUCCESS_LINES[:4] + [ok], 0).submitted
+    fake = "2026-10-20 12:03:01  INFO biliup_cli::uploader: APP接口投稿成功"
+    assert not bb.parse_upload_output(SUCCESS_LINES[:4] + [fake], 1).submitted
+    assert not bb.parse_upload_output(["APP接口投稿成功", "投稿成功"], 1).submitted
+    # code 非 0 的响应优先于任何「投稿成功」字样
+    assert not bb.parse_upload_output(SUCCESS_LINES[:4] + [REJECT_21070, ok], 1).submitted
+
+
+def test_parse_upload_output_unknown_time():
+    """Linux/macOS 上 biliup 取不到本地时区，时间戳是 <unknown time>。"""
+    lines = [line.replace("2026-10-20 12:03:00", "<unknown time>").replace("2026-10-20 12:03:01", "<unknown time>")
+             for line in SUCCESS_LINES[2:]]
+    o = bb.parse_upload_output(lines, 0)
+    assert o.uploaded and o.submitted and o.bvid == "BV1Ab4y1C7xY"
+    o = bb.parse_upload_output(lines[:2] + ["Error: connection reset"], 1)
+    assert o.uploaded and not o.submitted
+
+
+def test_echo_strings():
+    echo = bb.echo_strings(Path("/a/b/投稿 成功.mp4"), None, "标题", "ab")
+    assert "/a/b/投稿 成功.mp4" in echo and "投稿 成功.mp4" in echo and "标题" not in echo  # 太短的不抹
+    assert echo == sorted(echo, key=len, reverse=True)
+    win = bb.echo_strings(Path("C:/视频/a\"b.mp4"))
+    assert any("\\\"" in s for s in win)  # JSON 转义形式（pre_upload 里的 "name"）
+
+
 async def test_run_streaming_real_subprocess(tmp_path: Path):
     code = "import sys; print('第一行'); print('\\x1b[32mINFO\\x1b[0m ok'); sys.stderr.write('err\\n'); sys.exit(3)"
     rc, lines = await bb.run_streaming([sys.executable, "-c", code], cwd=tmp_path / "运行目录", timeout=30)
@@ -454,9 +534,11 @@ def video_env(settings, media: Path, fake_bili):
     return settings
 
 
-def fake_run(lines: list[str], rc: int | None, calls: list[Any]):
+def fake_run(lines: list[str], rc: int | None, calls: list[Any], timeouts: list[float] | None = None):
     async def run(args, *, cwd, timeout, on_line=None, heartbeat=30):
         calls.append(args)
+        if timeouts is not None:
+            timeouts.append(timeout)
         for line in lines:
             if on_line:
                 on_line(line)
@@ -494,6 +576,7 @@ async def test_publish_video_scheduled(video_env, media: Path, monkeypatch):
     (["uploading..."], None, ErrorCode.TIMEOUT),
     (SUCCESS_LINES[:4], None, ErrorCode.UNKNOWN_OUTCOME),
     (["Error: credential validation failed with Bilibili code -101"], 1, ErrorCode.LOGIN_REQUIRED),
+    (SUCCESS_LINES[:4] + [REJECT_21070], 0, ErrorCode.PLATFORM_ERROR),  # 响应 code 优先于退出码
 ])
 async def test_publish_video_failures(video_env, media: Path, monkeypatch, lines, rc, code):
     monkeypatch.setattr(bb, "run_streaming", fake_run(lines, rc, []))
@@ -502,6 +585,62 @@ async def test_publish_video_failures(video_env, media: Path, monkeypatch, lines
         await BilibiliAdapter(ctx).publish(video_post(media))
     assert info.value.code is code
     assert ctx.submit_started
+
+
+async def test_publish_video_file_name_with_success_words(video_env, media: Path, monkeypatch):
+    """文件名里有「投稿成功」：被拒 / 出错时不能报成 submitted（否则查重会挡住重发）。"""
+    video = media / TRICKY.name
+    video.write_bytes((media / "video.mp4").read_bytes())
+    for tail, rc, code in (([REJECT_21070, "Error: 未知错误"], 1, ErrorCode.PLATFORM_ERROR),
+                           (["Error: connection reset"], 1, ErrorCode.UNKNOWN_OUTCOME)):
+        monkeypatch.setattr(bb, "run_streaming", fake_run(tricky_upload_lines(video) + tail, rc, []))
+        ctx, _ = make_ctx(video_env)
+        with pytest.raises(PublishError) as info:
+            await BilibiliAdapter(ctx).publish(video_post(media, video=video, title="投稿成功复盘"))
+        assert info.value.code is code
+    # 上传前就失败：错误报告里回显的路径不能被当成登录错误
+    lines = ["Error: 未知错误", f"╰─▶ file {video}", "    No such file or directory (os error 2)"]
+    monkeypatch.setattr(bb, "run_streaming", fake_run(lines, 1, []))
+    ctx, _ = make_ctx(video_env)
+    with pytest.raises(PublishError) as info:
+        await BilibiliAdapter(ctx).publish(video_post(media, video=video))
+    assert info.value.code is ErrorCode.PLATFORM_ERROR and "尚未投稿" in str(info.value)
+
+
+async def test_publish_video_deadline_accounts_for_elapsed(video_env, media: Path, monkeypatch):
+    import multipub.platforms.bilibili as mod
+
+    timeouts: list[float] = []
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, [], timeouts))
+    ctx, _ = make_ctx(video_env)
+    ctx.timeout = 1000
+    adapter = BilibiliAdapter(ctx)
+    real_token = adapter._token
+
+    async def slow_token(cred, *, timeout=30):  # 预检用掉 0.3 秒
+        await asyncio.sleep(0.3)
+        return await real_token(cred, timeout=timeout)
+
+    adapter._token = slow_token
+    await adapter.publish(video_post(media))
+    assert 1000 - mod.VIDEO_TIMEOUT_MARGIN - 5 < timeouts[0] <= 1000 - mod.VIDEO_TIMEOUT_MARGIN - 0.3
+    # 预检卡住：有自己的上限，不会吃掉 biliup 的时间
+    monkeypatch.setattr(mod, "TOKEN_PRECHECK_TIMEOUT", 0.05)
+
+    async def hang(cred, *, timeout=30):
+        await asyncio.sleep(30)
+
+    adapter2 = BilibiliAdapter(make_ctx(video_env)[0])
+    adapter2.ctx.timeout = 1000
+    adapter2._token = hang
+    result = await adapter2.publish(video_post(media))
+    assert result.status is Status.SUBMITTED and timeouts[1] > 900
+    # 剩余时间不够：不启动 biliup、不标记 submit_started
+    ctx3, _ = make_ctx(video_env)
+    ctx3.timeout = mod.VIDEO_TIMEOUT_MARGIN + mod.VIDEO_MIN_BUDGET - 1
+    with pytest.raises(PublishError) as info:
+        await BilibiliAdapter(ctx3).publish(video_post(media))
+    assert info.value.code is ErrorCode.TIMEOUT and not ctx3.submit_started and len(timeouts) == 2
 
 
 async def test_publish_video_token_precheck(video_env, media: Path, monkeypatch, fake_bili):
@@ -535,7 +674,7 @@ async def test_publish_video_through_worker(video_env, media: Path, monkeypatch)
     result = await run_job(job, emit=lambda e: None)
     assert result.status is Status.FAILED and result.error_code == "platform_error"
     assert result.submit_started and not result.retryable
-    assert "--force" in result.message
+    assert "尚未投稿" in result.message and "--force" not in result.message
 
 
 async def test_publish_video_requires_login_and_biliup(settings, media: Path):
@@ -577,6 +716,21 @@ def test_validate_video_rules(media: Path):
     cover.write_bytes(b"x")
     assert "cover" in errors_of(BilibiliAdapter.validate(video_post(media, cover=cover)))
     assert "ai_generated" in warnings_of(BilibiliAdapter.validate(video_post(media, ai_generated=True)))
+    # ai_generated 但显式设了非 AI 的创作声明：提醒不会声明 AI
+    for value in (-1, 2, "4"):
+        issues = BilibiliAdapter.validate(video_post(media, ai_generated=True,
+                                                     options={"tid": 231, "creation_statement": value}))
+        assert "platforms.bilibili.creation_statement" in warnings_of(issues) and not errors_of(issues)
+    assert not warnings_of(BilibiliAdapter.validate(
+        video_post(media, ai_generated=True, options={"tid": 231, "creation_statement": 1})))
+    # 精选评论 / 关闭评论 / 关闭弹幕只在 app 接口生效
+    web = BilibiliAdapter.validate(video_post(media, options={"tid": 231, "submit": "web", "close_reply": True}))
+    assert "platforms.bilibili.submit" in warnings_of(web) and not errors_of(web)
+    for opts in ({"tid": 231, "submit": "app", "close_reply": True}, {"tid": 231, "close_danmu": True},
+                 {"tid": 231, "submit": "b-cut-android", "is_only_self": True}):
+        assert "platforms.bilibili.submit" not in warnings_of(BilibiliAdapter.validate(video_post(media, options=opts)))
+    assert "platforms.bilibili.submit" in warnings_of(BilibiliAdapter.validate(
+        video_post(media, options={"tid": 231, "submit": "b-cut-android", "selection_reply": True})))
 
 
 @pytest.mark.parametrize("delta,level", [
@@ -1016,6 +1170,9 @@ class _FakeLocator:
         self.page.clicks.append(self.key)
         self.page.on_click(self.key)
 
+    async def get_attribute(self, name: str) -> str:
+        return ""
+
 
 class _FakeContext:
     def __init__(self, cookies: list[dict]):
@@ -1036,6 +1193,8 @@ class _FakePage:
         self.on_click = lambda key: None
         self.ticks = 0
         self.on_tick = lambda page: None
+        self.eval_result: Any = {"ok": True}
+        self.evaluated: list[dict] = []
 
     def locator(self, sel: str, has_text: str | None = None):
         if sel == ".bili-dyn-specification-popup":  # 每次轮询都会查一次弹窗：借此推进"时间"
@@ -1048,6 +1207,10 @@ class _FakePage:
 
     async def goto(self, url: str, **kw) -> None:
         self.url = url
+
+    async def evaluate(self, script: str, args: Any = None, isolated_context: bool = True) -> Any:
+        self.evaluated.append(args)
+        return self.eval_result
 
 
 SPEC_BTN = ".bili-dyn-specification-popup .bili-dyn-specification-popup__btn[确认并发送]"
@@ -1074,7 +1237,7 @@ async def test_spec_popup_confirmed_with_consent(settings, fast_note):
         pub.net.created = {"code": 0, "data": {"dyn_id_str": "777"}}
 
     page.on_click = clicked
-    data = await pub._wait_created(page, spec_pending=True)
+    data = await pub._wait_created(page)
     assert data["dyn_id_str"] == "777" and page.clicks == [SPEC_BTN]
     assert any("confirm_dynamic_rules" in e.get("message", "") for e in events)
 
@@ -1093,7 +1256,7 @@ async def test_spec_popup_human_click_is_remembered(settings, fast_note):
             pub.net.created = {"code": 0, "data": {"dyn_id_str": "888"}}
 
     page.on_tick = tick
-    data = await pub._wait_created(page, spec_pending=True)
+    data = await pub._wait_created(page)
     assert data["dyn_id_str"] == "888" and not page.clicks  # 没有代点
     assert marker.is_file()
     assert any("确认并发送" in e.get("message", "") for e in events)
@@ -1106,7 +1269,7 @@ async def test_spec_popup_cancelled_means_not_sent(settings, fast_note):
     page = _FakePage(visible={".bili-dyn-specification-popup"})
     page.on_tick = lambda p: p.visible.clear() if p.ticks >= 2 else None
     with pytest.raises(PublishError, match="没有发出") as info:
-        await pub._wait_created(page, spec_pending=True)
+        await pub._wait_created(page)
     assert info.value.code is ErrorCode.PLATFORM_ERROR
 
 
@@ -1121,6 +1284,200 @@ async def test_spec_needs_consent_in_headless_before_submit(settings, fast_note)
     agreed = _FakePage(visible={".bili-dyn-publishing"}, cookies=[{"name": "dy_spec_agreed", "value": "1"}])
     assert await pub._spec_agreed(agreed)
     assert not await pub._spec_agreed(page)
+
+
+class _FakeReq:
+    def __init__(self, url: str, body: Any, method: str = "POST"):
+        self.url, self.method = url, method
+        self._body = body
+
+    @property
+    def post_data(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body if isinstance(self._body, (str, type(None))) else json.dumps(self._body)
+
+
+CREATE_URL = "https://api.bilibili.com/x/dynamic/feed/create/dyn?platform=web&w_rid=1"
+LAUNCHER = ".bili-dyn-publishing__action.launcher"
+
+
+def browser_pub(bn, settings, *, consent: bool = False, headless: bool = True):
+    """BrowserNotePublisher + 假页面：填写/传图步骤换成空操作，只走发布按钮之后的流程。"""
+    ctx, events = make_ctx(settings)
+    ctx.headless = headless
+    pub = bn.BrowserNotePublisher(ctx, account="main", spec_consent=consent)
+
+    async def noop(*a, **kw):
+        return None
+
+    pub._fill_title = pub._fill_text = pub._upload_images = noop
+    cookies = [{"name": "dy_spec_agreed", "value": "1"}] if consent else []
+    page = _FakePage(visible={".bili-dyn-publishing", LAUNCHER}, cookies=cookies)
+    return ctx, events, pub, page
+
+
+def send_create(pub, option: dict | None, dyn_id: str = "555") -> None:
+    pub.net.on_request(_FakeReq(CREATE_URL, {"dyn_req": {"scene": 2, "option": option}} if option is not None else "x"))
+    pub.net.created = {"code": 0, "data": {"dyn_id_str": dyn_id}}
+
+
+async def test_spec_popup_still_shown_with_consent_through_run(settings, fast_note):
+    """已同意并带了 dy_spec_agreed，B站仍弹规范框：代为点「确认并发送」，而不是干等 60 秒报结果未知。"""
+    ctx, events, pub, page = browser_pub(fast_note, settings, consent=True)
+
+    def clicked(key):
+        if key == LAUNCHER:
+            page.visible |= {".bili-dyn-specification-popup", SPEC_BTN}
+        elif key == SPEC_BTN:
+            page.visible -= {".bili-dyn-specification-popup", SPEC_BTN}
+            send_create(pub, {"aigc": 2})
+
+    page.on_click = clicked
+    data = await pub._run(page, title="", text="", images=[], timer_pub_time=None, aigc=False, pic_mode=None)
+    assert data["dyn_id_str"] == "555" and page.clicks == [LAUNCHER, SPEC_BTN]
+    assert ctx.submit_started and not pub.warnings and pub.scheduled_at is None
+
+
+async def test_unexpected_spec_popup_without_consent_headless(settings, fast_note):
+    """没同意、无头，却在点发布后弹了规范框（如定时）：没人能点，明确报 consent_required、动态没发出。"""
+    ctx, _, pub, page = browser_pub(fast_note, settings)
+    page.eval_result = {"ok": True, "timing": True}
+    page.visible.add(".bili-dyn-publishing__datetime")
+    page.on_click = lambda key: page.visible.add(".bili-dyn-specification-popup")
+    with pytest.raises(NeedsAction) as info:
+        await pub._run(page, title="", text="", images=[], timer_pub_time=int(time.time()) + 3600, aigc=False,
+                       pic_mode=None)
+    assert info.value.code is ErrorCode.CONSENT_REQUIRED and "尚未发出" in str(info.value)
+
+
+async def test_browser_aigc_not_settable_fails_before_submit(settings, fast_note):
+    for eval_result in ({"ok": False, "reason": "no-vm"}, {"ok": True, "aigc": False}, None):
+        ctx, _, pub, page = browser_pub(fast_note, settings, consent=True)
+        page.eval_result = eval_result
+        with pytest.raises(ValidationFailed, match="AI 创作声明") as info:
+            await pub._run(page, title="", text="", images=[], timer_pub_time=None, aigc=True, pic_mode=None)
+        assert not ctx.submit_started and LAUNCHER not in page.clicks
+        assert "mode: http" in str(info.value) and "ai_generated: false" in str(info.value)
+
+
+async def test_browser_options_verified_against_sent_request(settings, fast_note):
+    when = int(time.time()) + 3600
+    page_cases = [
+        # (请求里的 option, 期望 scheduled_at, 期望提醒里的字样)
+        ({"aigc": 1, "pic_mode": 1, "timer_pub_time": when}, when, []),
+        ({"aigc": 2, "pic_mode": 1, "timer_pub_time": when}, when, ["没有声明 AI"]),
+        ({"aigc": 1, "pic_mode": 0}, None, ["立即发布", "图片排版"]),
+        (None, when, []),  # 读不到请求体：按发布框状态，只记日志
+    ]
+    for option, scheduled, expect in page_cases:
+        ctx, events, pub, page = browser_pub(fast_note, settings, consent=True)
+        page.eval_result = {"ok": True, "timing": True, "aigc": True, "pic_mode": True}
+        page.visible.add(".bili-dyn-publishing__datetime")
+        page.on_click = lambda key, pub=pub, option=option: send_create(pub, option) if key == LAUNCHER else None
+        data = await pub._run(page, title="", text="", images=[], timer_pub_time=when, aigc=True, pic_mode=1)
+        assert data["dyn_id_str"] == "555" and page.evaluated[-1] == {"timer_ms": when * 1000, "aigc": True,
+                                                                     "pic_mode": 1}
+        assert pub.scheduled_at == scheduled
+        assert len(pub.warnings) == len(expect) and all(any(w in x for x in pub.warnings) for w in expect)
+        if option is None:
+            assert any("无法核对" in e.get("message", "") for e in events)
+    # 发布框没有图片排版选项：照发，但写进提醒
+    ctx, _, pub, page = browser_pub(fast_note, settings, consent=True)
+    page.eval_result = {"ok": True}
+    page.on_click = lambda key: send_create(pub, {"aigc": 2}) if key == LAUNCHER else None
+    await pub._run(page, title="", text="", images=[], timer_pub_time=None, aigc=False, pic_mode=1)
+    assert any("pic_mode 未生效" in w for w in pub.warnings)
+
+
+def test_net_tracker_reads_sent_option(settings):
+    from multipub.platforms.bili_note import _NetTracker
+
+    net = _NetTracker()
+    net.on_request(_FakeReq(CREATE_URL, {"dyn_req": {"option": {"aigc": 1, "timer_pub_time": 1700000000}}}))
+    assert net.create_sent and net.sent_option == {"aigc": 1, "timer_pub_time": 1700000000}
+    for body in (None, "not json", [1], {"dyn_req": {"option": "x"}}, ValueError("binary")):
+        net = _NetTracker()
+        net.on_request(_FakeReq(CREATE_URL, body))
+        assert net.create_sent and net.sent_option is None
+    net = _NetTracker()
+    net.on_request(_FakeReq(CREATE_URL, {"dyn_req": {}}, method="GET"))
+    assert not net.create_sent
+
+
+async def test_captcha_and_login_popup_after_click(settings, fast_note):
+    bn = fast_note
+    # 无头，发布请求还没发出：needs_action / captcha
+    ctx, _, pub, page = browser_pub(bn, settings, consent=True)
+    page.visible.add(".geetest_panel")
+    with pytest.raises(NeedsAction) as info:
+        await pub._wait_created(page)
+    assert info.value.code is ErrorCode.CAPTCHA and "没有发出" in str(info.value)
+    # 无头，发布请求已发出、还没有结果：结果未知（查重会拦住重发）
+    pub.net.create_sent = True
+    with pytest.raises(PublishError) as info:
+        await pub._wait_created(page)
+    assert info.value.code is ErrorCode.UNKNOWN_OUTCOME and not isinstance(info.value, NeedsAction)
+    # 有头：等人过验证，过了就拿到结果
+    ctx, events, pub, page = browser_pub(bn, settings, consent=True, headless=False)
+    page.visible.add(".geetest_panel")
+
+    def solved(p):
+        if p.ticks == 3:
+            p.visible.discard(".geetest_panel")
+            send_create(pub, {"aigc": 2}, dyn_id="666")
+
+    page.on_tick = solved
+    assert (await pub._wait_created(page))["dyn_id_str"] == "666"
+    assert any("人机验证" in e.get("message", "") for e in events)
+    # .bili-mini-mask 是迷你登录框，不是验证码：没发出请求时报 login_required
+    ctx, _, pub, page = browser_pub(bn, settings, consent=True)
+    page.visible.add(".bili-mini-mask")
+    with pytest.raises(LoginRequired, match="没有发出"):
+        await pub._wait_created(page)
+    # submit_check 返回 -101：同样是登录失效
+    ctx, _, pub, page = browser_pub(bn, settings, consent=True)
+    pub.net.check_sent, pub.net.check = True, {"code": -101, "message": "账号未登录"}
+    with pytest.raises(LoginRequired):
+        await pub._wait_created(page)
+
+
+async def test_note_browser_result_uses_what_was_sent(note_env, media: Path, monkeypatch):
+    """定时没生效（请求里没有定时）→ published + 提醒；提醒都进结果消息。"""
+    from multipub.platforms import bili_note as bn
+
+    ctx, _, _ = note_env
+    state: dict[str, Any] = {}
+
+    class StubPublisher:
+        def __init__(self, ctx, *, account, spec_consent=False, spec_marker=None):
+            self.warnings = state.get("warnings", [])
+            self.scheduled_at = state.get("scheduled_at")
+
+        async def publish(self, **kw):
+            return {"dyn_id_str": "43"}
+
+    monkeypatch.setattr(bn, "BrowserNotePublisher", StubPublisher)
+    when = datetime.now() + timedelta(hours=3)
+    state.update(warnings=["发布请求里没有定时时间，动态已经立即发布"], scheduled_at=None)
+    result = await BilibiliAdapter(ctx).publish(note_post(media, schedule=when))
+    assert result.status is Status.PUBLISHED and "注意：发布请求里没有定时时间" in result.message
+    actual = int((when + timedelta(minutes=7)).timestamp())
+    state.update(warnings=["x 不一致"], scheduled_at=actual)
+    result = await BilibiliAdapter(ctx).publish(note_post(media, schedule=when))
+    assert result.status is Status.SCHEDULED and f"{datetime.fromtimestamp(actual):%H:%M}" in result.message
+    assert "注意：x 不一致" in result.message
+
+
+async def test_http_note_rechecks_schedule_before_submit(note_env, media: Path):
+    ctx, _, fake = note_env
+    async with bh.make_client({"SESSDATA": "s"}) as client:
+        with pytest.raises(ValidationFailed, match="不足 5 分钟"):
+            await bh.publish_note_http(client, csrf="c", account="main", mid=1, keys=(IMG_KEY, SUB_KEY), title="",
+                                       text="x", images=[media / "images" / "1.jpg"], aigc=False, pic_mode=0,
+                                       timer_pub_time=int(time.time()) + 200, mark_submit=ctx.mark_submit_started,
+                                       log=ctx.log)
+    assert not ctx.submit_started and not fake.by_path("/x/dynamic/feed/create/dyn")
 
 
 def test_with_spec_cookie():

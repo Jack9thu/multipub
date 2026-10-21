@@ -65,7 +65,11 @@ MIN_WRITE_INTERVAL = 1.0  # write_interval 配得再小也不低于这个值（�
 DEFAULT_IMAGE_TIMEOUT = 90.0  # 单张图片等知乎处理完成的最长时间（秒）
 IMAGE_POLL_INTERVAL = 1.5
 REMOTE_IMAGE_MAX_BYTES = 20 * 1024 * 1024
-PASS_THROUGH_FORMATS = {"JPEG": ("image/jpeg", "jpg"), "PNG": ("image/png", "png")}
+# MPO：带深度图 / Ultra HDR 增益图的手机 JPEG，Pillow 认成 MPO，浏览器和图床按普通 JPEG 处理
+PASS_THROUGH_FORMATS = {"JPEG": ("image/jpeg", "jpg"), "MPO": ("image/jpeg", "jpg"),
+                        "PNG": ("image/png", "png")}
+EXIF_ORIENTATION = 0x0112
+ROTATED_ORIENTATIONS = {5, 6, 7, 8}  # 这几种方向显示时要转 90°，宽高互换
 
 LogFn = Callable[..., None]
 
@@ -231,23 +235,47 @@ class PreparedImage:
     converted_from: str = ""  # 非空表示从该格式转成了 JPEG
 
 
+def _orientation(im: Any) -> int:
+    try:
+        return int(im.getexif().get(EXIF_ORIENTATION) or 1)
+    except Exception:  # noqa: BLE001 - EXIF 坏了就当没有方向
+        return 1
+
+
+def _upright(im: Any) -> Any:
+    """按 EXIF 方向把像素转正（转码会丢 EXIF）；EXIF 坏了就原样返回。"""
+    from PIL import ImageOps
+
+    try:
+        return ImageOps.exif_transpose(im)
+    except Exception:  # noqa: BLE001
+        return im
+
+
 def prepare_image(raw: bytes, name: str) -> PreparedImage:
-    """JPEG / PNG 原样上传；GIF（只取第一帧）、WebP、BMP 等转成 JPEG。"""
+    """JPEG（含 MPO）/ PNG 原样上传；GIF（只取第一帧）、WebP、BMP 等按 EXIF 方向转正后转成 JPEG。
+
+    宽高（data-rawwidth / rawheight）一律按显示方向记：原样上传的照片带 EXIF 旋转时宽高互换。"""
     from PIL import Image, UnidentifiedImageError
 
     try:
         with Image.open(io.BytesIO(raw)) as im:
             fmt = (im.format or "").upper()
-            width, height = im.size
             if fmt in PASS_THROUGH_FORMATS:
                 mime, ext = PASS_THROUGH_FORMATS[fmt]
+                width, height = im.size
+                if _orientation(im) in ROTATED_ORIENTATIONS:
+                    width, height = height, width
                 return PreparedImage(name, raw, mime, ext, width, height)
             im.seek(0)
-            frame = im.convert("RGBA")
+            frame = _upright(im).convert("RGBA")
             canvas = Image.new("RGB", frame.size, (255, 255, 255))
             canvas.paste(frame, mask=frame.getchannel("A"))
+            width, height = canvas.size
             buf = io.BytesIO()
             canvas.save(buf, "JPEG", quality=92)
+    except Image.DecompressionBombError as exc:
+        raise ValidationFailed(f"{name} 分辨率太大，拒绝处理（{exc}）：请先缩小图片") from exc
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise ValidationFailed(f"{name} 不是可识别的图片（{exc}）") from exc
     return PreparedImage(name, buf.getvalue(), "image/jpeg", "jpg", width, height, converted_from=fmt or "unknown")
@@ -523,8 +551,11 @@ class ZhihuApi:
         topics = [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
         if not topics:
             return None
-        exact = [t for t in topics if str(t.get("name", "")).strip().lower() == keyword.strip().lower()]
-        return (exact or topics)[0]
+        key = keyword.strip().lower()
+        names = [str(t.get("name") or "").strip().lower() for t in topics]
+        exact = [t for t, n in zip(topics, names) if n == key]
+        close = [t for t, n in zip(topics, names) if n and (key in n or n in key)]  # 「徒步」→「徒步旅行」
+        return (exact or close or topics)[0]  # 不同名时由调用方决定是否采用
 
     async def add_article_topic(self, article_id: str, topic: dict[str, Any]) -> None:
         await self.call("POST", f"{ZHUANLAN}/api/articles/{article_id}/topics",

@@ -179,7 +179,8 @@ class DouyinAdapter(PlatformAdapter):
                 productTitle=str(opts.get("product_title") or ""),
                 collection_name=str(opts["collection"]) if opts.get("collection") else None,
                 declaration=resolve_declaration(post),
-                sync_toutiao=bool(opts.get("sync_toutiao", False)),
+                # 三态：没写 → None（不碰开关，保持页面默认）；true → 打开；false → 关闭（关不掉则拒绝发布）
+                sync_toutiao=opts["sync_toutiao"] if isinstance(opts.get("sync_toutiao"), bool) else None,
                 **common,
             )
         return dy.DouYinNote(

@@ -73,7 +73,9 @@ class PublishRejected(SauError):
 
 
 class DeclarationFailed(SauError):
-    """调用方要求的声明（如抖音自主声明）没能设置上，拒绝继续发布。"""
+    """调用方明确要求的设置（抖音自主声明、小红书来源转载、关闭头条同步）没能设置上，拒绝继续发布。
+
+    消息里已写明处理办法，适配器原样转成 validation 错误。"""
 
 
 # ---------------------------------------------------------------- hooks
@@ -91,7 +93,7 @@ class Hooks:
     upload_timeout: float = 3000  # 等待视频/图片上传完成
     publish_timeout: float = 240  # 点击「发布」后等待成功跳转
     sms_timeout: float = 300  # 等待用户提供短信验证码
-    poll_interval: float = 2.0  # 轮询验证码文件的间隔
+    poll_interval: float = 2.0  # 轮询间隔：验证码文件、抖音等发布表单出现
     reclick_gap: float = 20  # 上次点击「发布」没有任何反应时，至少隔这么久才再点
     max_publish_clicks: int = 3  # 最终「发布」按钮最多点几次（含被平台弹窗拦下的那次）
     reject_grace: float = 15  # 发布接口明确失败后，等这么久仍没有验证弹窗就判定为被拒
@@ -204,6 +206,55 @@ class PublishGuard:
                 or self.inflight > 0 or self.unblocked):
             return None
         return self.rejection if self._clock() - self._rejected_at >= grace else None
+
+
+# ---------------------------------------------------------------- 页面检查
+
+async def publish_button_ready(button: Any) -> bool:
+    """最终发布按钮唯一、可见、可用时，点击才可能真正触发发布。
+
+    disabled 的 <button> 被 force 点击时什么也不发生，非 force 点击会一直等按钮可用，
+    选择器命中多个按钮时 click() 直接报错——这些都不算一次「点击」：不记账、不标记已提交，继续等。
+    """
+    try:
+        if await button.count() != 1:
+            return False
+        if not (await button.is_visible() and await button.is_enabled()):
+            return False
+        if await button.get_attribute("disabled") is not None:
+            return False
+        return (await button.get_attribute("aria-disabled") or "").strip().lower() != "true"
+    except Exception:  # noqa: BLE001 - 页面跳转中 locator 可能失效
+        return False
+
+
+_VISIBLE_TEXT_JS = """({texts, exact, exclude}) => {
+    const skip = '[contenteditable="true"], input, textarea' + (exclude ? ', ' + exclude : '');
+    for (const el of document.querySelectorAll('body *')) {
+        if (el.closest(skip)) continue;
+        const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
+        if (!own || !texts.some(t => exact ? own === t : own.includes(t))) continue;
+        const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+        if (r.width && r.height && st.visibility !== 'hidden' && st.display !== 'none') return own.slice(0, 80);
+    }
+    return '';
+}"""
+
+
+async def find_visible_text(page: Any, texts: list[str], *, exact: bool = False, exclude: str = "") -> str:
+    """页面上第一个可见、且直接文字包含（exact 时等于）texts 之一的元素的文字；没有返回 ""。
+
+    输入框、contenteditable 编辑区和 exclude 选择器里的不算：用来确认声明等设置「显示出来了」，
+    正文里碰巧写了同样的字、输入框里的值都不会被当成设置成功。
+    """
+    texts = [t for t in texts if t]
+    if page is None or not texts:
+        return ""
+    try:
+        found = await page.evaluate(_VISIBLE_TEXT_JS, {"texts": texts, "exact": exact, "exclude": exclude})
+    except Exception:  # noqa: BLE001
+        return ""
+    return found if isinstance(found, str) else ""
 
 
 # ---------------------------------------------------------------- evidence

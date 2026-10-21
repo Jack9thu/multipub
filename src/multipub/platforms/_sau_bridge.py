@@ -137,13 +137,20 @@ def login_hint(platform: str, account: str) -> str:
 
 # ================================================================ worker 侧
 
-def sau_timeouts(settings: "Settings", platform: str, kind: Kind) -> dict[str, float]:
-    """各等待步骤的截止时间（秒），可在 config.toml 的 [platforms.<平台>] 里覆盖。"""
+UPLOAD_RESERVE = 600  # 任务总超时里留给上传以外步骤（开页面、填表、发布、短信）的时间
+LOGIN_OVERHEAD = 120  # 登录任务里留给 cookie 校验、抓二维码、轮询开销的时间
+
+
+def sau_timeouts(settings: "Settings", platform: str, kind: Kind,
+                 job_timeout: float | None = None) -> dict[str, float]:
+    """各等待步骤的截止时间（秒），可在 config.toml 的 [platforms.<平台>] 里覆盖。
+
+    上传等待 = 本次任务的总超时（ctx.timeout，即 --timeout 或 timeouts.publish_<kind>）− 600 秒。"""
     cfg = settings.platform_config(platform)
-    total = settings.timeout_for(f"publish_{kind.value}")
+    total = job_timeout or settings.timeout_for(f"publish_{kind.value}")
     defaults = {
         "page_timeout": 300.0,
-        "upload_timeout": float(max(180, total - 600)),
+        "upload_timeout": float(max(180, total - UPLOAD_RESERVE)),
         "publish_timeout": 240.0,
         "sms_timeout": 300.0,
     }
@@ -181,10 +188,12 @@ def sau_session(ctx: "JobContext", business_name: str) -> Iterator[None]:
 def make_hooks(ctx: "JobContext", kind: Kind, *, sms_message: str = "") -> Any:
     from .._sau.runtime import Hooks
 
-    timeouts = sau_timeouts(ctx.settings, ctx.platform, kind)
+    timeouts = sau_timeouts(ctx.settings, ctx.platform, kind, ctx.timeout)
+    sms_note = (f"{sms_message or '需要短信验证码'}（发布正在等待，{int(timeouts['sms_timeout'])} 秒内有效；"
+                "中途退出后重新发布会重新发送短信）")
 
     def on_sms(path: Path) -> None:
-        ctx.needs_input("sms_code", sms_message or "需要短信验证码", path=path)
+        ctx.needs_input("sms_code", sms_note, path=path)
 
     return Hooks(
         before_publish_click=ctx.mark_submit_started,
@@ -239,15 +248,19 @@ async def run_login(adapter: "PlatformAdapter", setup_fn: SetupFn) -> Result:
     account_file.parent.mkdir(parents=True, exist_ok=True)
     hint = login_hint(ctx.platform, ctx.account)
     callback, qr_path = qrcode_callback(ctx)
-    wait = max(60, ctx.settings.timeout_for("login") - 90)
-    # SAU 只按轮询次数计时，抓二维码等步骤另算；worker 的总超时兜底
+    budget = ctx.timeout or (ctx.settings.timeout_for("login") - 30)
+    wait = int(max(60, budget - LOGIN_OVERHEAD))
+    # SAU 只按轮询次数计时，cookie 校验、抓二维码等步骤另算，所以留出余量，免得被 worker 的总超时打断
     if ctx.headless:
         ctx.log("无头模式登录：请扫描上报的二维码图片；如需短信二次验证请去掉 --headless 重试")
     try:
         detail = await setup_fn(str(account_file), handle=True, return_detail=True,
                                 qrcode_callback=callback, headless=ctx.headless, login_timeout=wait)
     finally:
-        qr_path.unlink(missing_ok=True)
+        try:
+            qr_path.unlink(missing_ok=True)
+        except OSError as exc:  # 例如 Windows 上图片正被看图软件占用：不影响登录结果
+            ctx.log(f"删除二维码图片失败（可手动删除）: {exc}", level="warning")
 
     status = detail.get("status")
     if detail.get("success") and account_file.is_file():
@@ -289,31 +302,36 @@ async def translate_errors(ctx: "JobContext") -> AsyncIterator[None]:
 
     hint = login_hint(ctx.platform, ctx.account)
     check_first = "请先到平台后台确认作品是否已发出，再决定是否重发"
+    sms_hint = (f"验证码必须在发布进行中提交：收到短信验证提示后，在 sms_timeout 时限内运行 "
+                f"mpub verify-code {ctx.platform} <验证码>；重新发布会重新发送短信，之前的验证码作废")
+    captcha_hint = "如需重发，请加 --headed 并在浏览器窗口里手动完成验证"
     try:
         yield
-    except rt.SmsCodeTimeout as exc:
-        msg = f"{exc}。收到短信后运行 mpub verify-code {ctx.platform} <验证码> 并重新发布"
-        if ctx.submit_started:
-            msg += f"（已点击过发布：{check_first}）"
-        raise NeedsAction(msg, code=ErrorCode.SMS_CODE_REQUIRED, retryable=False) from exc
-    except rt.CaptchaRequired as exc:
-        msg = f"{exc}。请加 --headed 重新发布并手动完成验证"
-        if ctx.submit_started:
-            msg += f"（已点击过发布：{check_first}）"
-        raise NeedsAction(msg, code=ErrorCode.CAPTCHA, retryable=False) from exc
     except rt.StepTimeout as exc:
+        # 点过发布之后，人机验证 / 短信验证 / 超时都说明结果未知：一律 unknown_outcome，
+        # 发布记录会拦住不带 --force 的重发（needs_action 不会拦，可能重复发布）
         if exc.after_submit or ctx.submit_started:
-            raise PublishError(f"{exc}。{check_first}", code=ErrorCode.UNKNOWN_OUTCOME,
-                               retryable=False) from exc
+            extra = ""
+            if isinstance(exc, rt.SmsCodeTimeout):
+                extra = f"；{sms_hint}"
+            elif isinstance(exc, rt.CaptchaRequired):
+                extra = f"；{captcha_hint}"
+            where = "" if "已点击发布" in str(exc) else "（已点击过发布，结果未知）"
+            raise PublishError(f"{exc}{where}。{check_first}{extra}",
+                               code=ErrorCode.UNKNOWN_OUTCOME, retryable=False) from exc
+        if isinstance(exc, rt.SmsCodeTimeout):
+            raise NeedsAction(f"{exc}。{sms_hint}", code=ErrorCode.SMS_CODE_REQUIRED, retryable=False) from exc
+        if isinstance(exc, rt.CaptchaRequired):
+            raise NeedsAction(f"{exc}。请加 --headed 重新发布并手动完成验证", code=ErrorCode.CAPTCHA,
+                              retryable=False) from exc
         if isinstance(exc, rt.CookieInvalid):
             raise LoginRequired(f"{exc}。请重新登录：{hint}") from exc
         raise PublishError(str(exc), code=ErrorCode.TIMEOUT, retryable=True) from exc
     except rt.PublishRejected as exc:
         raise PublishError(f"{exc}。作品应未创建；建议先到平台后台确认，再修改内容后重发",
                            code=ErrorCode.PLATFORM_ERROR, retryable=False) from exc
-    except rt.DeclarationFailed as exc:
-        raise ValidationFailed(f"{exc}：确认 platforms.{ctx.platform}.declaration 与页面上的选项文字完全一致，"
-                               "或设为 false 不声明") from exc
+    except rt.DeclarationFailed as exc:  # 发布前拒绝：消息里已写明怎么处理
+        raise ValidationFailed(str(exc)) from exc
     except rt.CookieInvalid as exc:
         raise LoginRequired(f"登录已失效：运行 {hint}") from exc
     except rt.UploadFailed as exc:

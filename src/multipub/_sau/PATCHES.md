@@ -3,8 +3,9 @@
 - 上游：https://github.com/dreammis/social-auto-upload （MIT，许可证见本目录 `LICENSE`）
 - 固定提交：`0012d2c355f88f683cc38dde2a2db209e14091bc`（2026-09-03 merge，main 分支）
 - 只取抖音 / 小红书需要的文件；所有代码改动都在源码里以 `# multipub patch:` 注释标出。
-- 小红书的 AI 内容声明函数移植自 omnipost（`uploader/xiaohongshu_uploader/main.py:420-492`，
-  提交 `23f30666e0fbbfc6373ed97394daea82acb0a0e5`，MIT，基于 SAU `99a392a`）。
+- 小红书的 AI 内容声明函数移植自 omnipost（https://github.com/rehatRobot/omnipost ，
+  `uploader/xiaohongshu_uploader/main.py:420-492`，提交 `23f30666e0fbbfc6373ed97394daea82acb0a0e5`，MIT，基于 SAU `99a392a`），
+  其许可证与版权声明见本目录 `LICENSE-omnipost`。
 
 ## 文件对照
 
@@ -20,6 +21,7 @@
 | `uploader/__init__.py`、`uploader/*/__init__.py` | 同名 | `c8cfe0b7` 等 | 清空（去掉 import 时的 mkdir） |
 | `utils/__init__.py` | 同名 | `e69de29b` | 原样（空文件） |
 | `LICENSE` | `LICENSE` | `beeaf19c` | 原样 |
+| `LICENSE-omnipost` | omnipost 的 `LICENSE` | — | 原文 + 说明（移植函数的版权声明，MIT 要求保留） |
 | `conf.py` | （上游 gitignore，`conf.example.py`） | — | multipub 新写的 shim |
 | `runtime.py` | — | — | multipub 新增：钩子、截止时间、防重复点击（`PublishGuard`）、异常类型、收尾工具 |
 
@@ -33,19 +35,27 @@
   新增常量 `DOUYIN_AI_DECLARATION`，由适配器在 `ai_generated: true` 且未显式填写声明时传入。
 - 原因：上游把贡献者自己的合规需求写成了默认值，会给所有作品打上 AI 声明。
 
-### b. 抖音视频：头条/西瓜同步开关改为显式开启
-- 文件：同上，`DouYinVideo.__init__` 新增参数 `sync_toutiao=False`；`_upload_video_steps` 中开关逻辑加条件。
-- 改动：`sync_toutiao=False`（默认）时完全不碰开关，保持页面默认状态。
-- 原因：上游强制打开第三方同步，属于隐藏副作用。
+### b. 抖音视频：头条/西瓜同步开关改为显式设置
+- 文件：同上，`DouYinVideo.__init__` 新增参数 `sync_toutiao=None`；上游无条件打开开关的那段换成 `apply_sync_toutiao()`。
+- 改动：三态。`None`（默认，清单里没写）完全不碰开关，保持页面默认；`True` 打开；`False` 把开着的开关关掉。
+  只动周围文字含「头条/西瓜」的开关（上游选择器较旧，改版后可能命中别的开关）。改完核实 `semi-switch-checked`：
+  要求关闭却关不掉时截图并抛 `DeclarationFailed`（拒绝发布，不能违背调用方的明确选择去同步）；要求打开却打不开只告警。
+- 原因：上游强制打开第三方同步，属于隐藏副作用；之前跑过上游的账号页面上开关可能一直开着。
 
 ### c. 小红书：「来源转载」声明改为显式开启；新增 AI 内容声明（尽力而为）
 - 文件：`uploader/xiaohongshu_uploader/main.py`
 - 改动：`XiaoHongShuBaseUploader.__init__` 新增 `ai_generated=False`、`repost_source=None`；
   新增 `apply_declarations()`：有 `repost_source` 才调用上游 `check_original_declaration()`（并真正填入媒体名称），
   `ai_generated` 时调用移植自 omnipost 的 `set_ai_content_declaration()`（选项文字 `XHS_AI_DECLARATION`，
-  找不到入口/选项只告警，不中断发布）。视频和图文流程里原来无条件的 `check_original_declaration()` 换成 `apply_declarations()`。
+  没能确认选上只告警，不中断发布）。视频和图文流程里原来无条件的 `check_original_declaration()` 换成 `apply_declarations()`。
   移植时把 omnipost 的兜底定位器 `page.locator("div").filter(has_text=...)`（会命中最外层容器、点到页面中央）
   改成非精确 `get_by_text(...)`。
+- 来源转载要核实：`check_original_declaration()` 改为返回 bool——找不到入口/选项/「确认」、点「确认」后媒体名称输入框没关、
+  或页面上（输入区以外，`runtime.find_visible_text`）没显示来源名称或「来源转载」，都返回 False；
+  `apply_declarations()` 据此截图并抛 `DeclarationFailed`（在点击发布之前，拒绝发布）。上游失败只记 warning 照常发出去，
+  会把用户要求声明转载的内容当原创发布。
+- AI 声明要核实：去掉 omnipost「选项附近有 取消/×/已选 就当作已选」的判断；先按 Esc 收起面板，页面上已显示该声明才跳过，
+  否则点选项后核实——点过的选项已随面板收起、且页面上显示着这几个字，才算成功，否则记入 `declaration_warnings`。
 - 原因：上游无条件声明「来源转载」且媒体名为空，会把原创内容标成转载。
 
 ### d. 所有等待循环加截止时间；区分「点击发布前/后」
@@ -58,7 +68,11 @@
   - 超时调用 `fail_step()`：截图到 `evidence_dir`，按页面特征抛 `CaptchaRequired` / `LoginPageDetected` / `StepTimeout`，
     异常带 `after_submit` 标记（是否已点过最终「发布」）。
   - 第一次点击最终「发布」按钮前调用 `_before_publish_click()` → `hooks.before_publish_click`（适配器接到
-    `ctx.mark_submit_started()`）。只在按钮存在（`count()>0`）时才点击/标记。
+    `ctx.mark_submit_started()`）。只在按钮能真正点下去时才点击/记账/标记：`runtime.publish_button_ready()` 要求
+    选择器只命中一个按钮、可见、可用（`is_enabled()`，且没有 `disabled` / `aria-disabled="true"`）；否则不点，
+    继续在发布截止时间内等（抖音视频用 `force=True` 点击，点在 disabled 按钮上什么也不会发生；非 force 点击会等到按钮可用；
+    命中多个按钮时 click 直接报错——这些以前都会被算成一次点击，耗尽次数后报 `unknown_outcome`）。
+    点击带 5 秒超时。小红书的子串选择器 `button:has-text("发布")` 命中多个按钮时改用文字完全一致的那个，仍不唯一就不点。
   - **防重复发布**：上游循环每 ~3.5 秒点一次「发布」直到跳转，平台处理慢时可能提交两次。现在最终发布按钮只经
     `_click_publish()` 点击，受 `runtime.PublishGuard` 限制：第一次之后，只有 (1) 平台弹窗拦下了上次点击
     （短信验证已处理、抖音「请设置封面后再发布」已选推荐封面）或 (2) 距上次点击 ≥ `reclick_gap`（20 秒）且期间没观察到
@@ -80,6 +94,13 @@
   - `validate_base_args()` 改抛 `CookieInvalid`（原 `RuntimeError`），适配器据此提示重新登录。
   - 抖音 `apply_self_declaration()` 失败改抛 `DeclarationFailed`（原 `RuntimeError`）并先截图；适配器映射为 `validation`，
     提示检查 `declaration` 文字。仍然“设置失败就拒绝发布”（上游行为）。
+  - 抖音 `set_self_declaration()` 不再“点完就返回 True”：选项要变成选中（`label.semi-radio` 带 `semi-radio-checked`
+    或内部 radio 已勾选，普通点击没生效时用 `_native_click` 再点一次），点「确定」后弹窗要关闭（没关再原生点一次），
+    页面没有 `label.semi-radio` 结构时改为核实入口处显示了所选声明（`find_visible_text`）；否则返回 False → `DeclarationFailed`。
+    抖音组件常吞掉点击且不抛异常，上游在这种情况下会不带声明发出去。
+  - 抖音视频：version_2 发布页（`post/video`）要等视频传完才渲染表单，上游在 `fill_title_and_description` 里固定等 120 秒，
+    大文件会在这里失败（报成 patchright 的 TimeoutError → internal）。现在进入发布页后先 `_wait_for_publish_form()`：
+    在 `upload_timeout` 截止时间内等标题框出现（期间照常检查「上传失败」并重传），与后面等「重新上传」共用同一个截止时间。
   - 删除循环里 `if self.debug: page.screenshot(full_page=True)`（没有路径，什么也不保存）。
 - 原因：页面改版时上游会无限卡住；也无法区分“没点发布”与“点了但不知道结果”。
 
@@ -102,7 +123,8 @@
 - 改动：`cv2` / `numpy` 改为可选导入（extra `terminal-qr`），缺失时 `decode_qrcode_from_path()` 返回 None，静默跳过终端二维码；
   `print_terminal_qrcode()` 全部输出到 stderr（`segno ... terminal(out=sys.stderr)`），不再 reconfigure stdout。
   新增 `terminal_qr_available()`。适配器把 `qrcode_callback` 接到：复制图片到 `settings.qrcode_dir/<平台>-<账号>.png` 并 `ctx.qrcode(path)`。
-- `douyin_setup` / `xiaohongshu_setup` 新增 `login_timeout` 参数（换算成 `max_checks`），让扫码等待落在 worker 超时之内。
+- `douyin_setup` / `xiaohongshu_setup` 新增 `login_timeout` 参数（换算成 `max_checks`），让扫码等待落在 worker 超时之内
+  （适配器传入 任务超时 − 120 秒：cookie 校验、抓二维码、每轮轮询的开销都不计入 `max_checks`）。
 
 ### h. 抖音短信验证码
 - 文件：`uploader/douyin_uploader/main.py`
@@ -111,10 +133,12 @@
   - 短信处理从 `DouYinVideo` 的发布循环抽到基类 `_handle_sms_verification()`，图文发布循环也调用（上游图文流程遇到短信弹窗会空转）。
     图文流程用 `strict=True`：除了输入框，还要求出现验证组件特征（`SMS_DIALOG_MARKERS`），避免误判。
   - 检测到弹窗：先删除残留的 `verify_code.txt`，点「获取验证码」，`hooks.sms_code_required(path)` 通知一次，
-    按 `poll_interval` 轮询文件，超过 `sms_timeout` 截图并抛 `SmsCodeTimeout`（适配器映射为 `NeedsAction(SMS_CODE_REQUIRED)`）。
+    按 `poll_interval` 轮询文件，超过 `sms_timeout` 截图并抛 `SmsCodeTimeout`（适配器映射：点发布前为 `NeedsAction(SMS_CODE_REQUIRED)`；
+    点过发布之后为 `unknown_outcome`——短信/人机验证出现在点击之后时作品是否已创建并不确定，发布记录要能拦住重发）。
+    每轮开始都会删掉 `verify_code.txt` 再发新短信，所以验证码只能在发布等待期间提交，适配器的提示也这样写。
     提交验证码后重置发布循环的截止时间，并告诉 `PublishGuard` 上次点击被拦下（允许再点一次「发布」，与上游一致）。
   - 每次发布最多处理 `MAX_SMS_ROUNDS`（3）轮短信验证；第 4 次检测到弹窗（验证码错误/过期）截图并抛 `SmsVerifyFailed`
-    （同样映射为 `sms_code_required`），避免反复发短信、无限循环。
+    （映射规则同 `SmsCodeTimeout`），避免反复发短信、无限循环。
   - `_submit_sms_verify_code()` 移到基类，日志里不再打印验证码本身。
   - 文件路径来自 `conf.verify_code_file()`（= `settings.sau_home/verify_code.txt`，与 `mpub verify-code douyin` 一致）。
 

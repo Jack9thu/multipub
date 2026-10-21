@@ -175,3 +175,21 @@ def test_worker_module_runs_standalone(home: Path):
                           capture_output=True, text=True, encoding="utf-8", timeout=60)
     last = json.loads(proc.stdout.strip().splitlines()[-1])
     assert last["event"] == "result" and last["result"]["status"] == "needs_action"
+
+
+def test_json_outputs_for_simple_commands(home: Path, tmp_path: Path, capsys, monkeypatch, media: Path):
+    d = tmp_path / "j"
+    assert main(["new", str(d), "--kind", "note", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] and out["path"].endswith("post.yaml")
+    assert main(["new", str(d), "--kind", "note", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "exists"
+
+    assert main(["verify-code", "douyin", " 123456 ", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert Path(out["path"]).read_text(encoding="utf-8") == "123456"
+
+    write_post(media, "kind: video\ntitle: t\nvideo: video.mp4\nplatforms: [fake]\n")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    assert main(["publish", str(media), "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "confirmation_required"

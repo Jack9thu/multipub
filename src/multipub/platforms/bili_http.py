@@ -22,7 +22,7 @@ from typing import Any, Callable
 
 import httpx
 
-from ..models import ErrorCode, LoginRequired, NeedsAction, PublishError
+from ..models import ErrorCode, LoginRequired, NeedsAction, PublishError, ValidationFailed
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/141.0.0.0 Safari/537.36")
@@ -61,6 +61,8 @@ LOGIN_HINT = "运行 mpub login bilibili --account {account} 重新扫码登录"
 HTTP_MODE_RISK_HINT = "稍后再试，或改用默认的浏览器模式（去掉 platforms.bilibili.mode: http）"
 # 服务端内部错误 / 超时：请求可能已经处理，发布接口遇到这些码按"结果未知"处理
 SERVER_ERROR_CODES = frozenset({-500, -502, -503, -504})
+# 动态定时至少晚于现在 5 分钟；发出前再留 30 秒余量，不足就不发（否则可能被拒或变成立即发布）
+TIMER_LEAD_MIN = 330
 
 
 def opus_url(dyn_id: str) -> str:
@@ -408,5 +410,7 @@ async def publish_note_http(client: httpx.AsyncClient, *, csrf: str, account: st
     dyn_req = build_dyn_req(text=text, title=title, pics=pics, mid=mid, aigc=aigc,
                             pic_mode=pic_mode, timer_pub_time=timer_pub_time)
     await submit_check(client, dyn_req, csrf, account=account)
+    if timer_pub_time and timer_pub_time <= time.time() + TIMER_LEAD_MIN:  # 传图可能用掉了 validate 时的余量
+        raise ValidationFailed("定时发布时间距现在已不足 5 分钟（传图耗时），动态没有发出；请调整 schedule 后重发")
     mark_submit()
     return await create_dyn(client, dyn_req, csrf, keys, account=account)

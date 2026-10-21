@@ -38,7 +38,10 @@
 | `creation_statement` | `ai_generated: true` 时为 `1`，否则不传 | 创作声明 id：-1 无 / 1 AI / 2 虚构演绎 / 3 营销 / 4 个人观点，经 `--extra-fields '{"creation_statement":{"id":N}}'` 提交（用法来自 OmniPost，**未验证**） |
 | `no_reprint` | `false` | `true` → `--no-reprint=1`（禁止转载） |
 | `is_only_self` | `false` | `true` → `--is-only-self=1`（仅自己可见） |
-| `selection_reply` / `close_reply` / `close_danmu` | `false` | 精选评论 / 关闭评论 / 关闭弹幕 → `--up-selection-reply` 等（biliup 注明仅 app 投稿接口有效，默认就是 app） |
+| `selection_reply` / `close_reply` / `close_danmu` | `false` | 精选评论 / 关闭评论 / 关闭弹幕 → `--up-selection-reply` 等（biliup 注明仅 app 投稿接口有效，默认就是 app；`submit: web` / `b-cut-android` 时给 warning） |
+
+上面 5 个开关**必须是 YAML 布尔值** `true` / `false`（不写或 `null` 等于 false）。`"false"`、`"no"`、`0`、`1`
+这类字符串或数字会在 validate 时报 error，不会被当成 true（否则 `is_only_self: "false"` 会把视频发成仅自己可见）。
 | `extra_fields` | 无 | 映射，原样 JSON 合并进投稿参数 → `--extra-fields`（高级用法） |
 | `line` | 自动探测 | 上传线路：`bldsa cnbldsa andsa atdsa bda2 cnbd anbd atbd tx cntx antx attx txa alia estx akbd` → `--line` |
 | `limit` | 3（biliup 默认） | 单文件并发分片数 → `--limit` |
@@ -75,7 +78,7 @@ platforms:
 | `biliup_version` | `v1.3.1` | 使用的 biliup 版本（安装目录 `<数据目录>/tools/biliup/<版本>/`） |
 | `biliup_path` | 空 | 指定已有的 biliup 可执行文件，优先于自动安装；`mpub setup` 不会动它 |
 | `github_mirror`（全局） | 空 | 下载 biliup 时拼在 GitHub URL 前，例如 `https://ghfast.top/` |
-| `[timeouts] publish_video` | 3600 | 单次视频发布总超时；biliup 会在此值 − 60 秒时被杀掉 |
+| `[timeouts] publish_video` | 3600 | 单次视频发布总超时（`--timeout` 优先）。biliup 的期限 = worker 的总超时（此值 − 30 秒）− 发布前准备已用的时间 − 30 秒，到点被杀掉并给出明确结果 |
 | `confirm_dynamic_rules` | `false` | `true`：阅读过 [《动态发布规范》](https://t.bilibili.com/h5/dynamic/specification) 后，允许 multipub 在浏览器模式里代为确认该弹窗（对所有账号生效） |
 
 ## biliup 的安装与校验（`mpub setup` / `mpub doctor`）
@@ -119,6 +122,9 @@ platforms:
 | `copyright` / `source` | 只能 1 或 2；2 必须有 `source` | error |
 | `creation_statement` | -1/1/2/3/4 | error |
 | `ai_generated: true` 且未写 `creation_statement` | 提示将以 id=1 提交（未验证） | warning |
+| `ai_generated: true` 但 `creation_statement` 不是 1 | 提示不会声明 AI 生成 | warning |
+| `no_reprint` / `is_only_self` / `selection_reply` / `close_reply` / `close_danmu` | 必须是 true/false（`null` 视为 false） | error |
+| `selection_reply` / `close_reply` / `close_danmu` 为 true 且 `submit` 不是 app | 这些开关只在 app 投稿接口生效 | warning |
 | `line` / `submit` / `limit` | 见上表取值；`limit` 1–64 | error |
 | 视频格式 | `.mp4 .flv .avi .wmv .mov .webm .mpeg .mpg .mkv .m4v .ts .rm .rmvb .3gp` 以外 | warning |
 | 封面 | 只能 jpg/png；>5MB | error / warning |
@@ -191,24 +197,35 @@ mpub login bilibili --account main
 
 1. 再次 validate；确认登录文件有 `token_info`、找到 biliup（否则 `internal`：先 `mpub setup`）。
    再做一次与 biliup 相同的只读令牌校验（`oauth2/info`）：令牌失效 → 启动 biliup **之前**就返回 `login_required`；
-   网络错误 / 风控只记警告，交给 biliup 自己校验。
+   网络错误 / 风控 / 超时（预检每个网络阶段 10 秒、整体最多 20 秒）只记警告，交给 biliup 自己校验。
+   biliup 的期限从 `publish()` 开始时算起，扣掉这些准备时间：剩余不到 60 秒就不启动 biliup，直接返回 `timeout`（尚未投稿）。
 2. 拼命令：`biliup --rust-log info -u <登录文件> upload --title=… --desc=… --tid=… --tag=… --copyright=… [...] -- <视频>`。
    全局参数写在子命令前；字符串参数都用 `--opt=value` 形式，避免以 `-` 开头的标题被当成参数；`--` 之后才是视频路径。
    设置 `NO_COLOR=1`，输出里残留的 ANSI 码也会被剥掉。
 3. **启动 biliup 前调用 `mark_submit_started()`**（上传和投稿是一条命令）。之后的任何失败都不会自动重试。
 4. 逐行读取 stdout+stderr：全部写入 worker 日志；`user:`、`Upload completed`、`投稿成功`、错误行低频转发；
-   60 秒没有输出时发一条「上传中……已用时 N 分钟」。超时（`publish_video` − 60 秒）杀进程。
-5. 解析输出：投稿响应 `ResponseData { code: 0, data: Some(Object {"aid": Number(…), "bvid": String("BV…")}) … }`
-   里取 BV 号 / aid。
+   60 秒没有输出时发一条「上传中……已用时 N 分钟」。到期（见上面 config.toml 的 `publish_video`）杀进程，
+   这样总是由适配器给出精确的结果，而不是被 worker 的总超时打断成笼统的「超时，结果未知」。
+5. 解析输出（biliup 的 tracing 格式：`<时间>  INFO <target>: <消息>`，Linux/macOS 上时间可能是 `<unknown time>`）：
+   - **投稿结果以投稿响应为准**：投稿模块（target `biliup::uploader::bilibili`）的 INFO 日志
+     `ResponseData { code: 0, data: Some(Object {"aid": Number(…), "bvid": String("BV…")}) … }`，或退出时错误报告里的
+     `ResponseData { code: 非0 … }`；取最后一条，code 非 0 时任何「投稿成功」字样都不算。
+     只有完全没有投稿响应时，才看投稿模块自己的 `APP接口投稿成功` / `Web 接口投稿成功` / `BCUT接口投稿成功`（整条消息完全匹配）。
+   - 上传完成：biliup 自己的日志消息以 `Upload completed:` / `All files uploaded successfully` 开头。
+   - 登录错误：只看错误报告和 WARN/ERROR 日志。
+   - biliup 会回显视频文件名 / 路径（`pre_upload: {"name":…}`、`Upload completed: <文件>`、`file <路径>`），
+     这些标记都按行首的级别、target 和固定前缀锚定；匹配登录错误和投稿响应前还会把视频 / 封面 / 登录文件路径和标题抹掉。
+     所以文件名叫「第一次投稿成功.mp4」也不会被误判成已投稿。
 
 | 情况 | 状态 | URL / 说明 |
 |---|---|---|
-| 投稿成功（看到 code 0 的响应或「投稿成功」） | `submitted`（有定时则 `scheduled`） | `https://www.bilibili.com/video/<BV>`（取不到 BV 时用 `av<aid>`）；审核通过前页面可能显示审核中 |
+| 投稿成功（投稿响应 code 0；没有响应时看 biliup 的「X接口投稿成功」日志） | `submitted`（有定时则 `scheduled`） | `https://www.bilibili.com/video/<BV>`（取不到 BV 时用 `av<aid>`）；审核通过前页面可能显示审核中 |
+| 投稿接口明确拒绝（`ResponseData { code: 非0 … }`，不论退出码） | `failed` / `platform_error` | 带 B站的 code 和 message |
 | biliup 退出码 0 但没解析到结果 | `submitted` | 无链接，提示去创作中心确认 |
-| 投稿接口明确拒绝（`ResponseData { code: 非0 … }`） | `failed` / `platform_error` | 带 B站的 code 和 message |
 | 投稿接口返回服务端错误码 -500/-502/-503/-504 | `failed` / `unknown_outcome` | 稿件可能已建好，先去创作中心确认 |
 | 视频已传完（看到 `Upload completed` / `All files uploaded successfully`）后失败或超时 | `failed` / `unknown_outcome` | 先去创作中心确认，不要重发 |
 | 上传阶段失败 / 超时（还没传完） | `failed` / `platform_error` 或 `timeout` | 尚未投稿；因为已标记 submit_started，`retryable` 为 false，不会自动重试，需人确认后再发 |
+| 发布前准备用掉了太多时间，剩余不足 60 秒 | `failed` / `timeout` | 没有启动 biliup、没有标记 submit_started |
 | 输出里是登录错误（`credential validation failed`、`账号未登录` 等）且没传完 | `needs_action` / `login_required` | 重新登录 |
 
 > 取舍：按约定在启动 biliup 前就标记 submit_started，所以「上传阶段就失败」的结果也带 `submit_started: true`，
@@ -232,12 +249,22 @@ mpub login bilibili --account main
 4. 定时 / AI 声明 / 图片排版：发布器的日期时间选择器、级联菜单是自绘组件，没有稳定的 DOM 可点，
    改为在页面主 world 里找到发布器的 Vue 2 组件（元素上的 `__vue__`）直接设置
    `tools.timingSetting`（`active`、`datetime` 毫秒）、`creationOption.value = 1`、`picModeOption.value`。
-   定时设置后检查 `.bili-dyn-publishing__datetime` 已显示，否则失败（不会悄悄变成立即发布）；
-   账号没有 AI 声明选项时只告警。点击前再次确认定时仍晚于现在 5.5 分钟（否则发布器会弹「直接发布？」）。
+   定时设置后检查 `.bili-dyn-publishing__datetime` 已显示，否则失败（不会悄悄变成立即发布）。
+   `ai_generated: true` 但找不到发布器组件、或账号的发布框没有 AI 声明选项 → **点发布之前**就失败（`validation`，
+   没有标记 submit_started，什么都没发）；可改用 `mode: http`，或在 `platforms.bilibili` 下设 `ai_generated: false`。
+   图片排版设不上只告警（写进结果消息）。点击前再次确认定时仍晚于现在 5.5 分钟（否则发布器会弹「直接发布？」）。
 5. 等「发布」按钮 `.bili-dyn-publishing__action.launcher` 可用，**调用 `mark_submit_started()` 后点击**。
 6. 监听 `/x/dynamic/feed/create/submit_check` 与 `/x/dynamic/feed/create/dyn` 的响应（60 秒）：
-   create/dyn `code 0` → `data.dyn_id_str`；submit_check 非 0 → 明确失败（发布请求未发出）；
-   出现极验验证码 → `needs_action`（`captcha`）。失败时截图 `bilibili-note-error.png`，成功后截图 `bilibili-note-done.png`。
+   create/dyn `code 0` → `data.dyn_id_str`；submit_check 非 0 → 明确失败（发布请求未发出；-101 → `login_required`）。
+   等待期间：
+   - 极验验证码（`.geetest_panel` / `.geetest_box` / geetest iframe）：无头时，发布请求还没发出 → `needs_action`（`captcha`）；
+     已发出但没有结果 → `failed` / `unknown_outcome`（查重会拦住重发）。`--headed` 时等你在窗口里完成（最多 180 秒）。
+   - 迷你登录框（`.bili-mini-mask`）且还没发出任何请求 → `login_required`。
+   - 《动态发布规范》确认框：见下一节。
+   失败时截图 `bilibili-note-error.png`，成功后截图 `bilibili-note-done.png`。
+7. **以实际提交的为准**：从 create/dyn 的请求体里读出 `dyn_req.option`，核对 `timer_pub_time` / `aigc` / `pic_mode`。
+   请求里没有定时 → 结果是 `published`（已立即发布）而不是 `scheduled`；定时时间不同 → 按实际时间报 `scheduled`；
+   要求声明 AI 但 `aigc` 不是 1、排版不一致 → 结果消息里加「注意：…」。读不到请求体时只记日志，按发布框状态报告。
 
 #### 动态发布规范（确认弹窗）
 
@@ -248,12 +275,14 @@ mpub login bilibili --account main
 
 - 已同意：config.toml `[platforms.bilibili] confirm_dynamic_rules = true`，或清单 `platforms.bilibili.confirm_rules: true`，
   或之前在有头模式里亲手点过确认（记录在 `<数据目录>/accounts/bilibili/<账号>.dy_spec_agreed`，删除即撤销）。
-  此时浏览器上下文直接带上 `dy_spec_agreed=1`，不再弹窗；万一仍弹出，则代为点击「确认并发送」并写日志。
+  此时浏览器上下文直接带上 `dy_spec_agreed=1`，不再弹窗；万一仍弹出（点发布后、还没发出任何请求时每次轮询都会检查），
+  则代为点击「确认并发送」并写日志。
 - 未同意、无头（默认）：打开发布框、**传图之前**就返回 `needs_action`（`error_code: consent_required`），提示上面两种做法；
   此时没有标记 submit_started，什么都没发。
 - 未同意、`--headed`：照常填写并点击发布，弹窗出现后等你在窗口里点（最多 180 秒）；你确认并发出后写入上面的记录文件。
   你点了取消（弹窗关闭 8 秒内没有发布请求）或超时 → `failed`，消息写明「动态没有发出」。
-- 定时发布走发布器的另一条分支，不会弹这个框；HTTP 模式没有这个弹窗。
+- 定时发布走发布器的另一条分支，不会弹这个框；万一弹了且未同意：无头 → `needs_action`（`consent_required`，动态没有发出），
+  有头 → 等你点。HTTP 模式没有这个弹窗。
 - 清单里写 `confirm_rules: false` 时，本条忽略 config.toml 和确认记录，按「未同意」处理。
 
 **HTTP 模式（`mode: http`，实验性）**：
@@ -261,6 +290,7 @@ mpub login bilibili --account main
 1. nav 取 `mid` 和 WBI 密钥（`wbi_img.img_url` / `sub_url` 文件名）。
 2. 每张图 `POST /x/dynamic/feed/draw/upload_bfs`（multipart：`file_up`、`biz=dyn`、`category=daily`、`csrf=bili_jct`）。
 3. `POST /x/dynamic/feed/create/submit_check?csrf=…`（与网页端一致的预检查）。
+   之后再确认一次定时仍晚于现在 5.5 分钟（传图可能用掉了 validate 时留的余量），不足就 `validation` 失败、什么都不发。
 4. **`mark_submit_started()`**，然后 `POST /x/dynamic/feed/create/dyn?platform=web&csrf=…&x-bili-device-req-json=…&dm_img_*…&w_dyn_req.upload_id=…&w_dyn_req.meta=…&wts=…&w_rid=…`，
    JSON：`{"dyn_req": {"content": {"contents": [{"raw_text": 正文, "type": 1, "biz_id": ""}], "title": 标题},
    "pics": [{img_src, img_width, img_height, img_size, ai_gen_pic}], "scene": 2, "upload_id": "<mid>_<秒>_<0-9999>",
@@ -288,6 +318,10 @@ mpub login bilibili --account main
 | 发布请求网络错误 / 非 JSON / 服务端错误码 -500/-502/-503/-504 / 60 秒无结果 / 成功但没有 id | `failed` / `unknown_outcome` | 先到动态页确认，不要直接重发 |
 | 传图失败、submit_check 不通过 | `failed` / `platform_error` | 发布请求没有发出 |
 | 浏览器模式未同意《动态发布规范》（无头） | `needs_action` / `consent_required` | 发布前就停下，什么都没发；见「动态发布规范」 |
+| 浏览器模式要求 AI 声明但设不上 / 定时设不上 | `failed` / `validation`、`platform_error` | 点发布之前就停下，什么都没发 |
+| 浏览器模式出现验证码（无头） | `needs_action` / `captcha`；发布请求已发出时 `failed` / `unknown_outcome` | 前者没发出，加 `--headed` 重发；后者先到动态页确认 |
+| 定时 / AI 声明 / 排版与实际提交的不一致 | 按实际提交的报 `published` / `scheduled` | 消息里有「注意：…」 |
+| HTTP 模式传完图后定时已不足 5.5 分钟 | `failed` / `validation` | 发布请求没有发出 |
 
 ## 已知风险
 
@@ -297,7 +331,8 @@ mpub login bilibili --account main
 - 无头 Chromium 可能更容易触发风控；需要时加 `--headed`，或在 config.toml 的 `[browser]` 里设 `channel = "chrome"`。
 - biliup 的 `--dtime` 注释写「距离提交大于 4 小时」，而创作中心是 2 小时；介于 2~4 小时的定时可能被拒（会得到明确的 `platform_error`）。
 - 视频上传后投稿前若网络中断，结果未知；B站对重复投稿有限制，务必先去创作中心确认。
-- biliup 会把上传断点（`biliup_checkpoint_*.json`）放在系统本地数据目录（Windows 为 `%LOCALAPPDATA%`），同一账号同一文件失败后用 `--force` 重发会跳过已传完的部分。
+- biliup 的断点续传（`biliup_checkpoint_*.json`，放在系统本地数据目录，Windows 为 `%LOCALAPPDATA%`）只按**整个文件**记录，
+  且在投稿之前就删除；multipub 每次只传一个视频，所以失败后重发总是**从头重新上传**，不会续传。
 - 动态正文里的 `@某人` 会作为纯文本发送（不转成 @ 提及）；`#标签#` 在网页发布器里输入时可能弹出话题联想框。
 - 账号需要绑定手机才能发动态；新账号可能还有转正答题等限制。
 
@@ -310,8 +345,8 @@ mpub login bilibili --account main
 |---|---|---|
 | biliup v1.3.1 命令行参数 | `-u`、`--rust-log`、`upload --title --desc --tid --tid-v2 --tag --cover --dtime --copyright --source --dynamic --no-reprint --is-only-self --up-*-reply --up-close-danmu --extra-fields --line --limit --submit`、`renew`、`login`（对照 v1.3.1 源码 `cli.rs` / `Studio`） | 高 |
 | biliup 发布包文件名与 sha256 | 见上表（实际下载核对） | 高 |
-| 投稿成功输出 | tracing 日志 `ResponseData { code: 0, data: Some(Object {"aid": Number(..), "bvid": String("BV..")}) … }`、`APP接口投稿成功`（据源码 `info!("{:?}", ret)` 推断格式，未实际运行） | 中 |
-| 上传完成标记 | `Upload completed:`、`All files uploaded successfully, checkpoint removed` | 中高 |
+| 投稿成功输出 | target `biliup::uploader::bilibili` 的 tracing 日志 `ResponseData { code: 0, data: Some(Object {"aid": Number(..), "bvid": String("BV..")}) … }`、`APP接口投稿成功` / `Web 接口投稿成功` / `BCUT接口投稿成功`（据源码 `info!("{:?}", ret)` 与 tracing-subscriber 默认格式推断，未实际运行；时间戳取不到时是 `<unknown time>`） | 中 |
+| 上传完成标记 | `Upload completed:`、`All files uploaded successfully, checkpoint removed`（target `biliup_cli::uploader`） | 中高 |
 | 登录错误标记 | `credential validation failed`、`credential refresh failed`、`open cookies file`、`账号未登录` | 中 |
 | TV 扫码登录 | `x/passport-tv-login/qrcode/auth_code` 与 `poll`，appkey `4409e2ce8ffd12b8`；签名用文档示例向量校验过；poll 码 0/86038/86039/86090 | 高 |
 | 扫码结果可被 biliup 直接使用 | 写入字段与 biliup `LoginInfo` 一致（`cookie_info`、`sso`、`token_info{access_token,expires_in,mid,refresh_token}`、`platform: BiliTV`） | 中高 |
@@ -324,7 +359,9 @@ mpub login bilibili --account main
 | 发布按钮 | `.bili-dyn-publishing__action.launcher`（禁用时带 `disabled` 类） | 中 |
 | 定时 / AI 声明 / 排版 | 主 world 里改 Vue 组件状态：`tools.timingSetting{visible,active,data.datetime}`、`creationOption{list,value}`、`picModeOption.value` | 中低 |
 | 发布结果 | 监听 `/x/dynamic/feed/create/dyn` 响应 `data.dyn_id_str`；`/create/submit_check` 预检查 | 中高 |
-| 验证码检测 | `.geetest_panel`、`.geetest_box`、`iframe[src*='geetest']`、`.bili-mini-mask` | 低 |
+| 验证码检测 | `.geetest_panel`、`.geetest_box`、`iframe[src*='geetest']` | 低 |
+| 迷你登录框 | `.bili-mini-mask`（mini-login 的遮罩，点发布后出现视为登录失效） | 低 |
+| 实际提交的选项 | create/dyn 请求体 `{"dyn_req": {"option": {"aigc", "pic_mode", "timer_pub_time"}}}`（与 HTTP 模式构造的一致） | 中 |
 | 动态发布规范弹窗 | cookie `dy_spec_agreed=1` 时不弹（发布器 `_checkSpecification` 源码）；弹窗 `.bili-dyn-specification-popup`、按钮 `.bili-dyn-specification-popup__btn` 文本「确认并发送」；定时发布不弹 | 高（逻辑）/ 中（选择器） |
 | HTTP 模式附加参数 | `x-bili-device-req-json`（spmid 取自页面 `<meta name="spm_prefix" content="333.1365">`）、`w_dyn_req.upload_id` / `w_dyn_req.meta` 及其签名方式（来自发布器中间件源码） | 中 |
 | 登录入口检测 | `.header-login-entry`、`.bili-header .login-btn` | 低 |

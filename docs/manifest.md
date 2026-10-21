@@ -133,7 +133,7 @@ platforms:
 | `declaration` | video | 不声明；`ai_generated: true` 时为 `内容由AI生成` | 「自主声明」选项文字，必须与页面完全一致（如 `内容由AI生成`、`内容为个人观点或见解`）；`false` / `none` 表示不声明。设置失败会拒绝发布 |
 | `collection` | video | 无 | 加入已有合集（名称精确匹配；找不到跳过并告警） |
 | `product_link` / `product_title` | video | 无 | 商品链接与短标题（≤10 字），两项都填才生效 |
-| `sync_toutiao` | video | `false` | `true` 才打开「同步到今日头条/西瓜视频」；`false` 时不碰该开关 |
+| `sync_toutiao` | video | 不写（不碰开关） | 不写保持页面默认；`true` 打开「同步到今日头条/西瓜视频」（打不开只告警）；`false` 把开着的开关关掉，关不掉则拒绝发布 |
 | `thumbnail_portrait` | video | 无 | 竖封面（3:4），路径相对 post.yaml |
 | `thumbnail_landscape` | video | 无 | 横封面（4:3）；与竖封面同时填时只应用竖封面 |
 | `bgm` | note | 无 | 背景音乐名称（搜索后选第一条，搜不到跳过） |
@@ -144,7 +144,7 @@ platforms:
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `repost_source` | 无（不声明） | 填写后声明「来源转载」并填入媒体名称 |
+| `repost_source` | 无（不声明） | 填写后声明「来源转载」并填入媒体名称；设置后会核实，设置不上则拒绝发布（validation） |
 
 ### 知乎（`platforms.zhihu`）
 

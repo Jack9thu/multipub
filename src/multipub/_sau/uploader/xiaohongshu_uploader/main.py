@@ -17,8 +17,9 @@ from patchright.async_api import async_playwright
 # multipub patch: 包内绝对导入；conf 由 multipub._sau.conf.configure() 预先设置
 from multipub._sau import conf as sau_conf
 from multipub._sau.conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
-from multipub._sau.runtime import (CookieInvalid, Deadline, Hooks, SauError, close_quietly, fail_rejected,
-                                   fail_step, save_screenshot, save_state_quietly)
+from multipub._sau.runtime import (CookieInvalid, Deadline, DeclarationFailed, Hooks, SauError, close_quietly,
+                                   fail_rejected, fail_step, find_visible_text, publish_button_ready,
+                                   save_screenshot, save_state_quietly)
 from multipub._sau.uploader.base_video import BaseVideoUploader
 from multipub._sau.utils.base_social_media import set_init_script
 from multipub._sau.utils.login_qrcode import build_login_qrcode_path
@@ -359,19 +360,42 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
 
     async def apply_declarations(self, page: Page) -> None:
         """multipub patch: 上游无条件声明「来源转载」（媒体名称为空），改为显式开启：
-        有 repost_source 才声明转载；ai_generated 时尽力选择 AI 合成内容声明（找不到只告警）。"""
-        if self.repost_source:
-            await self.check_original_declaration(page)
+        有 repost_source 才声明转载，设置不上就拒绝发布（不能把转载内容当原创发出去）；
+        ai_generated 时尽力选择 AI 合成内容声明（没能确认选上只告警，写进结果消息）。"""
+        if self.repost_source and not await self.check_original_declaration(page):
+            await save_screenshot(page, self.hooks, "declaration")
+            raise DeclarationFailed(
+                f"「来源转载」声明（来源：{self.repost_source}）没能设置上，拒绝继续发布，笔记没有发出。"
+                "可去掉 platforms.xiaohongshu.repost_source 后重发，并在网页上手动声明转载"
+            )
         if self.ai_generated and not await self.set_ai_content_declaration(page):
-            self.declaration_warnings.append(f"未能自动选择「{XHS_AI_DECLARATION}」声明，请在笔记管理里补充")
+            self.declaration_warnings.append(f"未能确认已选择「{XHS_AI_DECLARATION}」声明，请在笔记管理里检查并补充")
+
+    PUBLISH_CLICK_TIMEOUT_MS = 5000
+
+    async def _publish_button(self, page: Page):
+        """multipub patch: 上游的 button:has-text("发布") 是子串匹配；命中多个按钮时改用文字完全一致的那个，
+        仍不唯一就不点（_click_publish 不会点不唯一的按钮），等到截止时间按超时处理。"""
+        text = "定时发布" if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED else "发布"
+        button = page.locator(f'button:has-text("{text}")')
+        if await button.count() > 1:
+            exact = page.locator("button").filter(has_text=re.compile(rf"^\s*{text}\s*$"))
+            if await exact.count() == 1:
+                return exact
+        return button
 
     async def _click_publish(self, button) -> bool:
-        """multipub patch: 受 PublishGuard 限制地点击最终发布按钮；第一次点击前通知适配器。"""
+        """multipub patch: 受 PublishGuard 限制地点击最终发布按钮；第一次点击前通知适配器。
+
+        按钮不唯一 / 不可见 / 不可用时不点、不记账、不标记已提交，继续在截止时间内等。"""
         if not self.publish_guard.may_click():
+            return False
+        if not await publish_button_ready(button):
+            xiaohongshu_logger.debug(_msg("🧍", "发布按钮还不能点（不唯一、不可见或不可用），小人再等等"))
             return False
         self._before_publish_click()
         self.publish_guard.clicked()  # 先记账再点：点击抛异常时也可能已经触发
-        await button.click()
+        await button.click(timeout=self.PUBLISH_CLICK_TIMEOUT_MS)
         self.publish_guard.click_returned()
         return True
 
@@ -447,10 +471,7 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                 await fail_step(page, self.hooks, deadline, after_submit=self._publish_clicked,
                                 detail=self._publish_detail())
             try:
-                if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
-                    publish_button = page.locator('button:has-text("定时发布")')
-                else:
-                    publish_button = page.locator('button:has-text("发布")')
+                publish_button = await self._publish_button(page)
                 if await publish_button.count():
                     await self._click_publish(publish_button)
                 await page.wait_for_url(
@@ -617,6 +638,8 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         """小红书「添加内容类型声明」选择「笔记含AI合成内容」。
 
         multipub patch: 移植自 omnipost（MIT，基于 SAU 99a392a），尽力而为，失败只告警。
+        不再凭选项附近有「取消/×」就当作已选：点击后核实——点过的选项随面板收起、
+        页面上（输入区以外）显示出这几个字，才返回 True。
         """
         if not getattr(self, "ai_generated", False):
             return False
@@ -644,13 +667,16 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                 xiaohongshu_logger.warning(_msg("😵", "没找到「添加内容类型声明」入口"))
                 return False
 
+            # 先收起可能开着的面板，再看声明是否已经显示为已选（例如页面恢复了草稿）
+            await self._press_escape(page)
+            if await find_visible_text(page, [declaration_text], exact=True):
+                xiaohongshu_logger.info(_msg("🥳", f"内容类型声明已是「{declaration_text}」，跳过"))
+                return True
+
             await trigger.scroll_into_view_if_needed()
             await page.wait_for_timeout(300)
-
-            option = page.get_by_text(declaration_text, exact=True).first
-            if not (await option.count() and await option.is_visible()):
-                await trigger.click()
-                await page.wait_for_timeout(600)
+            await trigger.click()
+            await page.wait_for_timeout(600)
 
             option_candidates = [
                 page.get_by_text(declaration_text, exact=True).first,
@@ -664,25 +690,19 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                     if not await opt.is_visible():
                         continue
 
-                    container = opt.locator("xpath=ancestor::div[contains(@class, 'd-grid') or contains(@class, 'options') or contains(@class, 'option')][1]")
-                    if await container.count():
-                        container_text = (await container.inner_text()).strip()
-                        if declaration_text in container_text and any(
-                            marker in container_text for marker in ("已选", "取消", "×")
-                        ):
-                            xiaohongshu_logger.info(_msg("🥳", f"内容类型声明已是「{declaration_text}」，跳过"))
-                            return True
-
+                    try:
+                        handle = await opt.element_handle()
+                    except Exception:
+                        handle = None
                     await opt.click()
                     await page.wait_for_timeout(600)
                     # 收起声明面板，避免挡住底部「发布」
-                    try:
-                        await page.keyboard.press("Escape")
-                        await page.wait_for_timeout(200)
-                    except Exception:
-                        pass
-                    xiaohongshu_logger.success(_msg("🥳", f"已选择内容类型声明：{declaration_text}"))
-                    return True
+                    await self._press_escape(page)
+                    if await self._declaration_displayed(page, handle, declaration_text):
+                        xiaohongshu_logger.success(_msg("🥳", f"已选择内容类型声明：{declaration_text}"))
+                        return True
+                    xiaohongshu_logger.warning(_msg("😵", f"点了「{declaration_text}」，但没能确认页面上已显示为已选"))
+                    return False
                 except Exception:
                     continue
 
@@ -692,18 +712,42 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             xiaohongshu_logger.warning(_msg("😵", f"设置内容类型声明失败: {e}"))
             return False
 
-    async def check_original_declaration(self, page: Page) -> None:
+    @staticmethod
+    async def _press_escape(page: Page) -> None:
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _declaration_displayed(page: Page, clicked_option, text: str) -> bool:
+        """multipub patch: 点过的选项已随面板收起（或已脱离页面），且页面上显示着声明文字。"""
+        if clicked_option is not None:
+            try:
+                if await clicked_option.is_visible():
+                    return False  # 面板还开着：看到的文字可能只是选项本身
+            except Exception:
+                pass  # 元素已脱离页面 = 面板已收起
+        return bool(await find_visible_text(page, [text], exact=True))
+
+    async def check_original_declaration(self, page: Page) -> bool:
         """设置「来源转载」声明，填写转载来源。
 
         流程（对应 codegen 录制）：
           点「添加内容类型声明」→ 点包含「来源转载」的 div
           → 填 placeholder「请输入媒体名称」→ 点 button「确认」。
-        容错：任一步失败记 warning 跳过、继续发布，不中断。
+        multipub patch: 返回是否设置成功，并核实结果——点「确认」后媒体名称输入框关闭、
+        页面上（输入区以外）显示出来源名称或「来源转载」。任一步失败返回 False，调用方拒绝发布
+        （上游失败只记 warning、照常发出去）。
         """
         source = getattr(self, "repost_source", "") or ""
         try:
             # 1. 点「添加内容类型声明」
             trigger = page.get_by_text("添加内容类型声明", exact=False).first
+            if not await trigger.count():
+                xiaohongshu_logger.warning(_msg("⚠️", "没找到「添加内容类型声明」入口"))
+                return False
             try:
                 await trigger.scroll_into_view_if_needed(timeout=5000)
             except Exception:
@@ -718,8 +762,9 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             ).last
             if await repost_option.count():
                 await repost_option.click(force=True)
-            else:
-                await _js_click_by_text(page, "来源转载")
+            elif not await _js_click_by_text(page, "来源转载"):
+                xiaohongshu_logger.warning(_msg("⚠️", "没找到「来源转载」选项"))
+                return False
             await page.wait_for_timeout(1500)
 
             # 3. 填写媒体名称
@@ -735,16 +780,26 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                 await confirm.wait_for(state="visible", timeout=5000)
                 await confirm.click()
             except Exception:
-                await _js_click_by_text(page, "确认")
+                if not await _js_click_by_text(page, "确认"):
+                    xiaohongshu_logger.warning(_msg("⚠️", "没找到「确认」按钮"))
+                    return False
 
             await page.wait_for_timeout(1000)
-            xiaohongshu_logger.success(_msg("🧾", f"来源转载已声明（来源：{source}）"))
-        except Exception as exc:
-            xiaohongshu_logger.warning(_msg("⚠️", f"设置来源转载失败，跳过继续发布: {exc}"))
+            # 5. multipub patch: 核实——输入框关闭、页面上显示出来源
             try:
-                await page.keyboard.press("Escape")
+                await source_input.wait_for(state="hidden", timeout=5000)
             except Exception:
-                pass
+                xiaohongshu_logger.warning(_msg("⚠️", "点「确认」后媒体名称输入框仍未关闭"))
+                return False
+            if not await find_visible_text(page, [source, "来源转载"]):
+                xiaohongshu_logger.warning(_msg("⚠️", "没能确认页面上已显示「来源转载」声明"))
+                return False
+            xiaohongshu_logger.success(_msg("🧾", f"来源转载已声明（来源：{source}）"))
+            return True
+        except Exception as exc:
+            # multipub patch: 不再按 Escape 继续发布：调用方会截图并拒绝发布
+            xiaohongshu_logger.warning(_msg("⚠️", f"设置来源转载失败: {exc}"))
+            return False
 
 
 class XiaoHongShuVideo(XiaoHongShuBaseUploader):

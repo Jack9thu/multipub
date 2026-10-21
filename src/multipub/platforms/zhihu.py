@@ -48,6 +48,8 @@ ARTICLE_OPTIONS = frozenset({"as", "draft", "statement", "column", "toc"})
 PIN_OPTIONS = frozenset({"as", "tags_in_text"})
 
 LOGIN_POLL_SECONDS = 1.0
+LOGIN_RESERVE = 45.0  # 扫码完成后的收尾（刷新首页、保存、接口校验）要留出的秒数
+VERIFY_HEADLESS_WAIT = 20.0  # 无头模式打开验证页后，等它自动放行的秒数；不放行就让人去掉 --headless 重来
 QR_FALLBACK_AFTER = 8.0  # 这么久还没从接口拿到二维码，就截图
 QR_API_PATH = "/api/v3/account/api/login/qrcode"
 QR_SELECTORS = (".Qrcode-img", ".Qrcode-content img", "img[alt*='二维码']", ".Qrcode canvas")
@@ -162,12 +164,11 @@ def _join(message: str, warnings: list[str]) -> str:
 
 
 def _with_draft(exc: PublishError, edit_url: str) -> PublishError:
-    """草稿已经建好后出错：把编辑链接带进错误信息，方便手动处理。"""
+    """草稿已经建好后出错：把编辑链接带进错误信息和 Result.url（风控时 url 仍是验证页），方便手动处理。"""
     note = "文章编辑页" if exc.code is ErrorCode.UNKNOWN_OUTCOME else "草稿已保存"
     new = type(exc)(f"{exc}（{note}：{edit_url}）", code=exc.code, retryable=exc.retryable,
                     evidence=exc.evidence)
-    if hasattr(exc, "url"):
-        new.url = exc.url  # type: ignore[attr-defined]
+    new.url = exc.url or edit_url
     return new
 
 
@@ -274,6 +275,8 @@ class ZhihuAdapter(PlatformAdapter):
             err("schedule", "知乎暂不支持定时发布：去掉 schedule，或这次不发知乎（--to 指定其他平台）")
         for img in post.images:
             cls._check_image_ext(img, "images", err, warn)
+            if post.kind is Kind.ARTICLE and not img.is_file():  # note 的图片由 common_issues 检查
+                err("images", f"文件不存在: {img}")
 
         if mode == "article":
             cls._validate_article(post, err, warn)
@@ -404,30 +407,49 @@ class ZhihuAdapter(PlatformAdapter):
             yield api
 
     # ================================================================ 登录
+    _login_deadline: float | None = None  # 等人扫码 / 过验证的截止时间（事件循环时钟）
+
+    def _login_wait(self) -> float:
+        """等人操作的最长秒数：本次任务的总超时（ctx.timeout）减去扫码之后的收尾时间。"""
+        budget = float(self.ctx.timeout) if self.ctx.timeout else self.settings.timeout_for("login") - 30
+        return max(60.0, budget - LOGIN_RESERVE)
+
+    def _save_state(self, state: dict[str, Any]) -> None:
+        self.account_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.account_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self.account_file)
+
     async def login(self) -> Result:
         from ..browser import load_storage_state
         from . import zhihu_api
 
+        # 从任务开始算：前面的接口检查也占 worker 的总超时
+        self._login_deadline = asyncio.get_running_loop().time() + self._login_wait()
         state = load_storage_state(self.account_file)
         pending = self._pending_verify() if state is not None else ""  # 没有登录态时验证无意义
-        if state is not None and not pending:
+        if state is not None:
             try:
                 async with self._api() as api:
                     me = await api.me()
-                return self.result(Status.OK, message=f"已登录：{me.get('name')}，无需重新登录；"
-                                                      f"要换号先删除 {self.account_file}")
+                if not pending:
+                    return self.result(Status.OK, message=f"已登录：{me.get('name')}，无需重新登录；"
+                                                          f"要换号先删除 {self.account_file}")
+                # 读接口正常不代表发布接口的风控已解除：仍打开上次记下的验证页（已放行时会自动跳走）
+                self.ctx.log("上次发布被知乎风控拦截，打开验证页确认", level="warning")
             except zhihu_api.RiskControl as exc:
-                pending = exc.url
+                pending = exc.url or pending  # 用最新的验证页地址，旧地址里的 session 可能已过期
+                self._remember_verify(pending)
                 self.ctx.log("登录态有效但被知乎风控，打开验证页", level="warning")
-            except PublishError as exc:  # 包括 LoginRequired：重新登录
+            except LoginRequired as exc:
+                pending = ""  # 登录已失效：验证没意义，重新扫码
                 self.ctx.log(f"现有登录不可用（{exc}），重新登录", level="debug")
+            except PublishError as exc:
+                self.ctx.log(f"登录检查失败（{exc}），{'打开验证页' if pending else '重新登录'}", level="debug")
 
         # 只有需要过安全验证时才带上旧登录态；正常登录用干净的浏览器上下文
         new_state = await self._browser_login(state if pending else None, pending)
-        self.account_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.account_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(new_state, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.account_file)
+        self._save_state(new_state)
         self._verify_file().unlink(missing_ok=True)
 
         who = ""
@@ -448,12 +470,14 @@ class ZhihuAdapter(PlatformAdapter):
         from . import zhihu_api
 
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + max(60, self.settings.timeout_for("login") - 45)
+        deadline = self._login_deadline or loop.time() + self._login_wait()
         qr = _QrCapture(self.ctx, self.settings.qrcode_dir / f"zhihu-{self.ctx.account}.png")
+        hint = f"mpub login zhihu --account {self.ctx.account}"
         if verify_url:
             self.ctx.log(f"请在打开的浏览器窗口里完成知乎安全验证：{verify_url}")
             if self.ctx.headless:
-                self.ctx.log("安全验证需要人操作，无头模式下看不到页面：请去掉 --headless 重新运行", level="warning")
+                self.ctx.log("安全验证需要人操作，无头模式下看不到页面：页面不自动放行的话请去掉 --headless 重新运行",
+                             level="warning")
         initial = next((c.get("value") for c in (state or {}).get("cookies", []) if c.get("name") == "z_c0"), None)
 
         async with open_context(self.settings, headless=self.ctx.headless, storage_state=state) as context:
@@ -468,16 +492,22 @@ class ZhihuAdapter(PlatformAdapter):
             opened = loop.time()
             try:
                 while not await self._browser_logged_in(context, page, initial):
+                    if verify_url and self.ctx.headless and loop.time() - opened > VERIFY_HEADLESS_WAIT:
+                        await snapshot(page, self.ctx, "login-verify")
+                        raise NeedsAction(f"知乎要求安全验证，无头模式下没法操作：去掉 --headless 重新运行 {hint}，"
+                                          f"在弹出的窗口里完成验证（验证页: {verify_url}）",
+                                          code=ErrorCode.RISK_CONTROL, url=verify_url)
                     if loop.time() > deadline:
                         await snapshot(page, self.ctx, "login-timeout")
-                        raise PublishError(f"等待登录超时：重新运行 mpub login zhihu --account {self.ctx.account}",
-                                           code=ErrorCode.TIMEOUT)
+                        raise PublishError(f"等待登录超时：重新运行 {hint}", code=ErrorCode.TIMEOUT)
                     if not verify_url and not qr.done and loop.time() - opened > QR_FALLBACK_AFTER:
                         await qr.fallback(page)
                     await asyncio.sleep(LOGIN_POLL_SECONDS)
             finally:
                 qr.cleanup()
             self.ctx.log("已登录，保存登录态")
+            # 先存一份：后面刷新首页慢或整个任务超时，也不至于白扫一次码
+            self._save_state(await context.storage_state())
             await self._remember_user_agent(page)
             try:  # 再打开一次首页，补齐 _xsrf / d_c0 等 cookie
                 await page.goto(zhihu_api.WWW_HOME, wait_until="domcontentloaded", timeout=30_000)
@@ -544,11 +574,18 @@ class ZhihuAdapter(PlatformAdapter):
             raise Unsupported(f"知乎暂不支持 {post.kind.value}")
         try:
             if publish_mode(post) == "article":
-                return await self._publish_article(post)
-            return await self._publish_pin(post)
+                result = await self._publish_article(post)
+            else:
+                result = await self._publish_pin(post)
         except zhihu_api.RiskControl as exc:
             self._remember_verify(exc.url)
             raise
+        if result.ok:  # 写接口能用，说明风控已解除：旧验证页不用再打开
+            try:
+                self._verify_file().unlink(missing_ok=True)
+            except OSError as exc:  # 发布已成功，不能因为删文件失败报错
+                self.ctx.log(f"删除旧的验证页记录失败: {exc}", level="debug")
+        return result
 
     async def _image(self, api: Any, ref: str | Path, *, source: str, referer: str,
                      dirs: list[Path]) -> Any:
@@ -601,8 +638,16 @@ class ZhihuAdapter(PlatformAdapter):
                 if topic is None:
                     warnings.append(f"没找到话题「{tag}」")
                     continue
+                name = str(topic.get("name") or "").strip()
+                key, low = tag.strip().lower(), name.lower()
+                if low != key and not (low and (key in low or low in key)):
+                    # 只有不相干的联想结果：不替用户挂上无关话题
+                    warnings.append(f"没找到话题「{tag}」（最接近的是「{name}」，没有添加）")
+                    continue
                 await api.add_article_topic(draft_id, topic)
-                self.ctx.log(f"已添加话题「{topic.get('name') or tag}」")
+                self.ctx.log(f"已添加话题「{name or tag}」")
+                if low != key:
+                    warnings.append(f"话题「{tag}」没有同名的，已改用「{name}」")
             except LoginRequired:
                 raise
             except NeedsAction as exc:  # 风控 / 限流：话题只是锦上添花，跳过；真被封的话发布接口会再拦下
@@ -695,15 +740,18 @@ class ZhihuAdapter(PlatformAdapter):
                                        message=f"知乎拒绝发布：{exc}{rejected}")
                 raise _with_draft(exc, edit_url) from exc
             code = zhihu_api.publish_code(data)
-            article_id = zhihu_api.parse_publish_id(data) or draft_id
+            parsed_id = zhihu_api.parse_publish_id(data)
+            article_id = parsed_id or draft_id
             url = zhihu_api.article_url(article_id)
             if code is None:
-                if await self._verify(api.get_article, article_id):
+                # 没有 code：只有响应里带了文章 id 且能查到才算成功。不能拿草稿 id 去查——
+                # 草稿和文章同一个 id，作者自己查草稿也可能返回 200，会把没发出去的报成已发布
+                if parsed_id and await self._verify(api.get_article, parsed_id):
                     return self.result(Status.PUBLISHED, kind=post.kind, url=url, item_id=article_id,
                                        message=_join("文章已发布", warnings))
                 self._save_publish_evidence(api)
                 raise PublishError(f"发布接口返回了无法识别的结果：先打开 {edit_url} 确认是否已发布，不要直接重发",
-                                   code=ErrorCode.UNKNOWN_OUTCOME)
+                                   code=ErrorCode.UNKNOWN_OUTCOME, url=edit_url)
             if code not in (0, "0"):
                 self._save_publish_evidence(api)
                 return self.result(

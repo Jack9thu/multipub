@@ -19,10 +19,10 @@
 
 | 参数 | 适用 | 默认 | 说明 |
 |---|---|---|---|
-| `declaration` | video | 不声明；`ai_generated: true` 时为 `内容由AI生成` | 「自主声明」选项文字，必须与页面上的单选项完全一致（如 `内容由AI生成`、`内容为个人观点或见解`）。填 `false` / `none` 表示不声明。声明设置失败会**拒绝发布**（不会在没有声明的情况下发出去） |
+| `declaration` | video | 不声明；`ai_generated: true` 时为 `内容由AI生成` | 「自主声明」选项文字，必须与页面上的单选项完全一致（如 `内容由AI生成`、`内容为个人观点或见解`）。填 `false` / `none` 表示不声明。选完会核实（选项变成选中、点「确定」后弹窗关闭），核实不了就**拒绝发布**（`validation`，作品没有发出）。核实依据的页面结构未在真实账号上验证，发布后仍建议在「作品管理」里看一眼 |
 | `collection` | video | 无 | 加入已有合集（名称精确匹配）；找不到时跳过并告警 |
 | `product_link` / `product_title` | video | 无 | 购物车商品链接与短标题（≤10 字），两项都填才生效 |
-| `sync_toutiao` | video | `false` | `true` 时打开「同步到今日头条/西瓜视频」开关；`false` 时完全不碰该开关（保持页面默认） |
+| `sync_toutiao` | video | 不写（不碰开关） | 「同步到今日头条/西瓜视频」开关。不写：保持页面默认；`true`：打开（打不开只告警）；`false`：开关开着就关掉，**关不掉时拒绝发布**（`validation`）。只动旁边写着「头条/西瓜」的开关；找不到这样的开关时只告警 |
 | `thumbnail_portrait` | video | 无 | 竖封面（3:4）。路径相对 post.yaml 所在目录 |
 | `thumbnail_landscape` | video | 无 | 横封面（4:3）。同时填竖、横时只会应用竖封面 |
 | `bgm` | note | 无 | 背景音乐名称，搜索后选第一条；搜不到跳过 |
@@ -45,9 +45,9 @@ platforms:
 | 键 | 默认 | 含义 |
 |---|---|---|
 | `page_timeout` | 300 | 选好视频后等待进入发布表单页（秒） |
-| `upload_timeout` | `timeouts.publish_<kind>` − 600（最少 180） | 等待视频/图片上传完成 |
+| `upload_timeout` | 本次任务超时 − 600（最少 180） | 等待视频/图片上传完成（视频含等待发布表单出现）。任务超时 = `mpub publish --timeout`，没给时为 `timeouts.publish_<kind>`，所以大文件加大 `--timeout` 即可 |
 | `publish_timeout` | 240 | 点击「发布」后等待跳转到作品管理页 |
-| `sms_timeout` | 300 | 等待短信验证码 |
+| `sms_timeout` | 300 | 等待短信验证码（验证码只能在这段时间内提交） |
 
 环境变量 `DOUYIN_COOKIE_AUTH_HEADLESS=false` 可让 cookie 校验用有头浏览器（上游提示无头偶尔被误判为失效）。
 
@@ -88,8 +88,9 @@ mpub login douyin --account main --headless
    （事件的 `note` 会说明），扫其中的二维码即可。登录结束后删除该图片。
 3. 扫码后若抖音要求短信二次验证，**只能在浏览器窗口里手动完成**，所以抖音登录建议不要加 `--headless`。
 4. 成功后把 storage_state 写到 `<数据目录>/accounts/douyin/<账号>.json`。
-5. 等待时长 = `timeouts.login` − 90 秒（默认 210 秒）。超时返回 `failed` / `timeout`；
-   如果整个过程都没拿到二维码图片，消息会提示去掉 `--headless`。
+5. 扫码等待时长 = 本次任务超时 − 120 秒（默认 `timeouts.login` 300 → 任务 270 → 扫码约 150 秒；
+   余下时间留给 cookie 校验、抓二维码和轮询开销，免得被总超时直接打断）。超时返回 `failed` / `timeout`；
+   如果整个过程都没拿到二维码图片，消息会提示去掉 `--headless`。需要更长时间就调大 `timeouts.login`。
 
 装了可选依赖 `multipub[terminal-qr]`（opencv）时，二维码也会以字符画打印到 worker 日志（stderr）。
 
@@ -97,10 +98,13 @@ mpub login douyin --account main --headless
 
 ## 发布流程与返回
 
-视频：打开上传页 → 选择视频 → 等待进入发布页 → 填标题/简介/话题 → 等待上传完成 → 商品 → 自主声明 →
-合集 → 封面 → （可选）同步头条 → 定时 → 点击「发布」并等待跳到作品管理页。图文类似（「发布图文」）。
+视频：打开上传页 → 选择视频 → 等待进入发布页 → 等待发布表单出现（新版发布页要等视频传完才出表单）→
+填标题/简介/话题 → 等待上传完成 → 商品 → 自主声明 → 合集 → 封面 → （可选）同步头条开关 → 定时 →
+点击「发布」并等待跳到作品管理页。图文类似（「发布图文」）。等表单和等上传完成共用 `upload_timeout`。
 
 - 第一次点击最终「发布」前会发出 `submit_started` 事件。之后的任何失败都**不会自动重试**（runner 层面）。
+- 只有「发布」按钮唯一、可见、可用（没有 `disabled` / `aria-disabled`）时才点：按钮还不能点时继续等（不算点击、
+  不发 `submit_started`），一直不能点就在 `publish_timeout` 后按「发布前超时」返回 `timeout`。
 - **不会重复点击发布**（multipub 补丁，上游每 3.5 秒点一次）：第一次点击之后只在两种情况下再点——
   平台弹窗拦下了上一次点击（短信验证已完成、提示「请设置封面后再发布」并已选推荐封面），或者 20 秒内既没跳转也没观察到
   发布请求（说明上次点击没生效）。发布请求还没返回、已拿到成功回执、或已经点了 3 次时一律不再点。
@@ -115,8 +119,12 @@ mpub login douyin --account main --headless
 发布时如果弹出短信验证：
 
 1. 自动点「获取验证码」，并发出 `needs_input` 事件（`kind = sms_code`，`path = <数据目录>/sau/verify_code.txt`）。
-2. 在 `sms_timeout`（默认 5 分钟）内运行 `mpub verify-code douyin <验证码>`（或直接写入该文件）。
-3. 超时则返回 `needs_action` / `sms_code_required`。如果当时已经点过发布，消息会提醒先去后台确认再重发。
+2. **发布还在等待时**，在 `sms_timeout`（默认 5 分钟）内运行 `mpub verify-code douyin <验证码>`（或直接写入该文件）。
+   验证码只能这样提交：每一轮验证开始都会删掉旧文件并重新发短信，所以先写验证码再重新发布是没用的。
+3. 超时（或提交 3 轮仍未通过）时：
+   - 还没点过发布 → `needs_action` / `sms_code_required`，重新发布后按上面的步骤及时提交新验证码；
+   - 已经点过发布（短信验证通常就在点击之后弹出）→ `failed` / `unknown_outcome`：作品可能已经创建，
+     先去「作品管理」确认；发布记录会拦住不带 `--force` 的重发。
 
 `verify_code.txt` 按数据目录全局共享：不要同时用两个抖音账号发布。
 
@@ -125,9 +133,11 @@ mpub login douyin --account main --headless
 | 情况 | status / error_code |
 |---|---|
 | 没有账号文件、cookie 失效、中途被踢回登录页（点发布前） | `needs_action` / `login_required` |
-| 页面停在人机验证（滑块等） | `needs_action` / `captcha`（建议 `--headed` 重发并手动验证） |
-| 短信验证码超时；或提交 3 轮验证码后弹窗仍在（验证码错误/过期） | `needs_action` / `sms_code_required` |
-| 自主声明设置失败（选项文字与页面不一致等），点发布前 | `failed` / `validation`（不会在没有声明的情况下发出去） |
+| 页面停在人机验证（滑块等），点发布前 | `needs_action` / `captcha`（建议 `--headed` 重发并手动验证） |
+| 短信验证码超时；或提交 3 轮验证码后弹窗仍在（验证码错误/过期），点发布前 | `needs_action` / `sms_code_required` |
+| 点发布**之后**出现人机验证或短信验证（超时 / 验证失败） | `failed` / `unknown_outcome`（结果未知：先去后台确认；消息里附验证提示） |
+| 自主声明没能确认设置上（选项文字与页面不一致、点击没生效等），点发布前 | `failed` / `validation`（拒绝发布，作品没有发出） |
+| `sync_toutiao: false` 但同步开关开着且关不掉，点发布前 | `failed` / `validation`（拒绝发布） |
 | 点发布后接口明确返回失败 | `failed` / `platform_error`（不可重试；作品应未创建，建议先去后台确认） |
 | 点发布前某一步超时 | `failed` / `timeout`（可重试） |
 | 点发布后超时或页面异常 | `failed` / `unknown_outcome`（**先去后台确认，不要直接重发**） |
@@ -144,7 +154,8 @@ mpub login douyin --account main --headless
 - 上游 2026-05 曾认为「自主声明」是发布必选项，2026-07 起改为可不填（multipub 也默认不填）。如果抖音要求必须声明，
   表现为点击发布后不跳转直至超时（`unknown_outcome`，实际没有发出）；此时请填写 `declaration`。
 - 抖音图文流程上游没有自主声明，`ai_generated: true` 不会自动标注。
-- 第三方同步开关（头条/西瓜）的选择器较旧，`sync_toutiao: true` 可能无效。
+- 第三方同步开关（头条/西瓜）的选择器较旧：`sync_toutiao: true` 可能无效（只告警）；`sync_toutiao: false`
+  在找不到开关（或开关旁没有「头条/西瓜」字样）时也只告警，此时请发布前在网页上确认开关状态。
 
 ## 未在真实账号上验证
 
@@ -161,9 +172,11 @@ mpub login douyin --account main --headless
 | 标题 / 简介 | `input[placeholder*="填写作品标题"]`、`div.zone-container[contenteditable="true"]` | 高（2026-06 DOM） |
 | 上传完成 | `[class^="long-card"] div:has-text("重新上传")` | 中 |
 | 自主声明 | `.semi-modal-content` 含「请选择声明类型」、`label.semi-radio .semi-radio-addon` | 高（ad49eba，2026-08） |
+| 自主声明核实 | 选中后 `label.semi-radio` 带 `semi-radio-checked`（或内部 radio 已勾选）；点「确定」后弹窗隐藏；没有 radio 结构时看入口处是否显示所选文字（multipub 新增） | 中低 |
 | 合集 | `[class*="select-collection-"]`、`.semi-select-option.collection-option` | 中高 |
 | 封面弹窗 | `div.dy-creator-content-modal`、`.semi-upload:has(.semi-upload-drag-area-main-text) input.semi-upload-hidden-input` | 中高 |
-| 同步头条/西瓜开关 | `[class^="info"] > [class^="first-part"] div div.semi-switch` | 低 |
+| 同步头条/西瓜开关 | `[class^="info"] > [class^="first-part"] div div.semi-switch`，周围文字含「头条/西瓜」，状态看 `semi-switch-checked` | 低 |
+| 发布表单出现 | 新版 `post/video` 页传完才渲染标题框 `input[placeholder*="填写作品标题"]`（上游 5e28092 实测约 40 秒） | 中高 |
 | 定时 | `[class^='radio']:has-text('定时发布')`、`.semi-input[placeholder="日期和时间"]` | 中 |
 | 发布按钮 / 成功 | 角色 button「发布」（exact）→ URL `creator-micro/content/manage**` | 高 |
 | 短信验证 | `input[placeholder*="验证码"], input[type="tel"], …`、「获取验证码」、`div.uc-ui-verify_sms-verify_button` | 中（be77aae；输入框选择器偏宽） |
