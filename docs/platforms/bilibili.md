@@ -247,7 +247,7 @@ mpub login bilibili --account main
 - 已同意：config.toml `[platforms.bilibili] confirm_dynamic_rules = true`，或清单 `platforms.bilibili.confirm_rules: true`，
   或之前在有头模式里亲手点过确认（记录在 `<数据目录>/accounts/bilibili/<账号>.dy_spec_agreed`，删除即撤销）。
   此时浏览器上下文直接带上 `dy_spec_agreed=1`，不再弹窗；万一仍弹出，则代为点击「确认并发送」并写日志。
-- 未同意、无头（默认）：打开发布框、**传图之前**就返回 `needs_action`（`error_code: validation`），提示上面两种做法；
+- 未同意、无头（默认）：打开发布框、**传图之前**就返回 `needs_action`（`error_code: consent_required`），提示上面两种做法；
   此时没有标记 submit_started，什么都没发。
 - 未同意、`--headed`：照常填写并点击发布，弹窗出现后等你在窗口里点（最多 180 秒）；你确认并发出后写入上面的记录文件。
   你点了取消（弹窗关闭 8 秒内没有发布请求）或超时 → `failed`，消息写明「动态没有发出」。
@@ -285,7 +285,7 @@ mpub login bilibili --account main
 | 412 / `-352` | `needs_action` / `risk_control` | 浏览器模式里出现时，请先到动态页确认再用 `--headed` 重试 |
 | 发布请求网络错误 / 非 JSON / 服务端错误码 -500/-502/-503/-504 / 60 秒无结果 / 成功但没有 id | `failed` / `unknown_outcome` | 先到动态页确认，不要直接重发 |
 | 传图失败、submit_check 不通过 | `failed` / `platform_error` | 发布请求没有发出 |
-| 浏览器模式未同意《动态发布规范》（无头） | `needs_action` / `validation` | 发布前就停下，什么都没发；见「动态发布规范」 |
+| 浏览器模式未同意《动态发布规范》（无头） | `needs_action` / `consent_required` | 发布前就停下，什么都没发；见「动态发布规范」 |
 
 ## 已知风险
 
