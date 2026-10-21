@@ -9,8 +9,9 @@
     4. uv run mpub doctor：环境自检。
 
 .PARAMETER China
-    国内网络：本次会话设置 PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright，
-    让 mpub setup 从镜像下载 Chromium。只影响这一次运行，不改系统设置。
+    国内网络：本次运行用国内镜像装依赖（PyPI：阿里云；Python 本体：npmmirror），
+    不下载 Chromium（镜像上没有 patchright 需要的版本），改用 Windows 自带的 Edge；
+    config.toml 不存在时生成一份（浏览器用 Edge，biliup 走 GitHub 镜像）。不改系统设置。
 
 .PARAMETER SkipBrowser
     不下载 Chromium（已在 config.toml 里改用本机 Chrome / Edge 时使用）。
@@ -33,7 +34,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
 
 $UvInstallCommand = 'powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"'
-$MirrorHost = 'https://npmmirror.com/mirrors/playwright'
+$PypiMirror = 'https://mirrors.aliyun.com/pypi/simple/'
+$PythonMirror = 'https://registry.npmmirror.com/-/binary/python-build-standalone'
+$GithubMirror = 'https://ghfast.top/'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
 function Write-Step([string]$Text) {
@@ -84,6 +87,33 @@ function Install-Uv {
     return Find-Uv
 }
 
+function Get-DataHome {
+    if ($env:MULTIPUB_HOME) { return $env:MULTIPUB_HOME }
+    return (Join-Path $env:LOCALAPPDATA 'multipub')
+}
+
+function Write-ChinaConfig {
+    $dataHome = Get-DataHome
+    $cfg = Join-Path $dataHome 'config.toml'
+    if (Test-Path $cfg) {
+        Write-Hint "已有 $cfg，不改动。国内网络请确认里面有 [browser] channel = ""msedge""（或 ""chrome""）和 github_mirror。"
+        return
+    }
+    New-Item -ItemType Directory -Force -Path $dataHome | Out-Null
+    $text = @"
+# 由 scripts\install.ps1 -China 生成，可随时修改（说明见 docs\config.example.toml）
+# biliup 从 GitHub 下载，国内走镜像
+github_mirror = "$GithubMirror"
+
+[browser]
+# 国内下载不到 patchright 的 Chromium，改用 Windows 自带的 Edge；装了 Chrome 也可以改成 "chrome"
+channel = "msedge"
+"@
+    # UTF-8 不带 BOM（Windows PowerShell 5.1 的 Set-Content -Encoding UTF8 会带 BOM）
+    [IO.File]::WriteAllText($cfg, $text, (New-Object System.Text.UTF8Encoding $false))
+    Write-Hint "已生成 $cfg：浏览器用 Edge，biliup 从 $GithubMirror 下载"
+}
+
 function Invoke-Main {
     # 返回退出码：0 全部成功；1 有步骤失败（见提示）
     # ---------------------------------------------------------------- 1. uv
@@ -94,14 +124,18 @@ function Invoke-Main {
     Invoke-Native $uv @('--version') | Out-Null
 
     # ---------------------------------------------------------------- 2. 依赖
+    if ($China) {
+        # 只影响本次运行；已经设置过的不覆盖
+        if (-not $env:UV_DEFAULT_INDEX) { $env:UV_DEFAULT_INDEX = $PypiMirror }
+        if (-not $env:UV_PYTHON_INSTALL_MIRROR) { $env:UV_PYTHON_INSTALL_MIRROR = $PythonMirror }
+        Write-Hint "本次运行使用镜像：PyPI $env:UV_DEFAULT_INDEX；Python $env:UV_PYTHON_INSTALL_MIRROR"
+    }
     Write-Step '安装依赖（uv sync）'
     $code = Invoke-Native $uv @('sync')
     if ($code -ne 0) {
         Write-Hint "uv sync 失败（退出码 $code），改用 uv venv + uv pip install -e ."
-        if ($China) {
-            Write-Hint '国内网络可先设置 PyPI / Python 镜像再重试，例如：'
-            Write-Hint '  $env:UV_DEFAULT_INDEX = "https://mirrors.aliyun.com/pypi/simple/"'
-            Write-Hint '  $env:UV_PYTHON_INSTALL_MIRROR = "https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download"'
+        if (-not $China) {
+            Write-Hint '国内网络建议加 -China 重新运行（PyPI / Python 走国内镜像）。'
         }
         if (-not (Test-Path (Join-Path $RepoRoot '.venv\Scripts\python.exe'))) {
             $code = Invoke-Native $uv @('venv')
@@ -114,8 +148,9 @@ function Invoke-Main {
     # ---------------------------------------------------------------- 3. mpub setup
     $result = 0
     if ($China) {
-        $env:PLAYWRIGHT_DOWNLOAD_HOST = $MirrorHost
-        Write-Hint "本次会话使用 Chromium 镜像：PLAYWRIGHT_DOWNLOAD_HOST=$MirrorHost"
+        # npmmirror 没有 patchright 1.58 需要的 Chromium 145，直连又要访问 Google 存储：国内改用系统自带的 Edge
+        Write-ChinaConfig
+        $SkipBrowser = $true
     }
     $setupArgs = @('run', 'mpub', 'setup')
     if ($SkipBrowser) { $setupArgs += '--skip-browser' }

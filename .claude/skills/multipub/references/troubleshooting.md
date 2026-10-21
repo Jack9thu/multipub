@@ -10,7 +10,7 @@
 |---|---|
 | `uv: command not found` | 安装 uv：`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 \| iex"`，重开终端；或运行 `scripts\install.ps1` |
 | `doctor` 里 `browser` ✘ | `uv run mpub setup`。下载慢/失败：改用本机浏览器，在 `<数据目录>\config.toml` 写 `[browser]` `channel = "chrome"`（或 `"msedge"`），再 `uv run mpub setup --skip-browser` |
-| Chromium 镜像 404 | patchright 1.58.2 需要 Chrome for Testing 145.0.7632.6，npmmirror（2026-10）没有这个版本。去掉 `PLAYWRIGHT_DOWNLOAD_HOST` 直连，或改用本机 Chrome / Edge（同上） |
+| Chromium 镜像 404 | patchright 1.58.2 需要 Chrome for Testing 145.0.7632.6，npmmirror（2026-10）没有这个版本。去掉 `PLAYWRIGHT_DOWNLOAD_HOST` 直连，或改用本机 Chrome / Edge（同上）。`scripts\install.ps1 -China` 已经默认改用 Edge |
 | `doctor` 里 `bilibili.biliup` ✘ / 发布报「未找到 biliup」 | `uv run mpub setup`；GitHub 慢时 config 里设 `github_mirror = "https://ghfast.top/"`；被杀毒软件隔离见 `docs/windows.md` |
 | biliup「sha256 不匹配」 | 下载被镜像或网络篡改/截断，已拒绝安装。换镜像或直连后重试 |
 | doctor 报 biliup 二进制与记录不一致 | 删除 `<数据目录>\tools\biliup\<版本>` 整个目录后 `uv run mpub setup` |
@@ -49,7 +49,7 @@
 |---|---|
 | `非交互环境需要加 --yes` | Claude Code 里必须加 `--yes`（在用户确认之后） |
 | `正被另一个任务使用` | 同一平台同一账号已有任务在跑（可能是另一个终端）。等它结束 |
-| 抖音要短信验证码 | 看到 `needs_input` 后问用户要验证码，`uv run mpub verify-code douyin <验证码>`。默认等 5 分钟（config `[platforms.douyin] sms_timeout`）。不要同时用两个抖音账号发布（验证码文件共用） |
+| 抖音要短信验证码 | 看到 `needs_input` 后问用户要验证码，`uv run mpub verify-code douyin <验证码>`。默认等 10 分钟（config `[platforms.douyin] sms_timeout`）；发布期间要一直盯着后台输出，别错过 `needs_input`。不要同时用两个抖音账号发布（验证码文件共用） |
 | 抖音「自主声明设置失败」（`validation`） | `declaration` 必须与页面上的选项文字完全一致，或设为 `false` 不声明 |
 | 抖音/小红书某一步 `timeout` | 平台可能改版了：看截图停在哪一步；加 `--headed` 重试观察。上传大文件：加大 `--timeout`（或 config `[timeouts] publish_video`；上传等待 = 任务超时 − 600 秒） |
 | 小红书发布页出现上次没发出去的内容 | 小红书可能恢复草稿；先在网页上清掉草稿再发 |

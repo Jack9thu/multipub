@@ -40,7 +40,10 @@ multipub 是本仓库里的命令行工具 `mpub`。它用浏览器自动化和�
 uv run mpub doctor --json
 ```
 
-`ok: false` 时看 `checks` 里 `ok: false` 的项：缺浏览器/biliup → `uv run mpub setup`（会下载，先告诉用户；国内网络见 troubleshooting）。
+`ok: false` 时看 `checks` 里 `ok: false` 的项：缺浏览器/biliup → `uv run mpub setup --json`。它要下载几百 MB，
+**一定用 Bash 的 `run_in_background` 运行，`timeout: 1800000`**（前台默认 2 分钟会被杀掉，留下半截下载），先告诉用户；
+已改用本机 Chrome/Edge 时加 `--skip-browser` 只下载 biliup。国内网络见 troubleshooting。
+`bilibili.biliup` 提示缺少 VC++ 运行库时，请用户安装 https://aka.ms/vs/17/release/vc_redist.x64.exe 。
 `*.accounts` 项只表示没登录，不影响 `ok`。
 
 ### 2. 准备清单
@@ -80,11 +83,14 @@ uv run mpub publish posts/<名字> --dry-run --json    # 发布前的最终本�
 uv run mpub publish posts/<名字> --yes --json
 ```
 
+- 目标里有**抖音**时，发布前先告诉用户：「抖音可能会给绑定手机发短信验证码，收到后直接发给我」。
 - **用 Bash 的 `run_in_background` 运行**，超时给足：视频 `timeout: 7200000`（2 小时，工具上限），图文/文章 `1800000`。
   每个平台之间默认等 30 秒；单个平台视频默认最多 1 小时。几个大视频加起来可能超过 2 小时时，用 `--to <平台>` 分几次发。
-- 运行期间读后台任务的输出，留意 stderr 事件：
+- **发布期间不要结束这一轮对话去等后台任务**（后台任务只有结束时才会通知你，中途的验证码请求会错过）：
+  用 Monitor 工具（或循环读取后台输出、每次间隔几十秒）盯住输出，直到出现 `"event": "needs_input"` 或命令结束。留意 stderr 事件：
   - `{"event": "needs_input", "kind": "sms_code", ...}`（抖音短信验证）：**让发布继续在后台跑**，请用户报出抖音账号绑定手机收到的验证码，
-    然后运行 `uv run mpub verify-code douyin <验证码>`。默认 5 分钟内有效；验证码错了可能会再来一次 `needs_input`。
+    然后运行 `uv run mpub verify-code douyin <验证码>`，再继续盯输出。默认等 10 分钟；验证码错了可能会再来一次 `needs_input`。
+    用户用 `--headed` 时也可以直接在弹出的浏览器窗口里输入验证码。
   - `{"event": "submit_started"}`：已经点了发布，此后这个平台无论结果如何都不能自动重发。
   - `{"event": "log", ...}`：进度，可以简要转告用户。
 - 结束后读 stdout 的 JSON：`{"ok", "run_id", "results": [...]}`。

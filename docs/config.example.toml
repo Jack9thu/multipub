@@ -49,7 +49,7 @@ page_timeout = 300      # 选好视频后等待进入发布表单页（秒）
 # upload_timeout 默认 = timeouts.publish_<kind> − 600（最少 180），即视频 3000、图文 300
 # upload_timeout = 3000
 publish_timeout = 240   # 点击「发布」后等待跳转到作品管理页
-sms_timeout = 300       # 等待短信验证码（mpub verify-code douyin <验证码>）
+sms_timeout = 600       # 等待短信验证码（mpub verify-code douyin <验证码>）
 
 [platforms.xiaohongshu]
 # upload_timeout 默认 = timeouts.publish_<kind> − 600（最少 180）

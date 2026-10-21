@@ -232,7 +232,7 @@ mpub verify-code douyin <验证码>
 |---|---|---|
 | `log` | `level`（`info`/`warning`/`debug`）、`message` | 进度。`debug` 是 worker 的非 JSON 输出，可忽略 |
 | `qrcode` | `path`、`note` | 登录二维码图片已生成或刷新（`<数据目录>\qrcode\<平台>-<账号>.png`）。展示给用户扫码；`note` 里有提示（如抖音没定位到二维码时这是整页截图） |
-| `needs_input` | `kind`（目前只有 `sms_code`）、`message`、`path` | 抖音发布需要短信验证码：向用户要验证码，运行 `mpub verify-code douyin <验证码>`（或写入 `path`）；默认等 300 秒 |
+| `needs_input` | `kind`（目前只有 `sms_code`）、`message`、`path` | 抖音发布需要短信验证码：向用户要验证码，运行 `mpub verify-code douyin <验证码>`（推荐用命令；直接写 `path` 也行，UTF-8/UTF-16 都认）；默认等 600 秒 |
 | `submit_started` | — | 即将/已经点击发布。此后该平台的任何失败都不能自动重试 |
 
 不加 `--json` 时这些事件以中文提示行显示在 stderr。

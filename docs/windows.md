@@ -34,8 +34,13 @@ uv run mpub doctor
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1           # 普通网络
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -China    # 国内网络：Chromium 走镜像
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -China    # 国内网络
 ```
+
+`-China` 做的事（只影响这一次运行）：依赖从阿里云 PyPI 镜像装，需要时 Python 本体从 npmmirror 下载；
+不下载 Chromium（镜像上没有 patchright 需要的版本），改用 Windows 自带的 Edge；
+数据目录里还没有 `config.toml` 时生成一份（`[browser] channel = "msedge"`、`github_mirror = "https://ghfast.top/"`），
+已有的不会改。`ghfast.top` 是第三方 GitHub 加速，不可用时换成别的镜像或留空直连。
 
 uv 默认装在 `%USERPROFILE%\.local\bin\uv.exe`。想省掉每次的 `uv run`，可以激活虚拟环境：
 `.\.venv\Scripts\Activate.ps1`（提示「禁止运行脚本」时先运行一次
@@ -47,7 +52,8 @@ uv 默认装在 `%USERPROFILE%\.local\bin\uv.exe`。想省掉每次的 `uv run`�
   `uv run mpub publish "D:\视频 素材\第12期"`。
 - `post.yaml` 里的 Windows 路径用**单引号**或**正斜杠**：`video: 'D:\视频素材\第12期.mp4'`、`video: D:/视频素材/第12期.mp4`。
   双引号里的 `\` 是转义符，要写 `"D:\\视频素材\\第12期.mp4"`。最省事的是把素材和 `post.yaml` 放在同一个目录、写相对路径。
-- 所有文本文件按 UTF-8 读取（记事本「另存为 UTF-8」即可，带 BOM 也行）。
+- 文本文件按 UTF-8 读取（记事本「另存为 UTF-8」即可，带 BOM 也行）；`config.toml` 另外也认 PowerShell 5.1
+  `Out-File` 写出的 UTF-16。`config.toml` 写错时所有命令都会报「配置错误」并退出（退出码 2），按提示改正即可。
 - 如果 Windows 用户名是中文、浏览器启动出现奇怪的问题，可以把数据目录和浏览器内核目录都换到纯英文路径再试：
 
   ```powershell

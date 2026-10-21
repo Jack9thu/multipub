@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, history
-from .config import Settings, load_settings
+from .config import ConfigError, Settings, load_settings
 from .manifest import (PLATFORMS, ManifestError, common_issues, load_manifest,
                        normalize_platform, parse_platform_list)
 from .models import (ErrorCode, Issue, Kind, PlatformPost, Result, Status,
@@ -56,7 +56,7 @@ class Printer:
             self.info(f"{who} 请用手机 App 扫码登录，二维码图片: {event.get('path')} {event.get('note') or ''}")
         elif kind == "needs_input":
             self.info(f"{who} 需要输入: {event.get('message')}"
-                      + (f"（写入文件 {event['path']}，或运行 mpub verify-code）" if event.get("path") else ""))
+                      + (f"（运行 mpub verify-code douyin <验证码>，或写入文件 {event["path"]}）" if event.get("path") else ""))
         elif kind == "submit_started":
             self.info(f"{who} 已点击发布……")
         elif kind == "log":
@@ -101,6 +101,11 @@ def _run_id() -> str:
 def _accounts(settings: Settings, platform: str) -> list[str]:
     d = settings.accounts_dir / platform
     return sorted(p.stem for p in d.glob("*.json")) if d.is_dir() else []
+
+
+def _busy(platform: str, account: str, action: str, message: str, kind: str = "") -> Result:
+    return Result(platform=platform, account=account, action=action, status=Status.FAILED, kind=kind,
+                  message=message, error_code=ErrorCode.INTERNAL.value, retryable=True, finished_at=now_iso())
 
 
 def _skip(post: PlatformPost, message: str, code: ErrorCode = ErrorCode.UNSUPPORTED) -> Result:
@@ -189,10 +194,13 @@ def cmd_login(args: argparse.Namespace, settings: Settings, out: Printer) -> int
             out.info(f"{DISPLAY_NAMES[platform]}没有终端交互式登录，去掉 --interactive 即可")
             return EXIT_USAGE
     headless = bool(args.headless)  # 登录默认有头，方便直接在浏览器窗口里扫码
-    with history.account_lock(settings, platform, args.account):
-        result = run_worker(settings, action="login", platform=platform, account=args.account,
-                            headless=headless, run_dir=settings.runs_dir / f"{_run_id()}-login",
-                            on_event=out.event)
+    try:
+        with history.account_lock(settings, platform, args.account):
+            result = run_worker(settings, action="login", platform=platform, account=args.account,
+                                headless=headless, run_dir=settings.runs_dir / f"{_run_id()}-login",
+                                on_event=out.event)
+    except history.AccountBusy as exc:
+        result = _busy(platform, args.account, "login", str(exc))
     if out.as_json:
         out.emit_json({"ok": result.ok, "result": result.to_dict()})
     else:
@@ -213,9 +221,12 @@ def cmd_check(args: argparse.Namespace, settings: Settings, out: Printer) -> int
                                   error_code=ErrorCode.LOGIN_REQUIRED.value, finished_at=now_iso()))
             continue
         for account in accounts:
-            with history.account_lock(settings, platform, account):
-                results.append(run_worker(settings, action="check", platform=platform, account=account,
-                                          headless=True, run_dir=run_dir, on_event=out.event))
+            try:
+                with history.account_lock(settings, platform, account):
+                    results.append(run_worker(settings, action="check", platform=platform, account=account,
+                                              headless=True, run_dir=run_dir, on_event=out.event))
+            except history.AccountBusy as exc:
+                results.append(_busy(platform, account, "check", str(exc)))
     if out.as_json:
         out.emit_json({"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]})
     else:
@@ -376,10 +387,8 @@ def cmd_publish(args: argparse.Namespace, settings: Settings, out: Printer) -> i
                            source=str(manifest.path), title=post.title)
             out.info(format_result(exc.result))
             raise
-        except RuntimeError as exc:  # 账号被占用
-            result = Result(platform=post.platform, account=post.account, action="publish",
-                            status=Status.FAILED, kind=post.kind.value, message=str(exc),
-                            error_code=ErrorCode.INTERNAL.value, retryable=True, finished_at=now_iso())
+        except history.AccountBusy as exc:
+            result = _busy(post.platform, post.account, "publish", str(exc), post.kind.value)
         history.append(settings, result, run_id=run_id, fingerprint=history.post_fingerprint(post),
                        source=str(manifest.path), title=post.title)
         if not out.as_json:
@@ -525,7 +534,14 @@ def main(argv: list[str] | None = None) -> int:
     _install_signal_handlers()
     args = build_parser().parse_args(argv)
     out = Printer(args.json)
-    settings = load_settings(args.home)
+    try:
+        settings = load_settings(args.home)
+    except ConfigError as exc:
+        if out.as_json:
+            out.emit_json({"ok": False, "error": "config", "message": str(exc)})
+        else:
+            out.info(f"配置错误: {exc}")
+        return EXIT_USAGE
     try:
         return COMMANDS[args.command](args, settings, out)
     except ManifestError as exc:

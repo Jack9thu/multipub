@@ -92,7 +92,7 @@ multipub 的知乎（接口发布）和 B站（biliup 投稿 + 动态）是自�
    ```
 
    `uv sync` 会按 `.python-version` 准备 Python 3.12、建 `.venv`、装好依赖（含测试用的 dev 组）。
-   也可以 `uv venv` 然后 `uv pip install -e .`。或者直接运行 `scripts\install.ps1` 完成第 2、3 步（国内网络加 `-China`）。
+   也可以 `uv venv` 然后 `uv pip install -e .`。或者直接运行 `scripts\install.ps1` 完成第 2、3 步（国内网络加 `-China`：依赖走国内镜像，浏览器改用系统自带的 Edge，详见 [docs/windows.md](docs/windows.md)）。
 
 3. 安装浏览器内核、下载 biliup，并自检：
 

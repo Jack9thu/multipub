@@ -83,6 +83,10 @@ def find_previous(settings: Settings, fingerprint: str) -> dict[str, Any] | None
     return None
 
 
+class AccountBusy(RuntimeError):
+    """同一平台账号正被另一个 mpub 任务使用（例如后台还在发布）。"""
+
+
 @contextmanager
 def account_lock(settings: Settings, platform: str, account: str, wait: float = 5) -> Iterator[None]:
     settings.locks_dir.mkdir(parents=True, exist_ok=True)
@@ -90,7 +94,7 @@ def account_lock(settings: Settings, platform: str, account: str, wait: float = 
     try:
         lock.acquire(timeout=wait)
     except Timeout as exc:
-        raise RuntimeError(f"{platform}/{account} 正被另一个任务使用，请稍后再试") from exc
+        raise AccountBusy(f"{platform}/{account} 正被另一个 mpub 任务使用（可能后台还在发布），请等它结束后再试") from exc
     try:
         yield
     finally:

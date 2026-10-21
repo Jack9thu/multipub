@@ -109,13 +109,29 @@ class Settings:
             d.mkdir(parents=True, exist_ok=True)
 
 
+class ConfigError(ValueError):
+    pass
+
+
+def _read_text_any(path: Path) -> str:
+    """Windows 上常见：记事本带 BOM 的 UTF-8、PowerShell 5.1 写出的 UTF-16。"""
+    data = path.read_bytes()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    return data.decode("utf-8-sig")
+
+
 def load_settings(home: Path | str | None = None) -> Settings:
     home_path = Path(home).expanduser().resolve() if home else default_home()
     raw: dict[str, Any] = {}
     cfg = home_path / "config.toml"
     if cfg.is_file():
-        with cfg.open("rb") as fh:
-            raw = tomllib.load(fh)
+        try:
+            raw = tomllib.loads(_read_text_any(cfg))
+        except UnicodeDecodeError as exc:
+            raise ConfigError(f"{cfg} 编码无法识别，请另存为 UTF-8：{exc}") from exc
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"{cfg} 格式错误：{exc}（Windows 路径请用单引号，如 'D:\\tools\\biliup.exe'）") from exc
 
     browser_raw = raw.get("browser", {}) or {}
     browser = BrowserSettings(

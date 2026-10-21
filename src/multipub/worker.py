@@ -104,8 +104,10 @@ async def _run_watching_parent(job: dict[str, Any]) -> Result:
     assert task is not None
 
     def watch() -> None:
+        # 直接读文件描述符：不占 BufferedReader 的锁，否则解释器退出时会因守护线程持锁而 abort
+        fd = sys.stdin.fileno()
         try:
-            while sys.stdin.buffer.read(4096):
+            while os.read(fd, 4096):
                 pass
         except (OSError, ValueError):
             pass
@@ -127,8 +129,20 @@ def main() -> int:
         except (AttributeError, ValueError):
             pass
     # Windows 上 asyncio 默认就是 Proactor 事件循环，patchright 启动浏览器子进程依赖它
-    # 第一行是任务；runner 会让 stdin 保持打开，用 EOF 表示主进程已经不在了
-    job = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
+    if sys.platform == "win32":
+        # 子进程（浏览器、biliup）缺 DLL 或崩溃时不弹系统对话框，直接返回错误码
+        import ctypes
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)  # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
+    # 第一行是任务；runner 会让 stdin 保持打开，用 EOF 表示主进程已经不在了。
+    # 逐字节读到换行，避免缓冲读把后续数据吞进 BufferedReader（watch() 读的是原始 fd）
+    raw = bytearray()
+    fd = sys.stdin.fileno()
+    while not raw.endswith(b"\n"):
+        chunk = os.read(fd, 1)
+        if not chunk:
+            break
+        raw += chunk
+    job = json.loads(raw.decode("utf-8"))
     if job.get("watch_parent"):
         try:
             result = asyncio.run(_run_watching_parent(job))

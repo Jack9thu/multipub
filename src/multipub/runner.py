@@ -32,6 +32,8 @@ class WorkerInterrupted(KeyboardInterrupt):
 
 # worker 输出 result 之后、进程退出之前允许的收尾时间
 _GRACE_SECONDS = 15
+# 等待输出时的轮询间隔。Windows + Python < 3.14 上 Ctrl+C 打断不了长时间的锁等待，必须分小段等
+_POLL_SECONDS = 0.5
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -130,18 +132,18 @@ def run_worker(
         deadline = time.monotonic() + timeout
         result: Result | None = None
         submit_started = False
+        grace_deadline = deadline
         eof = False
         try:
             while not eof:
-                remaining = deadline - time.monotonic()
-                if result is not None:
-                    remaining = min(remaining, _GRACE_SECONDS)
+                # 拿到 result 后只再等 worker 收尾 _GRACE_SECONDS 秒
+                remaining = (grace_deadline if result is not None else deadline) - time.monotonic()
                 if remaining <= 0:
                     break
                 try:
-                    raw = lines.get(timeout=remaining)
+                    raw = lines.get(timeout=min(remaining, _POLL_SECONDS))
                 except queue.Empty:
-                    break
+                    continue
                 if raw is None:
                     eof = True
                     break
@@ -162,6 +164,7 @@ def run_worker(
                         result = Result.from_dict(event["result"])
                     except (KeyError, TypeError, ValueError):
                         result = None
+                    grace_deadline = min(deadline, time.monotonic() + _GRACE_SECONDS)
                     continue
                 if on_event:
                     on_event(event)
@@ -170,6 +173,26 @@ def run_worker(
             # Ctrl+C / SIGTERM：先结束整棵进程树（浏览器、biliup），再把中断时的状态交给调用方记录
             _close_stdin(proc)
             _kill_tree(proc)
+            # 进程已死，把管道里剩下的事件读完：中断前可能已经发出了 submit_started / result
+            drain_until = time.monotonic() + 3
+            while time.monotonic() < drain_until:
+                try:
+                    raw = lines.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if raw is None:
+                    break
+                try:
+                    event = json.loads(raw.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict) and event.get("event") == "submit_started":
+                    submit_started = True
+                elif isinstance(event, dict) and event.get("event") == "result":
+                    try:
+                        result = Result.from_dict(event["result"])
+                    except (KeyError, TypeError, ValueError):
+                        pass
             interrupted = result or Result(
                 platform=platform, account=account, action=action, status=Status.FAILED,
                 kind=post.kind.value if post else "",

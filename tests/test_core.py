@@ -222,3 +222,30 @@ def test_interrupted_publish_is_recorded_and_cleaned_up(home: Path, media: Path)
     time.sleep(1)
     ps = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
     assert str(home) not in ps and not any("multipub.worker" in l and str(media) in l for l in ps.splitlines())
+
+
+def test_config_bom_utf16_and_errors(home: Path, capsys):
+    home.mkdir(parents=True, exist_ok=True)
+    cfg = home / "config.toml"
+    text = "gap_seconds = 7\n[browser]\nchannel = 'msedge'\n"
+    for data in (b"\xef\xbb\xbf" + text.encode("utf-8"), text.encode("utf-16")):
+        cfg.write_bytes(data)
+        s = load_settings()
+        assert s.gap_seconds == 7 and s.browser.channel == "msedge"
+    cfg.write_text("[browser\nchannel = 1", encoding="utf-8")
+    assert main(["doctor", "--json"]) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["error"] == "config"
+
+
+def test_check_reports_busy_account_as_json(home: Path, capsys):
+    from filelock import FileLock
+
+    assert main(["login", "fake", "--account", "busy1", "--json"]) == 0
+    capsys.readouterr()
+    settings = load_settings()
+    settings.locks_dir.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(settings.locks_dir / "fake-busy1.lock")):
+        assert main(["check", "fake", "--json"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["results"][0]["error_code"] == "internal" and "正被另一个" in out["results"][0]["message"]
