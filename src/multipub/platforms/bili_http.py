@@ -1,7 +1,7 @@
 """B站 Web / TV 接口的最小封装（自己实现，未使用 GPL 的 bilibili-api）。
 
-- WBI 签名：nav 拿 img_key/sub_key -> 固定表重排得 mixin_key -> 参数排序、去掉 !'()*、
-  按 encodeURIComponent 规则编码 -> md5(query + mixin_key) = w_rid。
+- WBI 签名（照网页端 um()）：nav 拿 img_key/sub_key -> 固定表重排得 mixin_key -> 参数加 wts 排序、
+  字符串值去掉 !'()*、按 encodeURIComponent 规则编码 -> md5(query + mixin_key) = w_rid。
 - APP 签名（TV 扫码登录用）：参数按键排序 urlencode 后拼 appsec 取 md5。
 - 图文动态 HTTP 模式（实验性）：nav -> upload_bfs（每张图）-> submit_check -> create/dyn。
 
@@ -51,8 +51,16 @@ MIXIN_KEY_ENC_TAB = (
 )
 _WBI_STRIP = str.maketrans("", "", "!'()*")
 
+# 网页端 METADATA 中间件附加的 x-bili-device-req-json：UA 含 Mozilla -> device=pc，
+# spmid 取 t.bilibili.com 页面的 <meta name="spm_prefix">，create/dyn 额外带 mobi_app=web_cn
+WEB_SPMID = "333.1365"
+# 网页端 WBI 中间件对 create/dyn 设置了 bodyPayload，把这两个 body 字段加前缀 w_ 拷进 URL 参数一起签名
+CREATE_DYN_BODY_PAYLOAD = ("upload_id", "meta")
+
 LOGIN_HINT = "运行 mpub login bilibili --account {account} 重新扫码登录"
 HTTP_MODE_RISK_HINT = "稍后再试，或改用默认的浏览器模式（去掉 platforms.bilibili.mode: http）"
+# 服务端内部错误 / 超时：请求可能已经处理，发布接口遇到这些码按"结果未知"处理
+SERVER_ERROR_CODES = frozenset({-500, -502, -503, -504})
 
 
 def opus_url(dyn_id: str) -> str:
@@ -62,6 +70,7 @@ def opus_url(dyn_id: str) -> str:
 # ------------------------------------------------------------------ 签名
 
 def _param_str(value: Any) -> str:
+    """参数在 URL 里的取值：对象 / 数组按网页端请求库的做法 JSON.stringify。"""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (dict, list)):
@@ -69,10 +78,27 @@ def _param_str(value: Any) -> str:
     return str(value)
 
 
+def _js_string(value: Any) -> str:
+    """参数参与 WBI 签名时的取值，等同 JS 的 String(value)。
+
+    网页端签名直接 encodeURIComponent(value)：对象会变成 "[object Object]"（URL 里发的却是 JSON），
+    这里照做，保证与浏览器算出的 w_rid 一致。
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, dict):
+        return "[object Object]"
+    if isinstance(value, (list, tuple)):
+        return ",".join("" if v is None else _js_string(v) for v in value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def encode_query(params: dict[str, Any]) -> str:
-    """按 encodeURIComponent 规则编码（空格是 %20，不是 +），保持传入顺序。"""
+    """按 encodeURIComponent 规则编码（空格是 %20，不是 +），保持传入顺序；值为 None 的跳过。"""
     return "&".join(f"{urllib.parse.quote(str(k), safe='')}={urllib.parse.quote(_param_str(v), safe='')}"
-                    for k, v in params.items())
+                    for k, v in params.items() if v is not None)
 
 
 def mixin_key(img_key: str, sub_key: str) -> str:
@@ -93,12 +119,28 @@ def wbi_keys(nav_data: dict[str, Any]) -> tuple[str, str]:
 
 
 def wbi_sign(params: dict[str, Any], img_key: str, sub_key: str, *, wts: int | None = None) -> dict[str, Any]:
-    """返回追加了 wts / w_rid 的新参数字典（原始值不变，只在计算签名时去掉 !'()*）。"""
-    signed = dict(params)
+    """返回追加了 wts / w_rid 的新参数字典。
+
+    与网页端 um() 一致：加 wts、按键排序、跳过 None、只对字符串值去掉 !'()*、
+    encodeURIComponent 后拼接，w_rid = md5(query + mixin_key)。发送的仍是原始值。
+    """
+    signed = {k: v for k, v in params.items() if v is not None}
     signed["wts"] = int(wts if wts is not None else time.time())
-    clean = {k: _param_str(signed[k]).translate(_WBI_STRIP) for k in sorted(signed)}
-    signed["w_rid"] = hashlib.md5((encode_query(clean) + mixin_key(img_key, sub_key)).encode("utf-8")).hexdigest()
+    parts = []
+    for key in sorted(signed):
+        value = signed[key]
+        text = value.translate(_WBI_STRIP) if isinstance(value, str) else _js_string(value)
+        parts.append(f"{urllib.parse.quote(str(key), safe='')}={urllib.parse.quote(text, safe='')}")
+    signed["w_rid"] = hashlib.md5(("&".join(parts) + mixin_key(img_key, sub_key)).encode("utf-8")).hexdigest()
     return signed
+
+
+def device_req_json(mobi_app: str | None = None) -> str:
+    """网页端 METADATA 中间件的 x-bili-device-req-json（JSON.stringify 的紧凑格式）。"""
+    data = {"platform": "web", "device": "pc", "spmid": WEB_SPMID}
+    if mobi_app:
+        data["mobi_app"] = mobi_app
+    return json.dumps(data, separators=(",", ":"))
 
 
 def app_sign(params: dict[str, Any], appsec: str = TV_APPSEC) -> dict[str, Any]:
@@ -260,8 +302,10 @@ def build_dyn_req(*, text: str, title: str, pics: list[dict[str, Any]], mid: int
 
 
 async def upload_image(client: httpx.AsyncClient, path: Path, csrf: str, *, account: str) -> dict[str, Any]:
+    """传一张图，返回 dyn_req.pics 里的一项（字段与网页端相同：img_size 是本地文件 KB 数）。"""
+    content = path.read_bytes()
     mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
-    files = {"file_up": (path.name, path.read_bytes(), mime)}
+    files = {"file_up": (path.name, content, mime)}
     form = {"biz": "dyn", "category": "daily", "csrf": csrf}
     data = await request_json(client, "POST", UPLOAD_BFS_URL, data=form, files=files,
                               what=f"上传图片 {path.name}", risk_hint=HTTP_MODE_RISK_HINT, timeout=120)
@@ -269,14 +313,17 @@ async def upload_image(client: httpx.AsyncClient, path: Path, csrf: str, *, acco
     d = data.get("data") or {}
     if not d.get("image_url"):
         raise PublishError(f"上传图片 {path.name} 没有返回地址", retryable=True)
-    return {"img_src": d["image_url"], "img_width": d.get("image_width", 0),
-            "img_height": d.get("image_height", 0), "img_size": d.get("img_size", 0)}
+    pic = {"img_src": d["image_url"], "img_width": d.get("image_width", 0),
+           "img_height": d.get("image_height", 0), "img_size": len(content) / 1024}
+    if "ai_gen_pic" in d:
+        pic["ai_gen_pic"] = d["ai_gen_pic"]
+    return pic
 
 
 async def submit_check(client: httpx.AsyncClient, dyn_req: dict[str, Any], csrf: str, *, account: str) -> None:
     body = {"content": dyn_req["content"], "pics": dyn_req["pics"], "scene": dyn_req["scene"],
             "create_option": dyn_req["option"]}
-    url = f"{SUBMIT_CHECK_URL}?{encode_query({'csrf': csrf})}"
+    url = f"{SUBMIT_CHECK_URL}?{encode_query({'csrf': csrf, 'x-bili-device-req-json': device_req_json()})}"
     data = await request_json(client, "POST", url, what="发布前检查", content=_json_bytes(body),
                               headers={"Content-Type": "application/json"}, risk_hint=HTTP_MODE_RISK_HINT)
     raise_for_code(data, what="发布前检查", account=account)
@@ -290,28 +337,36 @@ def _b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def create_dyn_query(csrf: str, keys: tuple[str, str], *, wts: int | None = None) -> str:
-    """create/dyn 的 URL 参数，带 WBI 签名。
+def create_dyn_query(csrf: str, keys: tuple[str, str], dyn_req: dict[str, Any], *, wts: int | None = None) -> str:
+    """create/dyn 的 URL 参数，带 WBI 签名（参数组成照网页端 2026-10 的中间件链）。
 
-    dm_img_list / dm_img_inter 是"没有鼠标键盘轨迹"时的取值，dm_img_str / dm_cover_img_str 是
-    WebGL 版本与显卡名的 base64（固定值）。网页端还会带 b_wet 环境令牌（WASM 生成，这里无法提供），
+    - x-bili-device-req-json：METADATA 中间件。
+    - dm_img_*：RISK_USER_LOG 中间件；这里用"没有鼠标键盘轨迹"的取值，dm_img_str / dm_cover_img_str
+      是 WebGL 版本与显卡名的 base64（固定值）。
+    - w_dyn_req.upload_id / w_dyn_req.meta：WBI 中间件的 bodyPayload（meta 是对象：签名按 "[object Object]"，
+      URL 里发 JSON，与浏览器一致）。
+    网页端还会带 b_wet 环境令牌（WASM 生成，这里无法提供）和 x-bili-locale-json，
     所以本模式可能被风控（412 / -352），届时请改用浏览器模式。
     """
-    params = {
+    params: dict[str, Any] = {
         "platform": "web",
         "csrf": csrf,
+        "x-bili-device-req-json": device_req_json("web_cn"),
         "dm_img_list": "[]",
         "dm_img_str": _b64("WebGL 1.0 (OpenGL ES 2.0 Chromium)"),
         "dm_cover_img_str": _b64("ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0)"),
         "dm_img_inter": '{"ds":[],"wh":[0,0,0],"of":[0,0,0]}',
     }
+    for field_name in CREATE_DYN_BODY_PAYLOAD:
+        if dyn_req.get(field_name) is not None:
+            params[f"w_dyn_req.{field_name}"] = dyn_req[field_name]
     return encode_query(wbi_sign(params, *keys, wts=wts))
 
 
 async def create_dyn(client: httpx.AsyncClient, dyn_req: dict[str, Any], csrf: str, keys: tuple[str, str],
                      *, account: str) -> dict[str, Any]:
     """真正发布。调用前必须已经 mark_submit_started；结果不明一律 UNKNOWN_OUTCOME。"""
-    url = f"{CREATE_DYN_URL}?{create_dyn_query(csrf, keys)}"
+    url = f"{CREATE_DYN_URL}?{create_dyn_query(csrf, keys, dyn_req)}"
     try:
         resp = await client.post(url, content=_json_bytes({"dyn_req": dyn_req}),
                                  headers={"Content-Type": "application/json"}, timeout=60)
@@ -322,11 +377,16 @@ async def create_dyn(client: httpx.AsyncClient, dyn_req: dict[str, Any], csrf: s
         raise _risk("发布动态", HTTP_MODE_RISK_HINT)  # 网关直接拦截，请求没进业务层
     try:
         data = resp.json()
-    except ValueError as exc:
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
         raise PublishError(f"发布接口返回了非 JSON（HTTP {resp.status_code}）：先到 B站动态页确认，不要直接重发",
-                           code=ErrorCode.UNKNOWN_OUTCOME) from exc
+                           code=ErrorCode.UNKNOWN_OUTCOME)
     if data.get("code") == -352:
         raise _risk("发布动态", HTTP_MODE_RISK_HINT)
+    if data.get("code") in SERVER_ERROR_CODES:
+        raise PublishError(f"发布接口返回服务端错误（{data.get('code')}: {data.get('message')}），可能已经发出："
+                           "先到 B站动态页确认，不要直接重发", code=ErrorCode.UNKNOWN_OUTCOME)
     raise_for_code(data, what="发布动态", account=account)
     d = data.get("data") or {}
     dyn_id = str(d.get("dyn_id_str") or d.get("dyn_id") or "")

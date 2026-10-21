@@ -17,8 +17,9 @@ from patchright.async_api import async_playwright
 # multipub patch: 包内绝对导入；conf 由 multipub._sau.conf.configure() 预先设置
 from multipub._sau import conf as sau_conf
 from multipub._sau.conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
-from multipub._sau.runtime import (CookieInvalid, Deadline, Hooks, SauError, SmsCodeTimeout, UploadFailed,
-                                   fail_step, save_screenshot)
+from multipub._sau.runtime import (CookieInvalid, Deadline, DeclarationFailed, Hooks, SauError, SmsCodeTimeout,
+                                   SmsVerifyFailed, UploadFailed, close_quietly, fail_rejected, fail_step,
+                                   save_screenshot, save_state_quietly)
 from multipub._sau.uploader.base_video import BaseVideoUploader
 from multipub._sau.utils.base_social_media import set_init_script
 from multipub._sau.utils.login_qrcode import build_login_qrcode_path
@@ -194,7 +195,19 @@ async def _save_douyin_qrcode(page: Page, account_file: str, previous_qrcode_pat
         qrcode_src = await _extract_douyin_qrcode_src(page)
     except Exception as exc:
         douyin_logger.warning(_msg("😵", f"没定位到二维码元素（{str(exc)[:50]}）——请直接在弹出的浏览器里扫码，小人继续等登录跳转"))
-        return {"image_path": "", "image_data_url": ""}
+        # multipub patch: 把登录页截图当作二维码图片上报（无头登录、或窗口不在前台时也能扫）
+        fallback_path = build_login_qrcode_path(account_file, suffix="login_page")
+        try:
+            fallback_path.parent.mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path=str(fallback_path))
+        except Exception as shot_exc:
+            douyin_logger.warning(_msg("😵", f"登录页截图失败: {shot_exc!r}"))
+            return {"image_path": "", "image_data_url": ""}
+        if previous_qrcode_path and previous_qrcode_path != fallback_path:
+            remove_qrcode_file(previous_qrcode_path)
+        qrcode_info = {"image_path": str(fallback_path), "image_data_url": "", "fallback": True}
+        await _emit_qrcode_callback(qrcode_callback, qrcode_info)
+        return qrcode_info
     qrcode_path = save_data_url_image(qrcode_src, build_login_qrcode_path(account_file))
     if previous_qrcode_path and previous_qrcode_path != qrcode_path:
         if remove_qrcode_file(previous_qrcode_path):
@@ -357,6 +370,8 @@ class DouYinBaseUploader(BaseVideoUploader):
         # multipub patch: 适配器注入的回调/超时；发布点击状态与接口回执
         self.hooks = hooks or Hooks(platform="douyin")
         self._publish_clicked = False
+        self.publish_guard = self.hooks.publish_guard()
+        self._sms_rounds = 0
         self.published_item_id: str | None = None
         self.publish_api_error: str | None = None
         self._response_tasks: set = set()
@@ -649,41 +664,119 @@ class DouYinBaseUploader(BaseVideoUploader):
             self._publish_clicked = True
             self.hooks.call("before_publish_click")
 
+    # 视频流程：发布按钮用 force 点击、短信弹窗用上游的宽松判定；图文流程相反（见 DouYinVideo）
+    PUBLISH_CLICK_KWARGS: dict = {}
+    STRICT_SMS_CHECK = True
+
+    async def _prepare_publish_attempt(self, page: Page) -> None:
+        """每轮点击「发布」前的准备（视频流程会移除拦截点击的浮层）。"""
+
+    async def _platform_blocked_publish(self, page: Page) -> bool:
+        """上一次点击是否被平台提示拦下并已处理（视频流程：「请设置封面后再发布」）。"""
+        return False
+
+    async def _publish_until_success(self, page: Page, what: str, success_url: str) -> None:
+        """上游视频/图文的发布循环（选择器不变），multipub 改动：
+        截止时间；短信验证有截止时间与轮数上限；「发布」只经 _click_publish 点击（PublishGuard 限制重复点击，
+        第一次点击前通知适配器）；接口明确失败且没有后续验证时提前报错。"""
+        self._watch_publish_response(page)
+        deadline = Deadline(self.hooks.publish_timeout, f"等待{what}发布成功")
+        while True:
+            if deadline.expired:
+                await fail_step(page, self.hooks, deadline, after_submit=self._publish_clicked,
+                                detail=self._publish_detail())
+            try:
+                await self._prepare_publish_attempt(page)
+                # 检测并处理短信验证码弹窗；等验证码的时间不计入发布等待
+                if await self._handle_sms_verification(page, strict=self.STRICT_SMS_CHECK):
+                    deadline.reset()
+
+                # ── 正常发布流程 ──
+                publish_button = page.get_by_role("button", name="发布", exact=True)
+                if await publish_button.count():
+                    await self._click_publish(publish_button, **self.PUBLISH_CLICK_KWARGS)
+                await page.wait_for_url(success_url, timeout=3000)
+                douyin_logger.success(_msg("🥳", f"{what}发布成功，小人开心收工"))
+                break
+            except SauError:
+                raise
+            except Exception:
+                if await self._platform_blocked_publish(page):
+                    self.publish_guard.blocked_by_platform()
+                await self._raise_if_rejected(page)
+                douyin_logger.info(_msg("🏃", f"小人正在冲刺发布{what}"))
+                await asyncio.sleep(0.5)
+        await self._drain_publish_responses()
+
+    async def _click_publish(self, button, **click_kwargs) -> bool:
+        """受 PublishGuard 限制地点击最终「发布」；第一次点击前通知适配器。返回是否点击了。"""
+        if not self.publish_guard.may_click():
+            return False
+        self._before_publish_click()
+        self.publish_guard.clicked()  # 先记账再点：点击抛异常时也可能已经触发
+        await button.click(**click_kwargs)
+        self.publish_guard.click_returned()
+        return True
+
+    async def _raise_if_rejected(self, page: Page) -> None:
+        """发布接口明确失败、且宽限期内没有出现验证弹窗：不再等到超时，直接报平台拒绝。"""
+        rejection = self.publish_guard.rejection_settled(self.hooks.reject_grace)
+        if rejection:
+            await fail_rejected(page, self.hooks, rejection)
+
+    @staticmethod
+    def _is_create_request(request) -> bool:
+        try:
+            parsed = urlparse(request.url)
+            return (request.method == "POST" and parsed.netloc == "creator.douyin.com"
+                    and bool(DOUYIN_CREATE_API_RE.match(parsed.path)))
+        except Exception:
+            return False
+
     def _watch_publish_response(self, page: Page) -> None:
-        """被动监听发布接口回执，记录作品 ID 或平台错误信息；不拦截、不改动请求。"""
+        """被动监听发布接口（不拦截、不改动请求）：记录作品 ID / 平台错误，并告知 PublishGuard 请求状态。"""
 
         async def capture(response) -> None:
+            ok: bool | None = None
             try:
                 body = await response.json()
-            except Exception:
-                return
-            if not isinstance(body, dict):
-                return
-            data = body.get("data") if isinstance(body.get("data"), dict) else {}
-            code = body.get("status_code")
-            item_id = body.get("item_id") or data.get("item_id")
-            if code == 0 and item_id and re.fullmatch(r"[1-9]\d*", str(item_id)):
-                self.published_item_id = str(item_id)
-                douyin_logger.info(_msg("🧾", f"发布接口返回作品 ID: {item_id}"))
-            elif isinstance(code, int) and code != 0:
-                self.publish_api_error = str(body.get("status_msg") or f"status_code={code}")
-                douyin_logger.warning(_msg("😵", f"发布接口返回失败: {self.publish_api_error}"))
-
-        def listener(response) -> None:
-            if not self._publish_clicked:
-                return
-            try:
-                parsed = urlparse(response.url)
-                if (response.request.method != "POST" or parsed.netloc != "creator.douyin.com"
-                        or not DOUYIN_CREATE_API_RE.match(parsed.path)):
+                if not isinstance(body, dict):
                     return
+                data = body.get("data") if isinstance(body.get("data"), dict) else {}
+                code = body.get("status_code")
+                item_id = body.get("item_id") or data.get("item_id")
+                if (200 <= response.status < 300 and code == 0 and item_id
+                        and re.fullmatch(r"[1-9]\d*", str(item_id))):
+                    ok = True
+                    self.published_item_id = str(item_id)
+                    douyin_logger.info(_msg("🧾", f"发布接口返回作品 ID: {item_id}"))
+                elif isinstance(code, int) and not isinstance(code, bool) and code != 0:
+                    ok = False
+                    self.publish_api_error = str(body.get("status_msg") or f"status_code={code}")
+                    douyin_logger.warning(_msg("😵", f"发布接口返回失败: {self.publish_api_error}"))
             except Exception:
+                return
+            finally:
+                self.publish_guard.request_done(ok, self.publish_api_error or "")
+
+        def on_request(request) -> None:
+            if self._publish_clicked and self._is_create_request(request):
+                self.publish_guard.request_sent()
+
+        def on_response(response) -> None:
+            if not self._publish_clicked or not self._is_create_request(response.request):
                 return
             task = asyncio.ensure_future(capture(response))
             self._response_tasks.add(task)
             task.add_done_callback(self._response_tasks.discard)
 
-        page.on("response", listener)
+        def on_failed(request) -> None:
+            if self._publish_clicked and self._is_create_request(request):
+                self.publish_guard.request_done(None)
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("requestfailed", on_failed)
 
     async def _drain_publish_responses(self, timeout: float = 5) -> None:
         if self._response_tasks:
@@ -698,6 +791,7 @@ class DouYinBaseUploader(BaseVideoUploader):
         return "；".join(parts)
 
     SMS_INPUT_SELECTOR = 'input[placeholder*="验证码"], input[type="tel"], input[placeholder*="短信"], input[placeholder*="手机号"]'
+    MAX_SMS_ROUNDS = 3
     # 图文流程（上游未验证过短信弹窗）额外要求出现验证组件的特征，避免把普通输入框误判成短信弹窗
     SMS_DIALOG_MARKERS = ('[class*="uc-ui-verify"]', "text=获取验证码", "text=身份验证", "text=短信验证")
 
@@ -722,7 +816,15 @@ class DouYinBaseUploader(BaseVideoUploader):
             return False
         if strict and not await self._sms_dialog_marked(page):
             return False
-        douyin_logger.warning(_msg("📱", "检测到短信验证码弹窗"))
+        # 提交过验证码后弹窗还在 = 验证码错误/过期；轮数有上限，避免无限循环发短信
+        if self._sms_rounds >= self.MAX_SMS_ROUNDS:
+            shot = await save_screenshot(page, self.hooks, "sms-failed")
+            raise SmsVerifyFailed(
+                f"短信验证已提交 {self._sms_rounds} 次验证码，弹窗仍未消失（验证码错误或已过期）",
+                step="短信验证", after_submit=self._publish_clicked, screenshot=shot,
+            )
+        self._sms_rounds += 1
+        douyin_logger.warning(_msg("📱", f"检测到短信验证码弹窗（第 {self._sms_rounds} 次）"))
         code_file = sau_conf.verify_code_file()
         # 清掉上一次残留的验证码，避免提交过期的验证码
         try:
@@ -735,6 +837,8 @@ class DouYinBaseUploader(BaseVideoUploader):
             douyin_logger.info(_msg("📤", "已点击「获取验证码」，请查看手机短信"))
         code = await self._wait_verify_code(page, code_file)
         await self._submit_sms_verify_code(page, sms_input, code, str(code_file))
+        # 短信验证拦下了上一次「发布」：允许再点一次（与上游一致：验证后继续点发布）
+        self.publish_guard.blocked_by_platform()
         return True
 
     async def _wait_verify_code(self, page: Page, code_file: Path) -> str:
@@ -833,7 +937,9 @@ class DouYinVideo(DouYinBaseUploader):
         if not self.declaration:
             return
         if not await self.set_self_declaration(page, self.declaration):
-            raise RuntimeError(f"自主声明「{self.declaration}」设置失败，拒绝继续发布")
+            # multipub patch: 专门的异常类型，适配器据此提示检查声明文字（上游是 RuntimeError）
+            await save_screenshot(page, self.hooks, "declaration")
+            raise DeclarationFailed(f"自主声明「{self.declaration}」设置失败，拒绝继续发布")
 
     async def _clear_blocking_overlays(self, page: Page) -> None:
         """清除会拦截点击的浮层：填完话题后残留的话题/@提及下拉(publish-mention-wrapper)
@@ -926,6 +1032,18 @@ class DouYinVideo(DouYinBaseUploader):
             self.thumbnail_portrait_path = str(self.validate_image_file(self.thumbnail_portrait_path))
 
     MAX_UPLOAD_RETRIES = 3
+    # multipub patch: 发布循环在基类，这几项保持上游视频流程的行为
+    PUBLISH_CLICK_KWARGS = {"force": True}
+    STRICT_SMS_CHECK = False
+
+    async def _prepare_publish_attempt(self, page: Page) -> None:
+        # 移除会拦截发布按钮点击的新手引导/话题下拉浮层
+        await page.evaluate(
+            "() => { document.querySelectorAll('.shepherd-element, .shepherd-modal-overlay-container, [class*=\"mention-wrapper\"]').forEach(e => e.remove()); }"
+        )
+
+    async def _platform_blocked_publish(self, page: Page) -> bool:
+        return bool(await self.handle_auto_video_cover(page))
 
     async def handle_upload_error(self, page):
         # multipub patch: 重传次数有上限，超过后失败（上游会无限重传）
@@ -1124,21 +1242,21 @@ class DouYinVideo(DouYinBaseUploader):
         )
         context = await set_init_script(context)
         page = None
-        # multipub patch: 出错先截图留证；无论成败都关闭浏览器
+        # multipub patch: 出错先截图留证；无论成败（含被取消）都关闭浏览器；发布成功后的收尾出错不影响结果
         try:
-            page = await context.new_page()
-            await self._upload_video_steps(page)
-            await context.storage_state(path=self.account_file)
-            douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
+            try:
+                page = await context.new_page()
+                await self._upload_video_steps(page)
+            except SauError:
+                raise
+            except Exception:
+                await save_screenshot(page, self.hooks, "error")
+                raise
+            if await save_state_quietly(context, self.account_file):
+                douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
             await asyncio.sleep(2)
-        except SauError:
-            raise
-        except Exception:
-            await save_screenshot(page, self.hooks, "error")
-            raise
         finally:
-            await context.close()
-            await browser.close()
+            await close_quietly(context, browser)
 
     async def _upload_video_steps(self, page: Page) -> None:
         """上游 upload() 的页面步骤（multipub patch: 拆出来以便统一截图/关闭；循环加截止时间）。"""
@@ -1237,40 +1355,8 @@ class DouYinVideo(DouYinBaseUploader):
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
 
-        # multipub patch: 发布循环带截止时间；第一次点击前通知适配器；短信验证移到基类
-        self._watch_publish_response(page)
-        deadline = Deadline(self.hooks.publish_timeout, "等待视频发布成功")
-        while True:
-            if deadline.expired:
-                await fail_step(page, self.hooks, deadline, after_submit=self._publish_clicked,
-                                detail=self._publish_detail())
-            try:
-                # 移除会拦截发布按钮点击的新手引导/话题下拉浮层
-                await page.evaluate(
-                    "() => { document.querySelectorAll('.shepherd-element, .shepherd-modal-overlay-container, [class*=\"mention-wrapper\"]').forEach(e => e.remove()); }"
-                )
-                # 检测并处理短信验证码弹窗；等验证码的时间不计入发布等待
-                if await self._handle_sms_verification(page):
-                    deadline.reset()
-
-                # ── 正常发布流程 ──
-                publish_button = page.get_by_role("button", name="发布", exact=True)
-                if await publish_button.count():
-                    self._before_publish_click()
-                    await publish_button.click(force=True)
-                await page.wait_for_url(
-                    "https://creator.douyin.com/creator-micro/content/manage**",
-                    timeout=3000,
-                )
-                douyin_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
-                break
-            except SauError:
-                raise
-            except Exception:
-                await self.handle_auto_video_cover(page)
-                douyin_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
-                await asyncio.sleep(0.5)
-        await self._drain_publish_responses()
+        # multipub patch: 发布循环抽到基类 _publish_until_success（带截止时间、限制重复点击、短信验证）
+        await self._publish_until_success(page, "视频", "https://creator.douyin.com/creator-micro/content/manage**")
 
     async def douyin_upload_video(self):
         async with async_playwright() as playwright:
@@ -1375,33 +1461,9 @@ class DouYinNote(DouYinBaseUploader):
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
 
-        # multipub patch: 发布循环带截止时间；第一次点击前通知适配器；
-        # 上游图文流程没有处理短信验证（弹窗出现会一直空转），这里复用基类的短信处理
-        self._watch_publish_response(page)
-        deadline = Deadline(self.hooks.publish_timeout, "等待图文发布成功")
-        while True:
-            if deadline.expired:
-                await fail_step(page, self.hooks, deadline, after_submit=self._publish_clicked,
-                                detail=self._publish_detail())
-            try:
-                if await self._handle_sms_verification(page, strict=True):
-                    deadline.reset()
-                publish_button = page.get_by_role("button", name="发布", exact=True)
-                if await publish_button.count():
-                    self._before_publish_click()
-                    await publish_button.click()
-                await page.wait_for_url(
-                    "**/creator-micro/content/manage?enter_from=publish**",
-                    timeout=3000,
-                )
-                douyin_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
-                break
-            except SauError:
-                raise
-            except Exception:
-                douyin_logger.info(_msg("🏃", "小人正在冲刺发布图文"))
-                await asyncio.sleep(0.5)
-        await self._drain_publish_responses()
+        # multipub patch: 发布循环抽到基类 _publish_until_success（带截止时间、限制重复点击）；
+        # 上游图文流程没有处理短信验证（弹窗出现会一直空转），基类循环里会处理（strict 模式）
+        await self._publish_until_success(page, "图文", "**/creator-micro/content/manage?enter_from=publish**")
 
     async def upload(self, playwright: Playwright) -> None:
         douyin_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
@@ -1433,12 +1495,12 @@ class DouYinNote(DouYinBaseUploader):
             await save_screenshot(page, self.hooks, "error")
             raise
         finally:
+            # multipub patch: 收尾（回写 cookie、关浏览器）出错不改变发布结果，也不掩盖原异常
             if upload_success:
-                await context.storage_state(path=self.account_file)
-                douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
+                if await save_state_quietly(context, self.account_file):
+                    douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
                 await asyncio.sleep(2)
-            await context.close()
-            await browser.close()
+            await close_quietly(context, browser)
 
     async def douyin_upload_note(self):
         async with async_playwright() as playwright:

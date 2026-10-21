@@ -136,6 +136,30 @@ def test_wbi_matches_independent_impl_with_special_chars():
     assert signed["keyword"] == params["keyword"]  # 发送的是原值，只在签名时去掉 !'()*
 
 
+def test_wbi_js_semantics():
+    """与网页端 um() 一致：None 跳过；只有字符串去掉 !'()*；对象按 String(obj) 即 "[object Object]" 签名。"""
+    params = {"a": None, "b": True, "obj": {"x": "(1)"}, "s": "x(y)!", "n": 1.0}
+    signed = bh.wbi_sign(params, IMG_KEY, SUB_KEY, wts=1700000000)
+    assert "a" not in signed and signed["obj"] == {"x": "(1)"}
+    expected = independent_wbi({"b": "true", "obj": "[object Object]", "s": "x(y)!", "n": "1",
+                                "wts": 1700000000}, IMG_KEY, SUB_KEY)
+    assert signed["w_rid"] == expected
+    # URL 里对象发 JSON（网页端请求库 JSON.stringify），None 不发
+    assert bh.encode_query({"m": {"k": "v"}, "z": None}) == "m=%7B%22k%22%3A%22v%22%7D"
+
+
+def test_create_dyn_query_shape():
+    dyn_req = bh.build_dyn_req(text="t", title="", pics=[], mid=1, upload_id="1_2_3")
+    query = bh.create_dyn_query("csrf1", (IMG_KEY, SUB_KEY), dyn_req, wts=1700000000)
+    params = dict(urllib.parse.parse_qsl(query))
+    assert params["wts"] == "1700000000" and params["w_dyn_req.upload_id"] == "1_2_3"
+    assert json.loads(params["w_dyn_req.meta"]) == {"app_meta": {"from": "create.dynamic.web", "mobi_app": "web"}}
+    assert {"dm_img_list", "dm_img_str", "dm_cover_img_str", "dm_img_inter"} <= set(params)
+    w_rid = params.pop("w_rid")
+    assert w_rid == independent_wbi({**params, "w_dyn_req.meta": "[object Object]"}, IMG_KEY, SUB_KEY)
+    assert dyn_req["option"] == {"aigc": 2}  # 没有图片时不带 pic_mode
+
+
 def test_wbi_keys_from_nav():
     nav = {"wbi_img": {"img_url": f"https://i0.hdslb.com/bfs/wbi/{IMG_KEY}.png",
                        "sub_url": f"https://i0.hdslb.com/bfs/wbi/{SUB_KEY}.png"}}
@@ -420,7 +444,7 @@ async def test_run_streaming_timeout_kills(tmp_path: Path):
 # ------------------------------------------------------------------ 视频发布（模拟 biliup）
 
 @pytest.fixture
-def video_env(settings, media: Path):
+def video_env(settings, media: Path, fake_bili):
     fake = settings.home / "biliup-fake.exe"
     fake.write_bytes(b"")
     settings.biliup_path = str(fake)
@@ -465,6 +489,8 @@ async def test_publish_video_scheduled(video_env, media: Path, monkeypatch):
     (SUCCESS_LINES[:4] + ["Error: connection reset"], 1, ErrorCode.UNKNOWN_OUTCOME),
     (SUCCESS_LINES[:4] + ['ResponseData { code: 21012, data: None, message: "标签不能为空", ttl: Some(1) }'], 1,
      ErrorCode.PLATFORM_ERROR),
+    (SUCCESS_LINES[:4] + ['ResponseData { code: -504, data: None, message: "服务调用超时", ttl: Some(1) }'], 1,
+     ErrorCode.UNKNOWN_OUTCOME),
     (["uploading..."], None, ErrorCode.TIMEOUT),
     (SUCCESS_LINES[:4], None, ErrorCode.UNKNOWN_OUTCOME),
     (["Error: credential validation failed with Bilibili code -101"], 1, ErrorCode.LOGIN_REQUIRED),
@@ -476,6 +502,28 @@ async def test_publish_video_failures(video_env, media: Path, monkeypatch, lines
         await BilibiliAdapter(ctx).publish(video_post(media))
     assert info.value.code is code
     assert ctx.submit_started
+
+
+async def test_publish_video_token_precheck(video_env, media: Path, monkeypatch, fake_bili):
+    calls: list[Any] = []
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, calls))
+    fake_bili.token_ok = False
+    ctx, _ = make_ctx(video_env)
+    with pytest.raises(LoginRequired, match="令牌已失效"):
+        await BilibiliAdapter(ctx).publish(video_post(media))
+    assert not ctx.submit_started and not calls  # 还没启动 biliup
+    oauth = fake_bili.by_path("/x/passport-login/oauth2/info")[-1]
+    assert oauth.url.params["appkey"] == bh.TV_APPKEY
+
+    # 预检网络不通：不拦，交给 biliup
+    def offline(request):
+        raise httpx.ConnectError("offline")
+    monkeypatch.setattr(bh, "make_client",
+                        functools.partial(bh.make_client.func, transport=httpx.MockTransport(offline)))
+    ctx2, events = make_ctx(video_env)
+    result = await BilibiliAdapter(ctx2).publish(video_post(media))
+    assert result.status is Status.SUBMITTED and calls
+    assert any("交给 biliup" in e.get("message", "") for e in events)
 
 
 async def test_publish_video_through_worker(video_env, media: Path, monkeypatch):
@@ -522,6 +570,7 @@ def test_validate_video_rules(media: Path):
             "platforms.bilibili.submit", "platforms.bilibili.creation_statement"} <= errors_of(issues)
     assert {"body", "platforms.bilibili.unknown_key"} <= warnings_of(issues)
     assert "tags" in errors_of(BilibiliAdapter.validate(video_post(media, tags=[])))
+    assert "tags" in errors_of(BilibiliAdapter.validate(video_post(media, tags=["a,b"])))
     assert "platforms.bilibili.tid" in errors_of(BilibiliAdapter.validate(video_post(media, options={"tid": "abc"})))
     assert not errors_of(BilibiliAdapter.validate(video_post(media, options={"tid": "231"})))
     cover = media / "cover.webp"
@@ -552,6 +601,9 @@ def test_validate_note_rules(media: Path):
     assert {"cover", "platforms.bilibili.tid"} <= warnings_of(issues)
     # 正文 995 字本身不超，但加上 #徒步# #周末# 后超过 1000
     assert "body" not in errors_of(BilibiliAdapter.validate(note_post(media, body="字" * 995, tags=[])))
+    assert "platforms.bilibili.confirm_rules" in errors_of(
+        BilibiliAdapter.validate(note_post(media, options={"confirm_rules": "yes"})))
+    assert not errors_of(BilibiliAdapter.validate(note_post(media, options={"confirm_rules": True})))
     big = media / "images" / "big.png"
     big.write_bytes(b"\0" * (20 * 1024 * 1024 + 1))
     assert "images" in errors_of(BilibiliAdapter.validate(note_post(media, images=[big])))
@@ -577,7 +629,8 @@ def test_note_text_tags():
 
 def test_adapter_module_import_is_cheap():
     code = ("import sys, multipub.platforms.bilibili as m; m.BilibiliAdapter.validate; "
-            "bad=[x for x in ('httpx','patchright','segno') if x in sys.modules]; print(bad); sys.exit(1 if bad else 0)")
+            "bad=[x for x in ('httpx','patchright','segno') if x in sys.modules]; "
+            "print(bad); sys.exit(1 if bad else 0)")
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
@@ -625,7 +678,7 @@ class FakeBili:
             n = sum(1 for r in self.requests if r.url.path == path)
             return httpx.Response(200, json={"code": 0, "data": {
                 "image_url": f"http://i0.hdslb.com/bfs/new_dyn/{n}.jpg", "image_width": 1080,
-                "image_height": 1440, "img_size": 123.4}})
+                "image_height": 1440, "img_size": 123.4, "ai_gen_pic": 0}})
         if path == "/x/dynamic/feed/create/submit_check":
             return httpx.Response(200, json={"code": 0, "data": {}})
         if path == "/x/dynamic/feed/create/dyn":
@@ -685,16 +738,27 @@ async def test_http_note_flow(note_env, media: Path):
 
     create = fake.by_path("/x/dynamic/feed/create/dyn")[0]
     params = dict(create.url.params)
-    assert params["platform"] == "web" and params["csrf"] == "csrf123"
-    w_rid = params.pop("w_rid")
-    assert w_rid == independent_wbi(params, IMG_KEY, SUB_KEY)
     req = json.loads(create.content)["dyn_req"]
+    assert params["platform"] == "web" and params["csrf"] == "csrf123"
+    assert json.loads(params["x-bili-device-req-json"]) == {"platform": "web", "device": "pc", "spmid": "333.1365",
+                                                            "mobi_app": "web_cn"}
+    # 网页端 WBI 中间件的 bodyPayload：body 里的 upload_id / meta 拷进 URL（meta 发 JSON）
+    assert params["w_dyn_req.upload_id"] == req["upload_id"]
+    assert json.loads(params["w_dyn_req.meta"]) == req["meta"]
+    w_rid = params.pop("w_rid")
+    # 浏览器签名时对对象直接 encodeURIComponent(obj)，即 "[object Object]"
+    assert w_rid == independent_wbi({**params, "w_dyn_req.meta": "[object Object]"}, IMG_KEY, SUB_KEY)
     assert req["scene"] == 2 and req["content"]["title"] == "周末徒步"
     assert req["content"]["contents"] == [{"raw_text": "正文第一行\n第二行\n#徒步# #周末#", "type": 1, "biz_id": ""}]
     assert [p["img_src"] for p in req["pics"]] == ["http://i0.hdslb.com/bfs/new_dyn/1.jpg",
                                                    "http://i0.hdslb.com/bfs/new_dyn/2.jpg"]
+    # img_size 与网页端一致：本地文件大小 / 1024（KB），ai_gen_pic 原样带上
+    size_kb = (media / "images" / "1.jpg").stat().st_size / 1024
     assert req["pics"][0] == {"img_src": "http://i0.hdslb.com/bfs/new_dyn/1.jpg", "img_width": 1080,
-                              "img_height": 1440, "img_size": 123.4}
+                              "img_height": 1440, "img_size": size_kb, "ai_gen_pic": 0}
+    check_req = fake.by_path("/x/dynamic/feed/create/submit_check")[0]
+    assert json.loads(check_req.url.params["x-bili-device-req-json"]) == {"platform": "web", "device": "pc",
+                                                                          "spmid": "333.1365"}
     assert req["option"] == {"aigc": 1, "pic_mode": 1, "timer_pub_time": int(when.timestamp())}
     assert req["upload_id"].startswith("10086_")
     assert req["meta"] == {"app_meta": {"from": "create.dynamic.web", "mobi_app": "web"}}
@@ -723,6 +787,9 @@ async def test_http_note_immediate_without_ai(note_env, media: Path):
     (httpx.Response(200, json={"code": -101, "message": "账号未登录"}), LoginRequired, ErrorCode.LOGIN_REQUIRED,
      True),
     (httpx.Response(502, text="<html>bad gateway</html>"), PublishError, ErrorCode.UNKNOWN_OUTCOME, True),
+    (httpx.Response(200, json={"code": -504, "message": "服务调用超时"}), PublishError, ErrorCode.UNKNOWN_OUTCOME,
+     True),
+    (httpx.Response(200, json=[1, 2]), PublishError, ErrorCode.UNKNOWN_OUTCOME, True),
 ])
 async def test_http_note_create_errors(note_env, media: Path, response, exc, code, started):
     ctx, _, fake = note_env
@@ -920,6 +987,185 @@ async def test_browser_net_tracker_and_result_mapping(settings):
     with pytest.raises(PublishError) as info:
         pub._parse_created({"code": 12345, "message": "内容违规"})
     assert info.value.code is ErrorCode.PLATFORM_ERROR
+    with pytest.raises(PublishError) as info:
+        pub._parse_created({"code": -504, "message": "服务调用超时"})
+    assert info.value.code is ErrorCode.UNKNOWN_OUTCOME
+
+
+class _FakeLocator:
+    def __init__(self, page: "_FakePage", key: str):
+        self.page, self.key = page, key
+
+    @property
+    def first(self):
+        return self
+
+    def locator(self, sel: str, has_text: str | None = None):
+        return _FakeLocator(self.page, f"{self.key} {sel}" + (f"[{has_text}]" if has_text else ""))
+
+    def get_by_text(self, text: str, exact: bool = False):
+        return _FakeLocator(self.page, f"{self.key} text={text}")
+
+    async def is_visible(self) -> bool:
+        return self.page.is_visible(self.key)
+
+    async def count(self) -> int:
+        return int(self.page.is_visible(self.key))
+
+    async def click(self, timeout: float | None = None) -> None:
+        self.page.clicks.append(self.key)
+        self.page.on_click(self.key)
+
+
+class _FakeContext:
+    def __init__(self, cookies: list[dict]):
+        self._cookies = cookies
+
+    async def cookies(self, urls=None):
+        return list(self._cookies)
+
+
+class _FakePage:
+    """只模拟 bili_note 用到的那点 Page API：可见元素集合、点击回调、cookie。"""
+
+    def __init__(self, visible: set[str] | None = None, cookies: list[dict] | None = None):
+        self.visible = set(visible or ())
+        self.clicks: list[str] = []
+        self.context = _FakeContext(cookies or [])
+        self.url = "https://t.bilibili.com/"
+        self.on_click = lambda key: None
+        self.ticks = 0
+        self.on_tick = lambda page: None
+
+    def locator(self, sel: str, has_text: str | None = None):
+        if sel == ".bili-dyn-specification-popup":  # 每次轮询都会查一次弹窗：借此推进"时间"
+            self.ticks += 1
+            self.on_tick(self)
+        return _FakeLocator(self, sel + (f"[{has_text}]" if has_text else ""))
+
+    def is_visible(self, key: str) -> bool:
+        return key in self.visible
+
+    async def goto(self, url: str, **kw) -> None:
+        self.url = url
+
+
+SPEC_BTN = ".bili-dyn-specification-popup .bili-dyn-specification-popup__btn[确认并发送]"
+
+
+@pytest.fixture
+def fast_note(monkeypatch):
+    from multipub.platforms import bili_note as bn
+
+    monkeypatch.setattr(bn, "POLL_SECONDS", 0)
+    monkeypatch.setattr(bn, "SPEC_CANCEL_GRACE", 0)
+    return bn
+
+
+async def test_spec_popup_confirmed_with_consent(settings, fast_note):
+    ctx, events = make_ctx(settings)
+    pub = fast_note.BrowserNotePublisher(ctx, account="main", spec_consent=True)
+    page = _FakePage(visible={".bili-dyn-specification-popup", SPEC_BTN})
+
+    def clicked(key):
+        assert key == SPEC_BTN
+        page.visible.clear()
+        pub.net.check_sent = pub.net.create_sent = True
+        pub.net.created = {"code": 0, "data": {"dyn_id_str": "777"}}
+
+    page.on_click = clicked
+    data = await pub._wait_created(page, spec_pending=True)
+    assert data["dyn_id_str"] == "777" and page.clicks == [SPEC_BTN]
+    assert any("confirm_dynamic_rules" in e.get("message", "") for e in events)
+
+
+async def test_spec_popup_human_click_is_remembered(settings, fast_note):
+    ctx, events = make_ctx(settings)
+    ctx.headless = False
+    marker = settings.accounts_dir / "bilibili" / "main.dy_spec_agreed"
+    pub = fast_note.BrowserNotePublisher(ctx, account="main", spec_marker=marker)
+    page = _FakePage(visible={".bili-dyn-specification-popup", SPEC_BTN})
+
+    def tick(p):
+        if p.ticks == 3:  # 用户在第 3 次轮询前点了确认
+            p.visible.clear()
+            pub.net.check_sent = pub.net.create_sent = True
+            pub.net.created = {"code": 0, "data": {"dyn_id_str": "888"}}
+
+    page.on_tick = tick
+    data = await pub._wait_created(page, spec_pending=True)
+    assert data["dyn_id_str"] == "888" and not page.clicks  # 没有代点
+    assert marker.is_file()
+    assert any("确认并发送" in e.get("message", "") for e in events)
+
+
+async def test_spec_popup_cancelled_means_not_sent(settings, fast_note):
+    ctx, _ = make_ctx(settings)
+    ctx.headless = False
+    pub = fast_note.BrowserNotePublisher(ctx, account="main")
+    page = _FakePage(visible={".bili-dyn-specification-popup"})
+    page.on_tick = lambda p: p.visible.clear() if p.ticks >= 2 else None
+    with pytest.raises(PublishError, match="没有发出") as info:
+        await pub._wait_created(page, spec_pending=True)
+    assert info.value.code is ErrorCode.PLATFORM_ERROR
+
+
+async def test_spec_needs_consent_in_headless_before_submit(settings, fast_note):
+    ctx, _ = make_ctx(settings)
+    pub = fast_note.BrowserNotePublisher(ctx, account="main")
+    page = _FakePage(visible={".bili-dyn-publishing"})
+    with pytest.raises(NeedsAction, match="confirm_dynamic_rules") as info:
+        await pub._run(page, title="t", text="x", images=[], timer_pub_time=None, aigc=False, pic_mode=None)
+    assert not ctx.submit_started and info.value.code is ErrorCode.VALIDATION
+    # 已同意（cookie 为 1）就不拦
+    agreed = _FakePage(visible={".bili-dyn-publishing"}, cookies=[{"name": "dy_spec_agreed", "value": "1"}])
+    assert await pub._spec_agreed(agreed)
+    assert not await pub._spec_agreed(page)
+
+
+def test_with_spec_cookie():
+    from multipub.platforms.bili_note import with_spec_cookie
+
+    state = {"cookies": [{"name": "SESSDATA", "value": "s"}, {"name": "dy_spec_agreed", "value": "0"}], "origins": []}
+    out = with_spec_cookie(state)
+    spec = [c for c in out["cookies"] if c["name"] == "dy_spec_agreed"]
+    assert len(spec) == 1 and spec[0]["value"] == "1" and spec[0]["domain"] == ".bilibili.com"
+    assert spec[0]["expires"] > time.time() + 300 * 86400 and out["origins"] == []
+    assert state["cookies"][1]["value"] == "0"  # 不改原对象
+
+
+async def test_note_consent_wiring(note_env, media: Path, monkeypatch):
+    """浏览器模式：配置 / 清单 / 记录文件 三种同意来源都会传给发布器。"""
+    from multipub.platforms import bili_note as bn
+
+    ctx, _, _ = note_env
+    seen: list[tuple[bool, Path]] = []
+
+    class StubPublisher:
+        def __init__(self, ctx, *, account, spec_consent=False, spec_marker=None):
+            seen.append((spec_consent, spec_marker))
+
+        async def publish(self, **kw):
+            assert any(c["name"] == "buvid3" for c in kw["storage_state"]["cookies"])
+            return {"dyn_id_str": "42"}
+
+    monkeypatch.setattr(bn, "BrowserNotePublisher", StubPublisher)
+    adapter = BilibiliAdapter(ctx)
+    marker = ctx.account_file.with_name("main.dy_spec_agreed")
+    result = await adapter.publish(note_post(media))
+    assert result.status is Status.PUBLISHED and result.url.endswith("/opus/42")
+    assert seen[-1] == (False, marker)
+    await adapter.publish(note_post(media, options={"confirm_rules": True}))
+    assert seen[-1][0] is True
+    ctx.settings.raw = {"platforms": {"bilibili": {"confirm_dynamic_rules": True}}}
+    await adapter.publish(note_post(media))
+    assert seen[-1][0] is True
+    await adapter.publish(note_post(media, options={"confirm_rules": False}))  # 清单明确 false 优先
+    assert seen[-1][0] is False
+    ctx.settings.raw = {}
+    marker.write_text("x", encoding="utf-8")
+    await adapter.publish(note_post(media))
+    assert seen[-1][0] is True
 
 
 def test_registry_and_doctor(settings):

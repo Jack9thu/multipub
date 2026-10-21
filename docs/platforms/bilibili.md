@@ -64,6 +64,7 @@ platforms:
 | `mode` | `browser` | `browser`：浏览器在 t.bilibili.com 发布框里发（推荐）；`http`：直接调 Web 接口（实验性，见下） |
 | `pic_mode` | 0 | 0 九宫格（图在正文下方）/ 1 大封面（图在正文上方） |
 | `tags_in_text` | `true` | 把 `tags` 以 `#标签#`（B站话题写法）追加到正文末尾；正文里已经有的不重复加 |
+| `confirm_rules` | 不写 | `true`：本条动态允许 multipub 代为确认《动态发布规范》弹窗（见下文「动态发布规范」）；`false`：本条不代为确认（优先于 config.toml 和确认记录）；不写则看 config.toml / 确认记录 |
 
 `cover` 对动态无效（warning 后忽略）。
 
@@ -75,6 +76,7 @@ platforms:
 | `biliup_path` | 空 | 指定已有的 biliup 可执行文件，优先于自动安装；`mpub setup` 不会动它 |
 | `github_mirror`（全局） | 空 | 下载 biliup 时拼在 GitHub URL 前，例如 `https://ghfast.top/` |
 | `[timeouts] publish_video` | 3600 | 单次视频发布总超时；biliup 会在此值 − 60 秒时被杀掉 |
+| `confirm_dynamic_rules` | `false` | `true`：阅读过 [《动态发布规范》](https://t.bilibili.com/h5/dynamic/specification) 后，允许 multipub 在浏览器模式里代为确认该弹窗（对所有账号生效） |
 
 ## biliup 的安装与校验（`mpub setup` / `mpub doctor`）
 
@@ -87,7 +89,7 @@ platforms:
   | Linux x86_64 / aarch64 / armv7 | `biliupR-v1.3.1-{x86_64,aarch64,arm}-linux.tar.xz` |
   | macOS Intel / Apple Silicon | `biliupR-v1.3.1-{x86_64,aarch64}-macos.tar.xz` |
 
-- **sha256**：v1.3.1 七个发布包的 sha256 已内置（2026-10-20 两次独立下载核对），不一致直接删除、拒绝安装。
+- **sha256**：v1.3.1 七个发布包的 sha256 已内置（2026-10-20 两次独立下载核对；这七个文件名在 `releases/download/v1.3.1/` 下都存在，没有 Windows ARM64 / 32 位包），不一致直接删除、拒绝安装。
   其他版本是 **trust-on-first-use**：首次下载时记录，不做比对。记录写在二进制旁边：
   `install.json`（版本、URL、压缩包 sha256、二进制 sha256、`verified: pinned|tofu`）和 `<压缩包名>.sha256`。
   请自行与 GitHub 发布页核对 TOFU 的值。
@@ -112,7 +114,7 @@ platforms:
 |---|---|---|
 | 视频标题 | 必填，≤80 字 | error |
 | 视频简介 | ≤2000 字；为空时用标题代替 | error / warning |
-| 视频标签 | 至少 1 个、最多 12 个，每个 ≤20 字 | error |
+| 视频标签 | 至少 1 个、最多 12 个，每个 ≤20 字，不能含逗号（biliup `--tag` 用逗号分隔） | error |
 | `tid` | 必填，1–65535 的整数（也接受数字字符串） | error |
 | `copyright` / `source` | 只能 1 或 2；2 必须有 `source` | error |
 | `creation_statement` | -1/1/2/3/4 | error |
@@ -126,6 +128,7 @@ platforms:
 | 动态图片 | ≤9 张（至少 1 张由通用检查保证）；jpg/jpeg/png/gif；单张 ≤20MB | error |
 | 动态定时 | 晚于现在 ≥5 分钟、≤7 天（发布器日期控件的范围）；不足 10 分钟给 warning | error / warning |
 | `mode` / `pic_mode` | `browser`/`http`；0/1 | error |
+| `confirm_rules` / `tags_in_text` | 必须是 true/false | error |
 | 未知的 `platforms.bilibili.*` 参数 | 列出支持的参数 | warning |
 
 `publish()` 开始时会再跑一遍 validate（定时窗口可能在等待期间过期）。
@@ -142,7 +145,10 @@ mpub login bilibili --account main
   二维码 3 分钟过期，过期自动刷新（最多 3 次）；整体等待上限为 `[timeouts] login` − 45 秒（默认 255 秒）。
   不需要终端、不需要浏览器，所以能在 Claude Code 里直接跑（`interactive_login = False`）。
 - **为什么不用浏览器登录**：biliup 上传前会用 `token_info.access_token` 调 `oauth2/info` 校验并按需刷新，
-  `LoginInfo` 里 `token_info` 是必填字段。网页登录只有 cookie、没有 token，biliup 读不了。
+  `LoginInfo` 里 `token_info` 是必填字段，投稿（默认 APP 接口 `x/vu/app/add`）也用 `access_key` 签名。网页登录只有 cookie、
+  没有 token，biliup 读不了。biliup 自己的「网页Cookie登录」其实也是拿 SESSDATA + bili_jct 去确认一张 TV 二维码
+  （`x/passport-tv-login/h5/qrcode/confirm`）换 TV token——既然最终都要 TV token，直接让用户扫 TV 码最简单。
+  另外按 v1.3.1 源码，biliup 的扫码登录轮询遇到 86090（已扫未确认）会直接报错退出；我们的实现会继续等待确认。
 - 结果写成 biliup 的 `cookies.json` 格式：`<数据目录>/accounts/bilibili/<账号>.json`
   （`cookie_info` / `sso` / `token_info` / `platform: "BiliTV"`），UTF-8 **无 BOM**（biliup 的 serde_json 不认 BOM）、
   原子替换、POSIX 下权限 600。视频（biliup `-u`）和图文（内存里转成浏览器 cookie）共用这一份。
@@ -183,6 +189,8 @@ mpub login bilibili --account main
 ### 视频
 
 1. 再次 validate；确认登录文件有 `token_info`、找到 biliup（否则 `internal`：先 `mpub setup`）。
+   再做一次与 biliup 相同的只读令牌校验（`oauth2/info`）：令牌失效 → 启动 biliup **之前**就返回 `login_required`；
+   网络错误 / 风控只记警告，交给 biliup 自己校验。
 2. 拼命令：`biliup --rust-log info -u <登录文件> upload --title=… --desc=… --tid=… --tag=… --copyright=… [...] -- <视频>`。
    全局参数写在子命令前；字符串参数都用 `--opt=value` 形式，避免以 `-` 开头的标题被当成参数；`--` 之后才是视频路径。
    设置 `NO_COLOR=1`，输出里残留的 ANSI 码也会被剥掉。
@@ -197,6 +205,7 @@ mpub login bilibili --account main
 | 投稿成功（看到 code 0 的响应或「投稿成功」） | `submitted`（有定时则 `scheduled`） | `https://www.bilibili.com/video/<BV>`（取不到 BV 时用 `av<aid>`）；审核通过前页面可能显示审核中 |
 | biliup 退出码 0 但没解析到结果 | `submitted` | 无链接，提示去创作中心确认 |
 | 投稿接口明确拒绝（`ResponseData { code: 非0 … }`） | `failed` / `platform_error` | 带 B站的 code 和 message |
+| 投稿接口返回服务端错误码 -500/-502/-503/-504 | `failed` / `unknown_outcome` | 稿件可能已建好，先去创作中心确认 |
 | 视频已传完（看到 `Upload completed` / `All files uploaded successfully`）后失败或超时 | `failed` / `unknown_outcome` | 先去创作中心确认，不要重发 |
 | 上传阶段失败 / 超时（还没传完） | `failed` / `platform_error` 或 `timeout` | 尚未投稿；因为已标记 submit_started，重发需要 `--force` |
 | 输出里是登录错误（`credential validation failed`、`账号未登录` 等）且没传完 | `needs_action` / `login_required` | 重新登录 |
@@ -212,6 +221,7 @@ mpub login bilibili --account main
 **浏览器模式（默认）**：patchright 打开 `https://t.bilibili.com/`（`--headed` 可看到窗口）：
 
 1. 等 `.bili-dyn-publishing`；被重定向到 passport 或看到登录按钮 → `login_required`。
+   接着检查《动态发布规范》的同意状态（见下文），无头且未同意时在这一步就停下。
 2. 标题填 `input.bili-dyn-publishing__title__input` 并回读校验；正文点击 `.bili-dyn-publishing__input [contenteditable]`
    后逐行 `insert_text`（行间按 Enter），回读首行校验。
 3. 点图片工具 `.bili-dyn-publishing__tools__item.pic`，点 `.bili-pics-uploader__add` 触发文件选择框
@@ -227,20 +237,44 @@ mpub login bilibili --account main
    create/dyn `code 0` → `data.dyn_id_str`；submit_check 非 0 → 明确失败（发布请求未发出）；
    出现极验验证码 → `needs_action`（`captcha`）。失败时截图 `bilibili-note-error.png`，成功后截图 `bilibili-note-done.png`。
 
+#### 动态发布规范（确认弹窗）
+
+发布器脚本里，**立即发布**前会检查 cookie `dy_spec_agreed`（`.bilibili.com`，网页端同意后写入，有效期一年）：
+不是 `1` 就弹出 `.bili-dyn-specification-popup`（内嵌 `https://t.bilibili.com/h5/dynamic/specification`），
+点「确认并发送」才会发出请求，点「取消」则不发。multipub 每次都用新的浏览器上下文（cookie 来自 biliup 登录文件，
+不回写），所以**每次都会遇到这个弹窗**。这相当于替你同意一份平台规范，multipub 不会擅自代点：
+
+- 已同意：config.toml `[platforms.bilibili] confirm_dynamic_rules = true`，或清单 `platforms.bilibili.confirm_rules: true`，
+  或之前在有头模式里亲手点过确认（记录在 `<数据目录>/accounts/bilibili/<账号>.dy_spec_agreed`，删除即撤销）。
+  此时浏览器上下文直接带上 `dy_spec_agreed=1`，不再弹窗；万一仍弹出，则代为点击「确认并发送」并写日志。
+- 未同意、无头（默认）：打开发布框、**传图之前**就返回 `needs_action`（`error_code: validation`），提示上面两种做法；
+  此时没有标记 submit_started，什么都没发。
+- 未同意、`--headed`：照常填写并点击发布，弹窗出现后等你在窗口里点（最多 180 秒）；你确认并发出后写入上面的记录文件。
+  你点了取消（弹窗关闭 8 秒内没有发布请求）或超时 → `failed`，消息写明「动态没有发出」。
+- 定时发布走发布器的另一条分支，不会弹这个框；HTTP 模式没有这个弹窗。
+- 清单里写 `confirm_rules: false` 时，本条忽略 config.toml 和确认记录，按「未同意」处理。
+
 **HTTP 模式（`mode: http`，实验性）**：
 
 1. nav 取 `mid` 和 WBI 密钥（`wbi_img.img_url` / `sub_url` 文件名）。
 2. 每张图 `POST /x/dynamic/feed/draw/upload_bfs`（multipart：`file_up`、`biz=dyn`、`category=daily`、`csrf=bili_jct`）。
 3. `POST /x/dynamic/feed/create/submit_check?csrf=…`（与网页端一致的预检查）。
-4. **`mark_submit_started()`**，然后 `POST /x/dynamic/feed/create/dyn?platform=web&csrf=…&dm_img_*…&wts=…&w_rid=…`，
+4. **`mark_submit_started()`**，然后 `POST /x/dynamic/feed/create/dyn?platform=web&csrf=…&x-bili-device-req-json=…&dm_img_*…&w_dyn_req.upload_id=…&w_dyn_req.meta=…&wts=…&w_rid=…`，
    JSON：`{"dyn_req": {"content": {"contents": [{"raw_text": 正文, "type": 1, "biz_id": ""}], "title": 标题},
-   "pics": [{img_src, img_width, img_height, img_size}], "scene": 2, "upload_id": "<mid>_<秒>_<0-9999>",
+   "pics": [{img_src, img_width, img_height, img_size, ai_gen_pic}], "scene": 2, "upload_id": "<mid>_<秒>_<0-9999>",
    "meta": {"app_meta": {"from": "create.dynamic.web", "mobi_app": "web"}},
    "option": {"aigc": 1|2, "pic_mode": 0|1, "timer_pub_time": 秒（定时才有）}}}`。
-5. WBI 签名自己实现：`img_key+sub_key` 按固定 64 位表重排取前 32 位为 mixin_key；参数加 `wts` 后按键排序，
-   值去掉 `!'()*`，按 encodeURIComponent 规则编码（空格是 `%20`），`w_rid = md5(query + mixin_key)`。
-   测试用 WBI 文档里的示例向量（mixin_key `ea1db124…`、w_rid `8f6f2b5b…`）校验。
-6. 网页端还会带 `b_wet`（WASM 生成的环境令牌）、`x-bili-device-req-json`、`w_webid` 等，这里无法提供，
+   与网页端一致：`img_size` 是本地文件大小 / 1024（KB，浮点），`ai_gen_pic` 取 upload_bfs 的返回值。
+5. URL 参数照网页端 create/dyn 的中间件链拼：METADATA 的
+   `x-bili-device-req-json={"platform":"web","device":"pc","spmid":"333.1365","mobi_app":"web_cn"}`（submit_check 也带，不含 mobi_app）；
+   RISK_USER_LOG 的 `dm_img_list=[]`、`dm_img_inter`（无鼠标轨迹）和固定的 `dm_img_str`/`dm_cover_img_str`；
+   WBI 中间件的 `bodyPayload`：把 body 里的 `upload_id`、`meta` 以 `w_dyn_req.` 前缀拷进 URL 一起签名。
+6. WBI 签名自己实现（照网页端 `um()`）：`img_key+sub_key` 按固定 64 位表重排取前 32 位为 mixin_key；参数加 `wts` 后按键排序，
+   跳过空值，**只对字符串**去掉 `!'()*`，按 encodeURIComponent 规则编码（空格是 `%20`），`w_rid = md5(query + mixin_key)`。
+   网页端对对象参数直接 `encodeURIComponent(obj)`，所以 `w_dyn_req.meta` 按 `"[object Object]"` 参与签名，
+   URL 里发送的却是 JSON（请求库 `JSON.stringify`）——这里照做。测试用 WBI 文档的示例向量（mixin_key `ea1db124…`、
+   w_rid `8f6f2b5b…`）和一个独立的直白实现交叉校验。
+7. 网页端还会带 `b_wet`（WASM 生成的环境令牌）和 `x-bili-locale-json`，这里无法提供，
    所以可能被风控。HTTP 412 或 `code -352` → `needs_action`（`risk_control`），提示改用浏览器模式。
 
 | 情况 | 状态 | URL / 说明 |
@@ -249,8 +283,9 @@ mpub login bilibili --account main
 | `code 4126021` | `failed` / `platform_error` | 账号没绑定手机，不能发动态 |
 | `code -101` / `-111` | `needs_action` / `login_required` | 重新登录 |
 | 412 / `-352` | `needs_action` / `risk_control` | 浏览器模式里出现时，请先到动态页确认再用 `--headed` 重试 |
-| 发布请求网络错误 / 非 JSON / 60 秒无结果 / 成功但没有 id | `failed` / `unknown_outcome` | 先到动态页确认，不要直接重发 |
+| 发布请求网络错误 / 非 JSON / 服务端错误码 -500/-502/-503/-504 / 60 秒无结果 / 成功但没有 id | `failed` / `unknown_outcome` | 先到动态页确认，不要直接重发 |
 | 传图失败、submit_check 不通过 | `failed` / `platform_error` | 发布请求没有发出 |
+| 浏览器模式未同意《动态发布规范》（无头） | `needs_action` / `validation` | 发布前就停下，什么都没发；见「动态发布规范」 |
 
 ## 已知风险
 
@@ -288,12 +323,16 @@ mpub login bilibili --account main
 | 定时 / AI 声明 / 排版 | 主 world 里改 Vue 组件状态：`tools.timingSetting{visible,active,data.datetime}`、`creationOption{list,value}`、`picModeOption.value` | 中低 |
 | 发布结果 | 监听 `/x/dynamic/feed/create/dyn` 响应 `data.dyn_id_str`；`/create/submit_check` 预检查 | 中高 |
 | 验证码检测 | `.geetest_panel`、`.geetest_box`、`iframe[src*='geetest']`、`.bili-mini-mask` | 低 |
+| 动态发布规范弹窗 | cookie `dy_spec_agreed=1` 时不弹（发布器 `_checkSpecification` 源码）；弹窗 `.bili-dyn-specification-popup`、按钮 `.bili-dyn-specification-popup__btn` 文本「确认并发送」；定时发布不弹 | 高（逻辑）/ 中（选择器） |
+| HTTP 模式附加参数 | `x-bili-device-req-json`（spmid 取自页面 `<meta name="spm_prefix" content="333.1365">`）、`w_dyn_req.upload_id` / `w_dyn_req.meta` 及其签名方式（来自发布器中间件源码） | 中 |
 | 登录入口检测 | `.header-login-entry`、`.bili-header .login-btn` | 低 |
 | HTTP 模式各接口字段 | `upload_bfs`（`file_up`/`biz`/`category`/`csrf`）、`create/dyn` 的 `dyn_req` 结构、错误码 4126021 / -101 / -352 | 高（字段）/ 低（能否通过风控） |
 | 动态链接格式 | `https://www.bilibili.com/opus/<dyn_id_str>` | 高 |
 
 ## 需要的核心改动（未做，待合入）
 
+- `models.ErrorCode` 增加 `CONSENT_REQUIRED = "consent_required"`（需要用户本人同意平台规则/协议）。目前「动态发布规范」未同意时
+  用 `needs_action` + `validation` 代替，避免被误读成登录过期或验证码。
 - `mpub login bilibili --interactive`：在 CLI 里提供调用 `run_interactive_login()` 的入口（biliup 交互式登录兜底）。
 - 把 worker 的 `timeout` 放进 `JobContext`，让 biliup 的内部超时跟随 `mpub publish --timeout`（目前只跟随 `[timeouts] publish_video`；
   `--timeout` 更短时由 worker 取消协程，biliup 进程同样会被杀掉）。

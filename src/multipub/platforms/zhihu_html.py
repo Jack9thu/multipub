@@ -30,12 +30,13 @@ TABLE_ATTRS = ('data-draft-node="block" data-draft-type="table" data-size="norma
                'data-row-style="normal"')
 EQUATION_URL = "//www.zhihu.com/equation?tex="
 
-_BREAK = ""  # 段内换行占位符（私有区字符，正文里不会出现）
+_BREAK = "\ue000"  # 段内换行占位符（私有区字符，正文里不会出现）
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
-_FRONT_MATTER_RE = re.compile(r"\A﻿?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
+_FRONT_MATTER_RE = re.compile(r"\A\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
 _URL_RE = re.compile(r"https?://[^\s<>()\]]+")
 _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((https?://[^\s)]+)[^)]*\)")
 _UNSAFE_SCHEMES = ("javascript:", "vbscript:", "data:")
+_RAW_IMG_RE = re.compile(r"""<img\b[^>]*?\bsrc\s*=\s*["']?([^"'\s>]+)""", re.I)
 
 
 @dataclass
@@ -84,6 +85,18 @@ def collect_image_urls(markdown: str) -> list[str]:
             url = str((tok.get("attrs") or {}).get("url") or "")
             if url and url not in out:
                 out.append(url)
+    return out
+
+
+def raw_html_images(markdown: str) -> list[str]:
+    """正文里原始 HTML <img> 标签的地址（不会被上传，只用于 validate 警告）。代码块里的不算。"""
+    tokens, _ = _parse(markdown)
+    out: list[str] = []
+    for tok in _walk(tokens):
+        if tok.get("type") in ("block_html", "inline_html"):
+            for url in _RAW_IMG_RE.findall(str(tok.get("raw") or "")):
+                if url not in out:
+                    out.append(url)
     return out
 
 
@@ -280,6 +293,8 @@ class _Renderer:
         return _text(raw)
 
     def image(self, url: str, alt: str) -> str:
+        if not url.strip():  # ![]() 空图片：丢掉
+            return ""
         img = self.images.get(url)
         if img is not None:
             return article_img(img, alt)

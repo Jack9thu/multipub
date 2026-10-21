@@ -87,9 +87,32 @@ class FakeLocator:
         if not self.page.visible.get(self.key):
             raise RuntimeError(f"找不到元素 {self.key}")
         self.page.clicks.append(self.key)
+        hook = self.page.on_click.get(self.key)
+        if hook is not None:
+            hook(self.page)
 
     async def fill(self, value: str, **_: Any) -> None:
         self.page.filled[self.key] = value
+
+    async def wait_for(self, state: str = "visible", timeout: float | None = None) -> None:
+        if not self.page.visible.get(self.key):
+            raise RuntimeError(f"等不到元素 {self.key}")
+
+    async def get_attribute(self, name: str) -> None:
+        return None
+
+
+class FakeRequest:
+    def __init__(self, url: str, method: str = "POST"):
+        self.url, self.method = url, method
+
+
+class FakeResponse:
+    def __init__(self, request: FakeRequest, body: Any, status: int = 200):
+        self.request, self.url, self.body, self.status = request, request.url, body, status
+
+    async def json(self) -> Any:
+        return self.body
 
 
 class FakeKeyboard:
@@ -106,17 +129,39 @@ class FakePage:
     def __init__(self, visible: dict[str, bool] | None = None, success_after_click: str | None = None):
         self.visible = dict(visible or {})
         self.success_after_click = success_after_click
+        self.succeeded = False  # 由 on_click 回调置位，模拟页面跳到成功页
+        self.on_click: dict[str, Any] = {}
+        self.listeners: dict[str, list[Any]] = {}
         self.clicks: list[str] = []
         self.filled: dict[str, str] = {}
         self.keyboard = FakeKeyboard()
+        self.url = "https://creator.example/publish"
 
     def get_by_text(self, text: str, exact: bool = False) -> FakeLocator:
         return FakeLocator(self, f"text={text}")
 
+    def get_by_role(self, role: str, name: str = "", exact: bool = False) -> FakeLocator:
+        return FakeLocator(self, f"role={role}:{name}")
+
     def locator(self, selector: str) -> FakeLocator:
         return FakeLocator(self, selector)
 
+    def on(self, event: str, callback: Any) -> None:
+        self.listeners.setdefault(event, []).append(callback)
+
+    def emit(self, event: str, arg: Any) -> None:
+        for callback in self.listeners.get(event, []):
+            callback(arg)
+
+    async def evaluate(self, *args: Any) -> None:
+        return None
+
+    async def wait_for_load_state(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
     async def wait_for_url(self, url: str, timeout: float | None = None) -> None:
+        if self.succeeded:
+            return
         if self.success_after_click is None or self.success_after_click not in self.clicks:
             raise RuntimeError("wait_for_url timeout")
 
@@ -225,6 +270,10 @@ def test_vendored_source_invariants():
     # c. 来源转载只在 apply_declarations 里有条件调用
     assert xhs_src.count("await self.check_original_declaration(page)") == 1
     assert "if self.repost_source:\n            await self.check_original_declaration(page)" in xhs_src
+    # d. 最终发布按钮只经 _click_publish（PublishGuard）点击
+    for src in (dy_src, xhs_src):
+        assert "publish_button.click(" not in src
+        assert src.count("await self._click_publish(publish_button") >= 1
     for path in _vendored_py():
         src = path.read_text(encoding="utf-8")
         # d. 每个 while True 都有对应的 Deadline
@@ -357,6 +406,244 @@ async def test_xhs_publish_loop_marks_submit_and_is_bounded(sau, tmp_path: Path)
     assert not info.value.after_submit and clicked == []
 
 
+# ------------------------------------------------------------------ 防重复点击「发布」
+
+DY_CREATE = "https://creator.douyin.com/web/api/media/aweme/create_v2/?read_aid=2906"
+XHS_CREATE = "https://edith.xiaohongshu.com/web_api/sns/v2/note"
+DY_PUBLISH = "role=button:发布"
+XHS_PUBLISH = 'button:has-text("发布")'
+
+
+def test_publish_guard_rules():
+    from multipub._sau.runtime import PublishGuard
+
+    now = [100.0]
+    g = PublishGuard(reclick_gap=20, max_clicks=3, clock=lambda: now[0])
+    assert g.may_click()
+    g.clicked()
+    assert not g.may_click()  # 刚点过
+    now[0] += 21
+    assert g.may_click()  # 没有任何请求、超过间隔：上次点击没生效
+    g.request_sent()
+    now[0] += 100
+    assert not g.may_click()  # 请求已发出：只等结果
+    g.request_done(None)
+    assert not g.may_click()  # 结果不明也不再点
+    g.blocked_by_platform()
+    assert g.may_click()  # 平台弹窗拦下了：允许再点一次
+    g.clicked()
+    g.click_returned()
+    assert not g.may_click()
+    g.blocked_by_platform()
+    g.clicked()
+    assert g.clicks == 3 and not g.may_click()  # 次数上限
+    g.blocked_by_platform()
+    assert not g.may_click()
+
+    ok = PublishGuard(clock=lambda: now[0])
+    ok.clicked()
+    ok.request_sent()
+    ok.request_done(True)
+    ok.blocked_by_platform()
+    assert ok.succeeded and not ok.may_click()  # 拿到成功回执后绝不再点
+
+    bad = PublishGuard(clock=lambda: now[0])
+    bad.clicked()
+    bad.request_sent()
+    bad.request_done(False, "标题违规")
+    assert bad.rejection_settled(15) is None  # 宽限期内（可能马上弹短信验证）
+    now[0] += 16
+    assert bad.rejection_settled(15) == "标题违规"
+    bad.blocked_by_platform()  # 弹出了验证：之前的失败不算数
+    assert bad.rejection_settled(0) is None
+
+
+def _fast_hooks(tmp_path: Path, **kw: Any):
+    from multipub._sau.runtime import Hooks
+
+    base = dict(publish_timeout=1.2, reclick_gap=0, reject_grace=0, evidence_dir=tmp_path,
+                sms_timeout=2, poll_interval=0.01, platform="douyin")
+    base.update(kw)
+    return Hooks(**base)
+
+
+async def test_douyin_no_reclick_while_create_request_in_flight(sau, tmp_path: Path):
+    _, dy, _ = sau
+    from multipub._sau.runtime import StepTimeout
+
+    marked: list[int] = []
+    note = dy.DouYinNote(["1.jpg"], "正文", [], 0, "x.json", title="标题",
+                         hooks=_fast_hooks(tmp_path, before_publish_click=lambda: marked.append(1)))
+    page = FakePage({DY_PUBLISH: True})
+    page.on_click[DY_PUBLISH] = lambda p: p.emit("request", FakeRequest(DY_CREATE))  # 请求发出后一直没回
+    with pytest.raises(StepTimeout) as info:
+        await note._publish_until_success(page, "图文", "**/manage**")
+    assert page.clicks.count(DY_PUBLISH) == 1 and marked == [1]
+    assert info.value.after_submit and info.value.screenshot
+
+
+async def test_douyin_reclick_only_when_click_had_no_effect(sau, tmp_path: Path):
+    _, dy, _ = sau
+    from multipub._sau.runtime import StepTimeout
+
+    note = dy.DouYinNote(["1.jpg"], "正文", [], 0, "x.json", title="标题",
+                         hooks=_fast_hooks(tmp_path, reclick_gap=0.3, max_publish_clicks=2))
+    page = FakePage({DY_PUBLISH: True})  # 点击没有任何反应（没请求、不跳转）
+    with pytest.raises(StepTimeout):
+        await note._publish_until_success(page, "图文", "**/manage**")
+    assert page.clicks.count(DY_PUBLISH) == 2  # 隔一段时间补点一次，且不超过上限
+
+
+async def test_douyin_success_receipt_records_item_id(sau, tmp_path: Path):
+    _, dy, _ = sau
+    note = dy.DouYinNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", hooks=_fast_hooks(tmp_path))
+    page = FakePage({DY_PUBLISH: True})
+
+    def submit(p: FakePage) -> None:
+        req = FakeRequest(DY_CREATE)
+        p.emit("request", req)
+        p.emit("request", FakeRequest("https://creator.douyin.com/web/api/media/aweme/other/"))  # 无关请求
+        p.emit("response", FakeResponse(req, {"status_code": 0, "item_id": "7400000000000000001"}))
+        p.succeeded = True
+
+    page.on_click[DY_PUBLISH] = submit
+    await note._publish_until_success(page, "图文", "**/manage**")
+    assert note.published_item_id == "7400000000000000001"
+    assert note.publish_guard.succeeded and note.publish_guard.inflight == 0
+    assert page.clicks.count(DY_PUBLISH) == 1
+
+
+async def test_douyin_explicit_rejection_fails_fast(sau, tmp_path: Path):
+    _, dy, _ = sau
+    from multipub._sau.runtime import PublishRejected
+
+    note = dy.DouYinNote(["1.jpg"], "正文", [], 0, "x.json", title="标题",
+                         hooks=_fast_hooks(tmp_path, publish_timeout=30))
+    page = FakePage({DY_PUBLISH: True})
+
+    def submit(p: FakePage) -> None:
+        req = FakeRequest(DY_CREATE)
+        p.emit("request", req)
+        p.emit("response", FakeResponse(req, {"status_code": 8, "status_msg": "标题含违规内容"}))
+
+    page.on_click[DY_PUBLISH] = submit
+    with pytest.raises(PublishRejected) as info:
+        await note._publish_until_success(page, "图文", "**/manage**")
+    assert "标题含违规内容" in str(info.value) and info.value.screenshot
+    assert page.clicks.count(DY_PUBLISH) == 1
+
+
+async def test_douyin_sms_after_click_allows_one_reclick(sau, tmp_path: Path):
+    conf, dy, _ = sau
+    sms_input = dy.DouYinBaseUploader.SMS_INPUT_SELECTOR
+    verify_btn = 'div.uc-ui-verify_sms-verify_button:has-text("验证")'
+    asked: list[Path] = []
+
+    def user_writes_code(path: Path) -> None:
+        asked.append(path)
+        path.write_text("123456", encoding="utf-8")
+
+    video = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json",
+                           hooks=_fast_hooks(tmp_path, publish_timeout=10, sms_code_required=user_writes_code))
+    page = FakePage({DY_PUBLISH: True, verify_btn: True})
+    publish_clicks = [0]
+
+    def on_publish(p: FakePage) -> None:
+        publish_clicks[0] += 1
+        if publish_clicks[0] == 1:  # 第一次点击 → 弹短信验证
+            p.visible.update({sms_input: True, "text=获取验证码": True})
+        else:
+            p.succeeded = True
+
+    def on_verify(p: FakePage) -> None:
+        p.visible[sms_input] = False
+        p.visible["text=获取验证码"] = False
+
+    page.on_click.update({DY_PUBLISH: on_publish, verify_btn: on_verify})
+    await video._publish_until_success(page, "视频", "**/manage**")
+    assert publish_clicks[0] == 2 and asked == [conf.verify_code_file()]
+    assert page.filled[sms_input] == "123456" and video._sms_rounds == 1
+
+
+async def test_douyin_sms_rounds_are_bounded(sau, tmp_path: Path):
+    _, dy, _ = sau
+    from multipub._sau.runtime import SmsVerifyFailed
+
+    sms_input = dy.DouYinBaseUploader.SMS_INPUT_SELECTOR
+    asked: list[Path] = []
+
+    def user_writes_code(path: Path) -> None:
+        asked.append(path)
+        path.write_text("000000", encoding="utf-8")
+
+    video = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json",
+                           hooks=_fast_hooks(tmp_path, publish_timeout=10, sms_code_required=user_writes_code))
+    page = FakePage({DY_PUBLISH: True, sms_input: True, "text=验证": True})  # 验证码一直不通过
+    with pytest.raises(SmsVerifyFailed) as info:
+        await video._publish_until_success(page, "视频", "**/manage**")
+    assert len(asked) == video.MAX_SMS_ROUNDS and info.value.screenshot
+    assert page.clicks.count(DY_PUBLISH) <= video.hooks.max_publish_clicks
+
+
+async def test_xhs_no_reclick_while_request_in_flight_and_note_id(sau, tmp_path: Path):
+    _, _, xhs = sau
+    from multipub._sau.runtime import StepTimeout
+
+    hooks = _fast_hooks(tmp_path, platform="xiaohongshu")
+    note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", hooks=hooks)
+    page = FakePage({XHS_PUBLISH: True})
+    page.on_click[XHS_PUBLISH] = lambda p: p.emit("request", FakeRequest(XHS_CREATE))
+    with pytest.raises(StepTimeout) as info:
+        await note._publish_until_success(page, "图文")
+    assert page.clicks.count(XHS_PUBLISH) == 1 and info.value.after_submit
+
+    note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", hooks=_fast_hooks(tmp_path))
+    page = FakePage({XHS_PUBLISH: True})
+
+    def submit(p: FakePage) -> None:
+        req = FakeRequest(XHS_CREATE)
+        p.emit("request", req)
+        p.emit("response", FakeResponse(req, {"success": True, "code": 0, "data": {"id": "64f0c0ffee0000000000abcd"}}))
+        p.succeeded = True
+
+    page.on_click[XHS_PUBLISH] = submit
+    await note._publish_until_success(page, "图文")
+    assert note.published_note_id == "64f0c0ffee0000000000abcd"
+
+
+async def test_xhs_ai_declaration_failure_is_reported(sau, tmp_path: Path):
+    _, _, xhs = sau
+    note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", ai_generated=True)
+    await note.apply_declarations(FakePage())  # 页面上没有「添加内容类型声明」入口
+    assert note.declaration_warnings and xhs.XHS_AI_DECLARATION in note.declaration_warnings[0]
+    plain = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题")
+    page = FakePage({"text=添加内容类型声明": True})
+    await plain.apply_declarations(page)  # 默认：不碰任何声明
+    assert page.clicks == [] and plain.declaration_warnings == []
+
+
+async def test_cleanup_helpers_never_raise():
+    from multipub._sau.runtime import close_quietly, save_state_quietly
+
+    class Broken:
+        async def storage_state(self, path: str) -> None:
+            raise RuntimeError("context closed")
+
+        async def close(self) -> None:
+            raise RuntimeError("browser crashed")
+
+    assert await save_state_quietly(Broken(), "x.json") is False
+    await close_quietly(Broken(), None, Broken())
+
+
+async def test_douyin_qrcode_fallback_screenshot(sau, tmp_path: Path):
+    _, dy, _ = sau
+    reported: list[dict[str, Any]] = []
+    info = await dy._save_douyin_qrcode(FakePage(), str(tmp_path / "acct.json"), qrcode_callback=reported.append)
+    assert info["fallback"] and Path(info["image_path"]).is_file()
+    assert reported == [info]
+
+
 def test_login_qrcode_without_opencv(monkeypatch, tmp_path: Path, capsys):
     from multipub._sau.utils import login_qrcode
 
@@ -419,6 +706,9 @@ def test_douyin_validate_video_rules(media: Path):
     assert _levels(far, "schedule") == {"warning"} and _levels(far, "title") == {"error"}
     near = DouyinAdapter.validate(dy_video(media, schedule=_future(2.1)))
     assert _levels(near, "schedule") == {"warning"}
+    both = DouyinAdapter.validate(dy_video(media, cover=media / "cover.jpg",
+                                           options={"thumbnail_portrait": "images/1.jpg"}))
+    assert _levels(both, "cover") == {"warning"}  # cover 被 thumbnail_* 覆盖
 
 
 def test_douyin_validate_note_rules(media: Path):
@@ -457,6 +747,10 @@ def test_xiaohongshu_validate_rules(media: Path):
         assert _levels(issues, field) == {"error"}, field
     no_title = XiaohongshuAdapter.validate(xhs_post(media, title=""))
     assert _levels(no_title, "title") == {"warning"}
+    nothing = XiaohongshuAdapter.validate(xhs_post(media, title="", body=""))
+    assert _levels(nothing, "title") == {"error"}  # 没标题也没正文，无法兜底
+    bmp = XiaohongshuAdapter.validate(xhs_post(media, images=[media / "a.bmp"]))
+    assert _levels(bmp, "images") == {"warning"}
     no_title_video = XiaohongshuAdapter.validate(xhs_post(media, Kind.VIDEO, title=""))
     assert _levels(no_title_video, "title") == {"error"}
     both = XiaohongshuAdapter.validate(xhs_post(media, ai_generated=True, options={"repost_source": "某媒体"}))
@@ -474,10 +768,15 @@ class Recorder:
     item_id: str | None = "7400000000000000001"
     raise_exc: BaseException | None = None
 
+    note_id: str | None = None
+    warnings: list[str] = []
+
     def __init__(self, **kwargs: Any):
         self.kwargs = kwargs
         self.hooks = kwargs["hooks"]
         self.published_item_id = None
+        self.published_note_id = None
+        self.declaration_warnings: list[str] = []
         Recorder.instances.append(self)
 
     async def _run(self) -> None:
@@ -485,6 +784,8 @@ class Recorder:
         if Recorder.raise_exc is not None:
             raise Recorder.raise_exc
         self.published_item_id = Recorder.item_id
+        self.published_note_id = Recorder.note_id
+        self.declaration_warnings = list(Recorder.warnings)
 
     douyin_upload_video = douyin_upload_note = main = _run
 
@@ -493,6 +794,7 @@ class Recorder:
 def recorder(sau, monkeypatch):
     _, dy, xhs = sau
     Recorder.instances, Recorder.raise_exc, Recorder.item_id = [], None, "7400000000000000001"
+    Recorder.note_id, Recorder.warnings = None, []
     for mod, names in ((dy, ("DouYinVideo", "DouYinNote")), (xhs, ("XiaoHongShuVideo", "XiaoHongShuNote"))):
         for name in names:
             monkeypatch.setattr(mod, name, type(name, (Recorder,), {}))
@@ -573,7 +875,13 @@ async def test_xiaohongshu_option_mapping(settings, media: Path, tmp_path: Path,
     assert kw["title"] is None and kw["note"] == "正文" and kw["repost_source"] is None
     assert kw["ai_generated"] is False
     assert kw["publish_strategy"] == "scheduled" and kw["publish_date"] == when
-    assert result.status is Status.SCHEDULED
+    assert result.status is Status.SCHEDULED and result.item_id is None
+
+    # 拿到笔记 ID、AI 声明没选上：都写进结果
+    recorder.note_id, recorder.warnings = "64f0c0ffee0000000000abcd", ["未能自动选择「笔记含AI合成内容」声明"]
+    result = await XiaohongshuAdapter(ctx).publish(xhs_post(media, ai_generated=True))
+    assert result.item_id == "64f0c0ffee0000000000abcd" and result.url is None
+    assert "64f0c0ffee0000000000abcd" in result.message and "笔记含AI合成内容" in result.message
 
 
 async def test_publish_prechecks_before_browser(settings, media: Path, tmp_path: Path, recorder):
@@ -596,6 +904,9 @@ async def test_publish_prechecks_before_browser(settings, media: Path, tmp_path:
     ("LoginPageDetected", True, ("failed", ErrorCode.UNKNOWN_OUTCOME, False)),
     ("CookieInvalid", False, ("needs_action", ErrorCode.LOGIN_REQUIRED, False)),
     ("UploadFailed", False, ("failed", ErrorCode.PLATFORM_ERROR, True)),
+    ("PublishRejected", True, ("failed", ErrorCode.PLATFORM_ERROR, False)),
+    ("DeclarationFailed", False, ("failed", ErrorCode.VALIDATION, False)),
+    ("SmsVerifyFailed", True, ("needs_action", ErrorCode.SMS_CODE_REQUIRED, False)),
 ])
 async def test_error_translation(settings, tmp_path: Path, exc_name, after, expected):
     from multipub._sau import runtime as rt
@@ -668,6 +979,7 @@ async def test_login_and_check_flow(settings, tmp_path: Path, sau, monkeypatch):
     with pytest.raises(PublishError) as info:
         await XiaohongshuAdapter(xctx).login()
     assert info.value.code is ErrorCode.TIMEOUT
+    assert "没有拿到二维码图片" in str(info.value) and "--headless" in str(info.value)
 
     # check
     cctx, _ = make_ctx(settings, "xiaohongshu", tmp_path, action="check")

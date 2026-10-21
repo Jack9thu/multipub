@@ -59,7 +59,7 @@ platforms:
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `write_interval` | `2.0` | 两次写请求（建草稿、登记图片、发布……）之间至少间隔的秒数；知乎风控对频率敏感，不建议调小 |
+| `write_interval` | `2.0` | 两次写请求（建草稿、登记图片、发布……）之间至少间隔的秒数；知乎风控对频率敏感，不建议调小，**最低 1 秒**（配得更小也按 1 秒） |
 | `image_timeout` | `90` | 每张图片等待知乎处理完成的最长秒数 |
 
 ## validate() 检查的限制
@@ -71,6 +71,7 @@ platforms:
 | 定时 | 设置了 `schedule` | error |
 | 文章标题 | 必填，≤100 字 | error |
 | 文章正文里的本地图片 | 文件必须存在；不支持 `data:` 内嵌图 | error |
+| 正文里的原始 HTML `<img>` | 不会上传到知乎图床（`*.zhimg.com` 的除外），可能显示不出来，请改用 `![](路径)` | warning |
 | 图片格式 | `.jpg .jpeg .png .gif .webp .bmp`；webp/bmp 自动转 JPEG | error |
 | GIF | 动图只保留第一帧（转成 JPEG） | warning |
 | 创作声明 | 只能是上表 6 个值；与 `ai_generated` 冲突时以 `statement` 为准 | error / warning |
@@ -99,7 +100,7 @@ platforms:
 | 表格 | `<table data-draft-node="block" data-draft-type="table" data-size="normal" data-row-style="normal"><tbody>`，表头行放进 tbody（保留 `<th>`） |
 | `$公式$` / `$$公式$$` | `<img eeimg="1|2" src="//www.zhihu.com/equation?tex=…">` |
 | 脚注 `[^1]` | `<sup data-text data-url data-draft-type="reference" data-numero>`，脚注列表去掉（知乎自动生成「参考」） |
-| 图片 | 先传到知乎图床，再写成带 `data-rawwidth / data-original-src / data-watermark-src …` 的 `<img>` |
+| 图片 | 先传到知乎图床，再写成带 `data-rawwidth / data-original-src / data-watermark-src …` 的 `<img>`；`![]()` 空地址丢掉 |
 | 链接 | `<a href>`（`javascript:` 等改成 `#`） |
 | 原始 HTML | 原样保留，HTML 注释去掉 |
 
@@ -128,6 +129,8 @@ mpub check zhihu --account main
    8 秒内没拦到就截取二维码区域（或整页）作为替代。二维码刷新会再次上报。
 3. 等到 `z_c0` cookie 出现（最长 `timeouts.login` − 45 秒，默认 255 秒），再打开一次首页补齐 `_xsrf` / `d_c0`，
    保存 `storage_state` 到 `<数据目录>/accounts/zhihu/<账号>.json`，然后用接口校验一次。
+   登录浏览器的 User-Agent 记到 `accounts/zhihu/<账号>.ua.txt`（无头模式的 `HeadlessChrome` 改回 `Chrome`），
+   之后发布请求沿用它，让登录和发布看起来是同一个浏览器；没有这个文件就用内置的 Windows Chrome UA。
 4. **风控验证**：发布或检查时遇到 40352，验证页地址会记到 `accounts/zhihu/<账号>.verify.txt`；
    下次 `mpub login zhihu`（有头）会**带着现有登录态**打开验证页，你完成验证、页面离开验证页后自动保存。
 
@@ -157,7 +160,7 @@ mpub check zhihu --account main
 | 文章发布成功且能查到 | `published` | `https://zhuanlan.zhihu.com/p/<id>` | 话题/封面没加上会在 message 里提示 |
 | 文章发布成功但暂时查不到 | `submitted` | 同上 | 可能在审核中 |
 | 只存草稿 | `draft` | `https://zhuanlan.zhihu.com/p/<id>/edit` | 声明 / 专栏需在编辑页发布时自己选 |
-| 知乎明确拒绝发布文章（`code≠0`） | `failed` / `platform_error` | 编辑页链接 | 内容已在草稿箱，可修改后手动发布 |
+| 知乎明确拒绝发布文章（`code≠0`，或 HTTP 4xx 且不是登录失效 / 风控） | `failed` / `platform_error` | 编辑页链接 | 内容已在草稿箱，可修改后手动发布 |
 | 想法发布成功 | `published` / `submitted` | `https://www.zhihu.com/pin/<id>` | 没拿到 id 时 `submitted` 且无链接 |
 | 想法被拒绝 | `failed` / `platform_error` | — | |
 
@@ -169,10 +172,13 @@ mpub check zhihu --account main
 | HTTP 403 + `error.code=40352`（验证页地址写进 message）、`zh-zse-ck` 挑战、HTTP 429 | `needs_action` / `risk_control` |
 | 发布前网络错误、5xx、图片处理超时 | `failed`（可重试） |
 | 发布请求已发出后超时 / 断网 / 5xx / 返回无法识别 | `failed` / `unknown_outcome`（**先去知乎确认，不要直接重发**） |
-| 建草稿之后出错 | 错误信息末尾带「草稿已保存：<编辑页链接>」 |
+| 建草稿之后出错 | 错误信息末尾带「草稿已保存：<编辑页链接>」（结果未知时是「文章编辑页：<链接>」） |
+| 话题搜索 / 添加被风控（40352、429）或接口报错 | 只在 message 里警告，**继续发布**（登录失效除外：直接中止） |
 | 正文引用的图片找不到、远程图片下载失败（HTTP 非 200）或超过 20MB、文件不是图片 | `failed` / `validation` |
 
-发布接口只调用一次，绝不自动重试。
+发布接口只调用一次，绝不自动重试。发布结果不是干净的成功时（被拒、结果未知、没拿到 id），发布接口的原始响应会存成
+`<数据目录>/runs/<本次运行>/zhihu/zhihu-publish-response.txt`，路径在结果的 `evidence` 里（响应里没有 cookie）。
+发布全程不开浏览器，所以没有截图；登录失败/超时会截图。
 
 ## 已知风险
 

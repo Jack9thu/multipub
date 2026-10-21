@@ -196,27 +196,37 @@ def make_hooks(ctx: "JobContext", kind: Kind, *, sms_message: str = "") -> Any:
     )
 
 
-def qrcode_callback(ctx: "JobContext") -> tuple[Callable[[dict[str, Any]], None], Path]:
-    """SAU 每次生成/刷新二维码都会回调：复制到 qrcode_dir/<平台>-<账号>.png 并上报事件。"""
-    dest = ctx.settings.qrcode_dir / f"{ctx.platform}-{ctx.account}.png"
+class QrRelay:
+    """SAU 每次生成/刷新二维码都会回调：复制到 qrcode_dir/<平台>-<账号>.png 并上报 qrcode 事件。"""
 
-    def callback(payload: dict[str, Any]) -> None:
+    def __init__(self, ctx: "JobContext"):
+        self.ctx = ctx
+        self.dest = ctx.settings.qrcode_dir / f"{ctx.platform}-{ctx.account}.png"
+        self.reported = 0
+
+    def __call__(self, payload: dict[str, Any]) -> None:
         src = str(payload.get("image_path") or "")
         data_url = str(payload.get("image_data_url") or "")
         try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            self.dest.parent.mkdir(parents=True, exist_ok=True)
             if src and Path(src).is_file():
-                shutil.copyfile(src, dest)
+                shutil.copyfile(src, self.dest)
             elif data_url.startswith("data:image/") and ";base64," in data_url:
-                dest.write_bytes(base64.b64decode(data_url.split(",", 1)[1]))
+                self.dest.write_bytes(base64.b64decode(data_url.split(",", 1)[1]))
             else:
                 return
         except (OSError, ValueError) as exc:
-            ctx.log(f"保存二维码图片失败: {exc}", level="warning")
+            self.ctx.log(f"保存二维码图片失败: {exc}", level="warning")
             return
-        ctx.qrcode(dest, note="二维码过期后会自动刷新，请以最新图片为准")
+        self.reported += 1
+        note = ("没定位到二维码元素，这是登录页截图，请扫描其中的二维码" if payload.get("fallback")
+                else "二维码过期后会自动刷新，请以最新图片为准")
+        self.ctx.qrcode(self.dest, note=note)
 
-    return callback, dest
+
+def qrcode_callback(ctx: "JobContext") -> tuple[QrRelay, Path]:
+    relay = QrRelay(ctx)
+    return relay, relay.dest
 
 
 SetupFn = Callable[..., Awaitable[dict[str, Any]]]
@@ -230,6 +240,7 @@ async def run_login(adapter: "PlatformAdapter", setup_fn: SetupFn) -> Result:
     hint = login_hint(ctx.platform, ctx.account)
     callback, qr_path = qrcode_callback(ctx)
     wait = max(60, ctx.settings.timeout_for("login") - 90)
+    # SAU 只按轮询次数计时，抓二维码等步骤另算；worker 的总超时兜底
     if ctx.headless:
         ctx.log("无头模式登录：请扫描上报的二维码图片；如需短信二次验证请去掉 --headless 重试")
     try:
@@ -243,8 +254,10 @@ async def run_login(adapter: "PlatformAdapter", setup_fn: SetupFn) -> Result:
         msg = "登录仍有效，无需重新扫码" if status == "cookie_valid" else "扫码登录成功"
         return adapter.result(Status.OK, message=f"{msg}（{account_file}）")
     if status == "timeout":
-        raise PublishError(f"等待扫码超时（约 {wait} 秒），请重新运行 {hint}",
-                           code=ErrorCode.TIMEOUT, retryable=True)
+        msg = f"等待扫码超时（约 {wait} 秒），请重新运行 {hint}"
+        if not callback.reported:
+            msg += "；本次没有拿到二维码图片" + ("，请去掉 --headless 在浏览器窗口里扫码" if ctx.headless else "")
+        raise PublishError(msg, code=ErrorCode.TIMEOUT, retryable=True)
     if status == "cookie_invalid":
         raise LoginRequired(f"扫码流程结束但没有拿到有效登录态，请重试 {hint}")
     raise PublishError(f"登录失败: {detail.get('message') or status}", code=ErrorCode.INTERNAL, retryable=True)
@@ -295,6 +308,12 @@ async def translate_errors(ctx: "JobContext") -> AsyncIterator[None]:
         if isinstance(exc, rt.CookieInvalid):
             raise LoginRequired(f"{exc}。请重新登录：{hint}") from exc
         raise PublishError(str(exc), code=ErrorCode.TIMEOUT, retryable=True) from exc
+    except rt.PublishRejected as exc:
+        raise PublishError(f"{exc}。作品应未创建；建议先到平台后台确认，再修改内容后重发",
+                           code=ErrorCode.PLATFORM_ERROR, retryable=False) from exc
+    except rt.DeclarationFailed as exc:
+        raise ValidationFailed(f"{exc}：确认 platforms.{ctx.platform}.declaration 与页面上的选项文字完全一致，"
+                               "或设为 false 不声明") from exc
     except rt.CookieInvalid as exc:
         raise LoginRequired(f"登录已失效：运行 {hint}") from exc
     except rt.UploadFailed as exc:

@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from patchright.async_api import Page
 from patchright.async_api import Playwright
@@ -15,7 +17,8 @@ from patchright.async_api import async_playwright
 # multipub patch: 包内绝对导入；conf 由 multipub._sau.conf.configure() 预先设置
 from multipub._sau import conf as sau_conf
 from multipub._sau.conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
-from multipub._sau.runtime import CookieInvalid, Deadline, Hooks, SauError, fail_step, save_screenshot
+from multipub._sau.runtime import (CookieInvalid, Deadline, Hooks, SauError, close_quietly, fail_rejected,
+                                   fail_step, save_screenshot, save_state_quietly)
 from multipub._sau.uploader.base_video import BaseVideoUploader
 from multipub._sau.utils.base_social_media import set_init_script
 from multipub._sau.utils.login_qrcode import build_login_qrcode_path
@@ -34,6 +37,9 @@ XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 # multipub patch: AI 内容声明选项文字（来自 omnipost，未在真实账号上验证）
 XHS_AI_DECLARATION = "笔记含AI合成内容"
+# multipub patch: 创建笔记接口（与开源 xhs 客户端一致；被动监听用于防重复点击和拿笔记 ID，未在真实账号上验证）
+XHS_CREATE_API_RE = re.compile(r"^/web_api/sns/v\d+/note/?$")
+XHS_API_HOSTS = (".xiaohongshu.com", ".rednote.com")
 
 
 def _build_xhs_creator_url(path: str) -> str:
@@ -339,6 +345,11 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         self.ai_generated = bool(ai_generated)
         self.repost_source = (repost_source or "").strip()
         self._publish_clicked = False
+        self.publish_guard = self.hooks.publish_guard()
+        self.published_note_id: str | None = None
+        self.publish_api_error: str | None = None
+        self.declaration_warnings: list[str] = []  # 没能自动完成的声明，适配器写进结果消息
+        self._response_tasks: set = set()
 
     def _before_publish_click(self) -> None:
         """multipub patch: 第一次点击最终「发布」之前通知适配器（对应 ctx.mark_submit_started）。"""
@@ -351,23 +362,97 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         有 repost_source 才声明转载；ai_generated 时尽力选择 AI 合成内容声明（找不到只告警）。"""
         if self.repost_source:
             await self.check_original_declaration(page)
-        if self.ai_generated:
-            await self.set_ai_content_declaration(page)
+        if self.ai_generated and not await self.set_ai_content_declaration(page):
+            self.declaration_warnings.append(f"未能自动选择「{XHS_AI_DECLARATION}」声明，请在笔记管理里补充")
+
+    async def _click_publish(self, button) -> bool:
+        """multipub patch: 受 PublishGuard 限制地点击最终发布按钮；第一次点击前通知适配器。"""
+        if not self.publish_guard.may_click():
+            return False
+        self._before_publish_click()
+        self.publish_guard.clicked()  # 先记账再点：点击抛异常时也可能已经触发
+        await button.click()
+        self.publish_guard.click_returned()
+        return True
+
+    @staticmethod
+    def _is_create_request(request) -> bool:
+        try:
+            parsed = urlparse(request.url)
+            return (request.method == "POST" and (parsed.hostname or "").endswith(XHS_API_HOSTS)
+                    and bool(XHS_CREATE_API_RE.match(parsed.path)))
+        except Exception:
+            return False
+
+    def _watch_publish_response(self, page: Page) -> None:
+        """multipub patch: 被动监听创建笔记接口（不拦截、不改动请求）：记录笔记 ID / 平台错误，告知 PublishGuard。"""
+
+        async def capture(response) -> None:
+            ok: bool | None = None
+            try:
+                body = await response.json()
+                if not isinstance(body, dict):
+                    return
+                data = body.get("data") if isinstance(body.get("data"), dict) else {}
+                code = body.get("code")
+                if 200 <= response.status < 300 and (body.get("success") is True or code == 0):
+                    ok = True
+                    note_id = str(data.get("id") or data.get("note_id") or "")
+                    if re.fullmatch(r"[0-9a-f]{24}", note_id):
+                        self.published_note_id = note_id
+                        xiaohongshu_logger.info(_msg("🧾", f"创建笔记接口返回笔记 ID: {note_id}"))
+                elif body.get("success") is False or (isinstance(code, int) and not isinstance(code, bool) and code != 0):
+                    ok = False
+                    self.publish_api_error = str(body.get("msg") or f"code={code}")
+                    xiaohongshu_logger.warning(_msg("😵", f"创建笔记接口返回失败: {self.publish_api_error}"))
+            except Exception:
+                return
+            finally:
+                self.publish_guard.request_done(ok, self.publish_api_error or "")
+
+        def on_request(request) -> None:
+            if self._publish_clicked and self._is_create_request(request):
+                self.publish_guard.request_sent()
+
+        def on_response(response) -> None:
+            if not self._publish_clicked or not self._is_create_request(response.request):
+                return
+            task = asyncio.ensure_future(capture(response))
+            self._response_tasks.add(task)
+            task.add_done_callback(self._response_tasks.discard)
+
+        def on_failed(request) -> None:
+            if self._publish_clicked and self._is_create_request(request):
+                self.publish_guard.request_done(None)
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("requestfailed", on_failed)
+
+    def _publish_detail(self) -> str:
+        parts = []
+        if self.published_note_id:
+            parts.append(f"创建接口已返回笔记 ID {self.published_note_id}")
+        if self.publish_api_error:
+            parts.append(f"平台返回: {self.publish_api_error}")
+        return "；".join(parts)
 
     async def _publish_until_success(self, page: Page, what: str) -> None:
-        """上游的发布循环（multipub patch: 带截止时间；第一次点击前通知适配器；视频/图文共用）。"""
+        """上游的发布循环（multipub patch: 带截止时间；视频/图文共用；
+        发布按钮只经 _click_publish 点击：PublishGuard 限制重复点击，第一次点击前通知适配器）。"""
+        self._watch_publish_response(page)
         deadline = Deadline(self.hooks.publish_timeout, f"等待{what}发布成功")
         while True:
             if deadline.expired:
-                await fail_step(page, self.hooks, deadline, after_submit=self._publish_clicked)
+                await fail_step(page, self.hooks, deadline, after_submit=self._publish_clicked,
+                                detail=self._publish_detail())
             try:
                 if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
                     publish_button = page.locator('button:has-text("定时发布")')
                 else:
                     publish_button = page.locator('button:has-text("发布")')
                 if await publish_button.count():
-                    self._before_publish_click()
-                await publish_button.click()
+                    await self._click_publish(publish_button)
                 await page.wait_for_url(
                     XHS_PUBLISH_SUCCESS_URL_PATTERN,
                     timeout=3000
@@ -375,8 +460,14 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                 xiaohongshu_logger.success(_msg("🥳", f"{what}发布成功，小人开心收工"))
                 break
             except Exception:
+                # 接口明确失败、宽限期内页面没有进展：直接报平台拒绝（fail_rejected 抛出的异常不会被这里吞掉）
+                rejection = self.publish_guard.rejection_settled(self.hooks.reject_grace)
+                if rejection:
+                    await fail_rejected(page, self.hooks, rejection)
                 xiaohongshu_logger.info(_msg("🏃", f"小人正在冲刺发布{what}"))
                 await asyncio.sleep(0.5)
+        if self._response_tasks:
+            await asyncio.wait(set(self._response_tasks), timeout=5)
 
     async def validate_base_args(self):
         # multipub patch: 抛 CookieInvalid，适配器据此提示重新登录
@@ -842,19 +933,20 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
         page = None
         try:
-            page = await context.new_page()
-            await self.upload_video_content(page)
-            await context.storage_state(path=self.account_file)
-            xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
-        except SauError:
-            raise
-        except Exception:
-            # multipub patch: 出错先截图留证
-            await save_screenshot(page, self.hooks, "error")
-            raise
+            try:
+                page = await context.new_page()
+                await self.upload_video_content(page)
+            except SauError:
+                raise
+            except Exception:
+                # multipub patch: 出错先截图留证
+                await save_screenshot(page, self.hooks, "error")
+                raise
+            # multipub patch: 发布已成功，回写 cookie / 关浏览器出错不改变结果
+            if await save_state_quietly(context, self.account_file):
+                xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
-            await context.close()
-            await browser.close()
+            await close_quietly(context, browser)
 
     async def xiaohongshu_upload_video(self):
         async with async_playwright() as playwright:
@@ -968,19 +1060,20 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
 
         page = None
         try:
-            page = await context.new_page()
-            await self.upload_note_content(page)
-            await context.storage_state(path=self.account_file)
-            xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
-        except SauError:
-            raise
-        except Exception:
-            # multipub patch: 出错先截图留证
-            await save_screenshot(page, self.hooks, "error")
-            raise
+            try:
+                page = await context.new_page()
+                await self.upload_note_content(page)
+            except SauError:
+                raise
+            except Exception:
+                # multipub patch: 出错先截图留证
+                await save_screenshot(page, self.hooks, "error")
+                raise
+            # multipub patch: 发布已成功，回写 cookie / 关浏览器出错不改变结果
+            if await save_state_quietly(context, self.account_file):
+                xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
-            await context.close()
-            await browser.close()
+            await close_quietly(context, browser)
 
     async def xiaohongshu_upload_note(self):
         async with async_playwright() as playwright:

@@ -54,7 +54,9 @@ NOTE_MODES = ("browser", "http")
 VIDEO_OPTIONS = frozenset({"tid", "tid_v2", "copyright", "source", "dynamic", "no_reprint", "is_only_self",
                            "selection_reply", "close_reply", "close_danmu", "creation_statement",
                            "extra_fields", "line", "limit", "submit"})
-NOTE_OPTIONS = frozenset({"mode", "pic_mode", "tags_in_text"})
+NOTE_OPTIONS = frozenset({"mode", "pic_mode", "tags_in_text", "confirm_rules"})
+# config.toml [platforms.bilibili] 里的同意项：允许 multipub 代为确认《动态发布规范》
+CONFIRM_RULES_CONFIG = "confirm_dynamic_rules"
 
 LOGIN_POLL_SECONDS = 2.0
 QR_MAX_REFRESH = 3
@@ -129,7 +131,8 @@ class BilibiliAdapter(PlatformAdapter):
         known = VIDEO_OPTIONS if post.kind is Kind.VIDEO else NOTE_OPTIONS
         for key in post.options:
             if key not in known:
-                warn(f"platforms.bilibili.{key}", f"未知参数，会被忽略（{post.kind.value} 支持: {', '.join(sorted(known))}）")
+                warn(f"platforms.bilibili.{key}",
+                     f"未知参数，会被忽略（{post.kind.value} 支持: {', '.join(sorted(known))}）")
         if post.kind is Kind.VIDEO:
             cls._validate_video(post, err, warn)
         elif post.kind is Kind.NOTE:
@@ -156,10 +159,13 @@ class BilibiliAdapter(PlatformAdapter):
         for tag in post.tags:
             if len(tag) > VIDEO_TAG_LEN_MAX:
                 err("tags", f"标签「{tag}」超过 {VIDEO_TAG_LEN_MAX} 字")
+            if "," in tag or "，" in tag:
+                err("tags", f"标签「{tag}」不能含逗号（biliup 用逗号分隔标签）")
 
         tid = _as_int(o.get("tid"))
         if o.get("tid") in (None, ""):
-            err("platforms.bilibili.tid", "必须填写分区 id（如 231=计算机技术、21=日常），见 docs/platforms/bilibili.md")
+            err("platforms.bilibili.tid",
+                "必须填写分区 id（如 231=计算机技术、21=日常），见 docs/platforms/bilibili.md")
         elif tid is None or not 0 < tid <= 65535:
             err("platforms.bilibili.tid", f"分区 id 必须是正整数，收到 {o.get('tid')!r}")
         if o.get("tid_v2") not in (None, "") and (_as_int(o.get("tid_v2")) or 0) <= 0:
@@ -171,7 +177,8 @@ class BilibiliAdapter(PlatformAdapter):
             err("platforms.bilibili.source", "转载（copyright: 2）必须填写转载来源 source")
         if o.get("creation_statement") not in (None, "") and \
                 _as_int(o.get("creation_statement")) not in CREATION_STATEMENTS:
-            err("platforms.bilibili.creation_statement", "只能是 -1（无）/ 1（AI）/ 2（虚构演绎）/ 3（营销）/ 4（个人观点）")
+            err("platforms.bilibili.creation_statement",
+                "只能是 -1（无）/ 1（AI）/ 2（虚构演绎）/ 3（营销）/ 4（个人观点）")
         elif post.ai_generated and o.get("creation_statement") in (None, ""):
             warn("ai_generated", "将以创作声明 id=1（AI）提交；该字段未在真实账号验证，发布后请到稿件页确认")
         if o.get("extra_fields") is not None and not isinstance(o.get("extra_fields"), dict):
@@ -211,7 +218,8 @@ class BilibiliAdapter(PlatformAdapter):
             err("platforms.bilibili.mode", "只能是 browser（默认）或 http（实验性）")
         title = post.title.strip()
         if len(title) > NOTE_TITLE_MAX:
-            err("title", f"B站动态标题最多 {NOTE_TITLE_MAX} 字（当前 {len(title)}），可在 platforms.bilibili.title 单独设置")
+            err("title", f"B站动态标题最多 {NOTE_TITLE_MAX} 字（当前 {len(title)}），"
+                         "可在 platforms.bilibili.title 单独设置")
         text = note_text(post)
         if len(text) > NOTE_TEXT_MAX:
             err("body", f"动态正文（含末尾的 #标签#）最多 {NOTE_TEXT_MAX} 字（当前 {len(text)}）")
@@ -224,6 +232,9 @@ class BilibiliAdapter(PlatformAdapter):
                 err("images", f"{img.name}: 单张图片不能超过 20MB")
         if o.get("pic_mode") not in (None, "") and _as_int(o.get("pic_mode")) not in (0, 1):
             err("platforms.bilibili.pic_mode", "只能是 0（九宫格，默认）或 1（大封面）")
+        for key in ("confirm_rules", "tags_in_text"):
+            if key in o and not isinstance(o[key], bool):
+                err(f"platforms.bilibili.{key}", "只能是 true 或 false")
         if post.cover is not None:
             warn("cover", "B站动态不使用封面，已忽略")
         if post.schedule is not None:
@@ -399,11 +410,18 @@ class BilibiliAdapter(PlatformAdapter):
     async def _publish_video(self, post: PlatformPost) -> Result:
         from . import bili_biliup
 
-        self._load_cred(require_token=True)
+        cred = self._load_cred(require_token=True)
         exe = bili_biliup.find_biliup(self.settings)
         if exe is None:
             raise PublishError("未找到 biliup：先运行 mpub setup（或在 config.toml 设置 biliup_path）",
                                code=ErrorCode.INTERNAL)
+        # 先做一次与 biliup 相同的只读令牌校验：登录失效时在"开始上传"之前就报 login_required
+        try:
+            await self._token(cred)
+        except LoginRequired:
+            raise
+        except PublishError as exc:  # 网络 / 风控：交给 biliup 自己校验
+            self.ctx.log(f"预先校验登录令牌失败（{exc}），交给 biliup 处理", level="warning")
         args = bili_biliup.build_upload_args(exe, self.account_file, post)
         timeout = self._video_timeout()
         assert post.video is not None
@@ -434,9 +452,12 @@ class BilibiliAdapter(PlatformAdapter):
         if o.returncode == 0:
             return self.result(Status.SUBMITTED, kind=post.kind,
                                message="biliup 正常退出但没解析到投稿结果，请到创作中心确认")
+        unknown = "视频已上传完，投稿请求结果未知：先到创作中心（member.bilibili.com）确认，不要直接重发"
+        if o.response_code in (-500, -502, -503, -504):  # 服务端错误 / 超时：稿件可能已经建好
+            raise PublishError(f"投稿接口返回服务端错误（{o.response_code}: {o.response_message}）；{unknown}",
+                               code=ErrorCode.UNKNOWN_OUTCOME)
         if o.response_code not in (None, 0):
             raise PublishError(f"B站拒绝投稿（{o.response_code}: {o.response_message}）")
-        unknown = "视频已上传完，投稿请求结果未知：先到创作中心（member.bilibili.com）确认，不要直接重发"
         if o.returncode is None:
             if o.uploaded:
                 raise PublishError(f"超时；{unknown}", code=ErrorCode.UNKNOWN_OUTCOME)
@@ -446,7 +467,8 @@ class BilibiliAdapter(PlatformAdapter):
             raise LoginRequired(f"B站登录已失效（biliup: {o.tail_text[-200:]}）；{_login_hint(self.ctx.account)}")
         if o.uploaded:
             raise PublishError(f"biliup 退出码 {o.returncode}；{unknown}", code=ErrorCode.UNKNOWN_OUTCOME)
-        raise PublishError(f"biliup 上传失败（退出码 {o.returncode}）：{o.tail_text}；尚未投稿，确认后可加 --force 重试")
+        raise PublishError(f"biliup 上传失败（退出码 {o.returncode}）：{o.tail_text}；"
+                           "尚未投稿，确认后可加 --force 重试")
 
     async def _web_session(self) -> tuple[Any, dict[str, Any], dict[str, str]]:
         """准备网页登录态：nav 不通过且有 token 时，用 biliup renew 刷新一次 cookie 再试。"""
@@ -467,6 +489,10 @@ class BilibiliAdapter(PlatformAdapter):
         if not nav.get("isLogin"):
             raise LoginRequired(f"B站登录已失效：{_login_hint(self.ctx.account)}")
         return cred, nav, extra
+
+    def spec_marker_path(self) -> Path:
+        """记录"用户亲手确认过《动态发布规范》"的文件（不是 .json，不会被当成账号）。"""
+        return self.account_file.with_name(f"{self.ctx.account}.dy_spec_agreed")
 
     async def _publish_note(self, post: PlatformPost) -> Result:
         from . import bili_cookies, bili_http
@@ -489,7 +515,13 @@ class BilibiliAdapter(PlatformAdapter):
         else:
             from .bili_note import BrowserNotePublisher
 
-            publisher = BrowserNotePublisher(self.ctx, account=self.ctx.account)
+            marker = self.spec_marker_path()
+            if "confirm_rules" in post.options:  # 清单里明确写了就以它为准
+                consent = post.options["confirm_rules"] is True
+            else:
+                consent = self.settings.platform_config(NAME).get(CONFIRM_RULES_CONFIG) is True or marker.is_file()
+            publisher = BrowserNotePublisher(self.ctx, account=self.ctx.account, spec_consent=consent,
+                                             spec_marker=marker)
             data = await publisher.publish(
                 storage_state=bili_cookies.to_storage_state(cred, extra), title=title, text=text,
                 images=post.images, timer_pub_time=timer, aigc=post.ai_generated, pic_mode=pic_mode)

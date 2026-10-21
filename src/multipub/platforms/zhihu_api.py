@@ -35,9 +35,10 @@ import httpx
 from ..models import ErrorCode, LoginRequired, NeedsAction, PublishError, ValidationFailed
 from .zhihu_html import ZhihuImage
 
+# 默认 UA；登录时记下的真实浏览器 UA 优先（见 zhihu.py _ua_file），保持登录与发布的 UA 一致
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/141.0.0.0 Safari/537.36")
-OSS_UA = "aliyun-sdk-js/6.8.0 Chrome 141.0.0.0 on Windows 10 64-bit"
+      "Chrome/147.0.0.0 Safari/537.36")
+OSS_UA = "aliyun-sdk-js/6.8.0 Chrome 147.0.0.0 on Windows 10 64-bit"
 
 WWW = "https://www.zhihu.com"
 WWW_HOME = f"{WWW}/"
@@ -60,6 +61,7 @@ SIGNATURE_CODE = 10003  # 「请求参数异常，请升级客户端后重试」
 AUTH_MARKERS = ("ERR_TICKET_NOT_EXIST", "ZERR_NO_AUTH_TOKEN")
 
 DEFAULT_WRITE_INTERVAL = 2.0  # 两次写请求之间至少间隔（秒），config.toml [platforms.zhihu] write_interval
+MIN_WRITE_INTERVAL = 1.0  # write_interval 配得再小也不低于这个值（测试里改成 0）
 DEFAULT_IMAGE_TIMEOUT = 90.0  # 单张图片等知乎处理完成的最长时间（秒）
 IMAGE_POLL_INTERVAL = 1.5
 REMOTE_IMAGE_MAX_BYTES = 20 * 1024 * 1024
@@ -169,11 +171,17 @@ def build_jar(cookies: list[dict[str, Any]]) -> httpx.Cookies:
     return jar
 
 
-def make_client(cookies: list[dict[str, Any]] | None = None, *,
+def normalize_user_agent(ua: str | None) -> str:
+    """登录浏览器的 navigator.userAgent → 发请求用的 UA（无头模式的 HeadlessChrome 改回 Chrome）；不像桌面浏览器就返回空。"""
+    ua = " ".join(str(ua or "").split()).replace("HeadlessChrome/", "Chrome/")
+    return ua if ua.startswith("Mozilla/5.0 ") and "Chrome/" in ua and len(ua) < 512 else ""
+
+
+def make_client(cookies: list[dict[str, Any]] | None = None, *, user_agent: str | None = None,
                 transport: httpx.AsyncBaseTransport | None = None, timeout: float = 30) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         cookies=build_jar(cookies or []), transport=transport, timeout=timeout, follow_redirects=False,
-        headers={"User-Agent": UA, "Accept": "application/json, text/plain, */*",
+        headers={"User-Agent": user_agent or UA, "Accept": "application/json, text/plain, */*",
                  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
     )
 
@@ -275,9 +283,9 @@ def _json(resp: httpx.Response) -> Any:
         return None
 
 
-def _snippet(resp: httpx.Response) -> str:
+def _snippet(resp: httpx.Response, limit: int = 2000) -> str:
     try:
-        return resp.text[:2000]
+        return resp.text[:limit]
     except (UnicodeDecodeError, LookupError):
         return ""
 
@@ -291,6 +299,10 @@ def error_message(data: Any, fallback: str = "") -> str:
                 if src.get(key):
                     return str(src[key])
     return fallback[:200]
+
+
+def is_risk_code(value: Any) -> bool:
+    return str(value).strip() == str(RISK_CODE)
 
 
 def risk_error(info: dict[str, Any], *, what: str, account: str) -> RiskControl:
@@ -312,7 +324,7 @@ def raise_for_response(resp: httpx.Response, data: Any, *, what: str, account: s
     err = data.get("error") if isinstance(data, dict) and isinstance(data.get("error"), dict) else {}
     if status == 401 or (status >= 400 and any(m in body for m in AUTH_MARKERS)):
         raise LoginRequired(f"知乎登录已失效（{what}）：{login_hint(account)}")
-    if err.get("code") == RISK_CODE or (isinstance(data, dict) and data.get("code") == RISK_CODE):
+    if is_risk_code(err.get("code")) or (isinstance(data, dict) and is_risk_code(data.get("code"))):
         raise risk_error(err or data, what=what, account=account)
     if status == 403 and "zh-zse-ck" in body:
         raise RiskControl(f"{what}被知乎要求浏览器安全验证（zh-zse-ck）：{login_hint(account)} 后重试",
@@ -436,6 +448,7 @@ class ZhihuApi:
         self.log = log or (lambda *a, **k: None)
         self._last_write = 0.0
         self._image_cache: dict[tuple[str, str], ZhihuImage] = {}
+        self.last_publish: tuple[int, str] | None = None  # 发布接口的原始响应（失败时存证据）
 
     @property
     def xsrf(self) -> str:
@@ -551,6 +564,7 @@ class ZhihuApi:
         except httpx.HTTPError as exc:
             raise PublishError(f"发布请求已发出但没有收到结果（{type(exc).__name__}）：先到知乎确认，不要直接重发",
                                code=ErrorCode.UNKNOWN_OUTCOME) from exc
+        self.last_publish = (resp.status_code, _snippet(resp, 50_000))
         data = _json(resp)
         raise_for_response(resp, data, what=what, account=self.account, after_submit=True)
         if not isinstance(data, dict):

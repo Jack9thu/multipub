@@ -388,9 +388,10 @@ def parse_upload_output(lines: list[str], returncode: int | None) -> UploadOutco
                 out.bvid = bv.group(0) if bv else out.bvid
                 out.aid = aid.group(1) if aid else out.aid
     if out.submitted and not out.bvid:
-        # 兜底：成功后在整段输出里找 BV 号
+        # 兜底：只在投稿响应相关的行里找 BV 号（视频文件名里也可能有 BV 字样）
         for raw in reversed(lines):
-            bv = BV_RE.search(strip_ansi(raw))
+            line = strip_ansi(raw)
+            bv = BV_RE.search(line) if ("bvid" in line or "ResponseData" in line) else None
             if bv:
                 out.bvid = bv.group(0)
                 break
@@ -409,6 +410,7 @@ def video_url(bvid: str | None, aid: str | None) -> str | None:
 # ------------------------------------------------------------------ 运行
 
 LineHandler = Callable[[str | None], None]  # None 表示心跳（一段时间没有新输出）
+STREAM_LIMIT = 1024 * 1024  # 单行输出上限（字节）
 
 
 def biliup_env() -> dict[str, str]:
@@ -423,7 +425,7 @@ async def run_streaming(args: list[str], *, cwd: Path, timeout: float,
     cwd.mkdir(parents=True, exist_ok=True)
     proc = await asyncio.create_subprocess_exec(
         *args, cwd=str(cwd), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT, env=biliup_env(), limit=1024 * 1024, **_no_window_kwargs())
+        stderr=asyncio.subprocess.STDOUT, env=biliup_env(), limit=STREAM_LIMIT, **_no_window_kwargs())
     assert proc.stdout is not None
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -438,6 +440,9 @@ async def run_streaming(args: list[str], *, cwd: Path, timeout: float,
             except asyncio.TimeoutError:
                 if on_line:
                     on_line(None)
+                continue
+            except ValueError:  # 单行超过 STREAM_LIMIT：StreamReader 已丢弃这段，记一笔继续读
+                lines.append("[multipub] 一行输出过长，已省略")
                 continue
             if not raw:
                 break

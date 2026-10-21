@@ -83,6 +83,8 @@ class DouyinAdapter(PlatformAdapter):
             landscape = bridge.check_option_file(c, post, "thumbnail_landscape", bridge.IMAGE_EXTS)
             if portrait and landscape:
                 c.warn("options.thumbnail_landscape", "同时设置了竖封面和横封面，抖音流程只会应用竖封面")
+            if post.cover is not None and (opts.get("thumbnail_portrait") or opts.get("thumbnail_landscape")):
+                c.warn("cover", "已设置 thumbnail_portrait / thumbnail_landscape，cover 被忽略")
             for key in ("collection", "product_link", "product_title"):
                 c.str_option(opts, key)
             c.bool_option(opts, "sync_toutiao")

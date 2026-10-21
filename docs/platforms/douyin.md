@@ -62,6 +62,7 @@ platforms:
 | 图文正文 | ≤1000 字 | error |
 | 图文图片 | 1–35 张，格式 `.jpg .jpeg .png .webp .bmp`（不支持 GIF） | error |
 | 封面 / thumbnail_* | 图片格式同上，文件必须存在 | error |
+| `cover` + `thumbnail_*` | 同时设置时 cover 被忽略 | warning |
 | 话题 | >5 个 | warning |
 | 话题内容 | 含空格、`#`、逗号（会被拆开） | warning |
 | 定时 | 必须晚于现在 2 小时以上（发布前在 worker 里会再查一次） | error |
@@ -83,10 +84,12 @@ mpub login douyin --account main --headless
 
 1. 已有 cookie 且仍有效时直接返回「登录仍有效」。
 2. 否则打开 `https://creator.douyin.com/`，抓取二维码图片，复制到 `<数据目录>/qrcode/douyin-<账号>.png`
-   并上报 `qrcode` 事件（二维码失效会自动刷新并再次上报）。登录结束后删除该图片。
+   并上报 `qrcode` 事件（二维码失效会自动刷新并再次上报）。定位不到二维码元素时，改为上报整页截图
+   （事件的 `note` 会说明），扫其中的二维码即可。登录结束后删除该图片。
 3. 扫码后若抖音要求短信二次验证，**只能在浏览器窗口里手动完成**，所以抖音登录建议不要加 `--headless`。
 4. 成功后把 storage_state 写到 `<数据目录>/accounts/douyin/<账号>.json`。
-5. 等待时长 = `timeouts.login` − 90 秒（默认 210 秒）。
+5. 等待时长 = `timeouts.login` − 90 秒（默认 210 秒）。超时返回 `failed` / `timeout`；
+   如果整个过程都没拿到二维码图片，消息会提示去掉 `--headless`。
 
 装了可选依赖 `multipub[terminal-qr]`（opencv）时，二维码也会以字符画打印到 worker 日志（stderr）。
 
@@ -95,9 +98,13 @@ mpub login douyin --account main --headless
 ## 发布流程与返回
 
 视频：打开上传页 → 选择视频 → 等待进入发布页 → 填标题/简介/话题 → 等待上传完成 → 商品 → 自主声明 →
-合集 → 封面 → （可选）同步头条 → 定时 → 循环点击「发布」直到跳到作品管理页。图文类似（「发布图文」）。
+合集 → 封面 → （可选）同步头条 → 定时 → 点击「发布」并等待跳到作品管理页。图文类似（「发布图文」）。
 
-- 第一次点击最终「发布」前会发出 `submit_started` 事件。之后的任何失败都**不会自动重试**。
+- 第一次点击最终「发布」前会发出 `submit_started` 事件。之后的任何失败都**不会自动重试**（runner 层面）。
+- **不会重复点击发布**（multipub 补丁，上游每 3.5 秒点一次）：第一次点击之后只在两种情况下再点——
+  平台弹窗拦下了上一次点击（短信验证已完成、提示「请设置封面后再发布」并已选推荐封面），或者 20 秒内既没跳转也没观察到
+  发布请求（说明上次点击没生效）。发布请求还没返回、已拿到成功回执、或已经点了 3 次时一律不再点。
+- 发布接口明确返回失败（如内容违规）且 15 秒内没有弹出验证：立即返回 `failed` / `platform_error`（附平台原文），不再空等。
 - 成功：`status = submitted`（立即发布，待审核）或 `scheduled`（定时）。
 - 作品链接：点击发布后被动监听创作者中心的创建接口回执，拿到 `item_id` 时返回
   `https://www.douyin.com/video/<id>`（图文为 `/note/<id>`）。拿不到时 `url` 为空，消息提示去「作品管理」查看。
@@ -119,7 +126,9 @@ mpub login douyin --account main --headless
 |---|---|
 | 没有账号文件、cookie 失效、中途被踢回登录页（点发布前） | `needs_action` / `login_required` |
 | 页面停在人机验证（滑块等） | `needs_action` / `captcha`（建议 `--headed` 重发并手动验证） |
-| 短信验证码超时 | `needs_action` / `sms_code_required` |
+| 短信验证码超时；或提交 3 轮验证码后弹窗仍在（验证码错误/过期） | `needs_action` / `sms_code_required` |
+| 自主声明设置失败（选项文字与页面不一致等），点发布前 | `failed` / `validation`（不会在没有声明的情况下发出去） |
+| 点发布后接口明确返回失败 | `failed` / `platform_error`（不可重试；作品应未创建，建议先去后台确认） |
 | 点发布前某一步超时 | `failed` / `timeout`（可重试） |
 | 点发布后超时或页面异常 | `failed` / `unknown_outcome`（**先去后台确认，不要直接重发**） |
 | 视频上传失败且重传 3 次仍失败 | `failed` / `platform_error` |
@@ -131,7 +140,9 @@ mpub login douyin --account main --headless
 
 - 选择器来自上游 2026-06 至 2026-08 的修复（抖音创作者中心改版后），平台随时可能再改版；改版后表现为某一步超时并留下截图。
 - 默认使用 patchright 自带的 Chromium；想降低风控可在 config.toml 设置 `browser.channel = "chrome"` 或 `browser.executable_path`。
-- 发布循环会在跳转前每隔几秒重复点击「发布」（上游行为）；抖音一般在第一次点击后禁用按钮，但理论上存在重复提交的可能。
+- 重复提交风险已大幅降低但未消除：发布接口的路径未在真实账号上验证，监听不到时只剩「20 秒内无反应才补点、最多 3 次」两道限制。
+- 上游 2026-05 曾认为「自主声明」是发布必选项，2026-07 起改为可不填（multipub 也默认不填）。如果抖音要求必须声明，
+  表现为点击发布后不跳转直至超时（`unknown_outcome`，实际没有发出）；此时请填写 `declaration`。
 - 抖音图文流程上游没有自主声明，`ai_generated: true` 不会自动标注。
 - 第三方同步开关（头条/西瓜）的选择器较旧，`sync_toutiao: true` 可能无效。
 
@@ -160,6 +171,8 @@ mpub login douyin --account main --headless
 | 图文成功 | URL `**/creator-micro/content/manage?enter_from=publish**` | 中 |
 | 背景音乐 | `.semi-sidesheet-content`、`.card-container-tmocjc`、`.apply-btn-LUPP0D`（哈希类名） | 低 |
 | 图文流程的短信验证 | 复用视频流程的选择器，并要求同时出现 `[class*="uc-ui-verify"]`、「获取验证码」「身份验证」「短信验证」之一（multipub 新增） | 低 |
-| 作品 ID | `POST creator.douyin.com/web/api/media/aweme/create(_v2)/` 响应 `status_code == 0` 的 `item_id`（multipub 新增） | 低 |
+| 作品 ID / 防重复点击 | `POST creator.douyin.com/web/api/media/aweme/create(_v2)/`：HTTP 2xx 且 `status_code == 0` 的 `item_id`；`status_code != 0` 视为拒绝（multipub 新增；postsail 的抖音文章流程使用同一接口与字段） | 中低 |
+| 被拦下后允许再点 | 短信弹窗处理完、「请设置封面后再发布」+ 推荐封面（与上游循环行为一致） | 中 |
+| 登录二维码兜底 | 定位不到二维码元素时上报整页截图（multipub 新增） | 中 |
 | 作品链接格式 | `https://www.douyin.com/video/<id>`、`/note/<id>` | 中 |
 | 卡住原因判定 | 文本「请完成安全验证」「拖动下方滑块」等、`#captcha_container`（multipub 新增，只影响错误分类） | 低 |

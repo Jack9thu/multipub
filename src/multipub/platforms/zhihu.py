@@ -163,7 +163,8 @@ def _join(message: str, warnings: list[str]) -> str:
 
 def _with_draft(exc: PublishError, edit_url: str) -> PublishError:
     """草稿已经建好后出错：把编辑链接带进错误信息，方便手动处理。"""
-    new = type(exc)(f"{exc}（草稿已保存：{edit_url}）", code=exc.code, retryable=exc.retryable,
+    note = "文章编辑页" if exc.code is ErrorCode.UNKNOWN_OUTCOME else "草稿已保存"
+    new = type(exc)(f"{exc}（{note}：{edit_url}）", code=exc.code, retryable=exc.retryable,
                     evidence=exc.evidence)
     if hasattr(exc, "url"):
         new.url = exc.url  # type: ignore[attr-defined]
@@ -292,7 +293,7 @@ class ZhihuAdapter(PlatformAdapter):
     @classmethod
     def _validate_article(cls, post: PlatformPost, err: Callable[[str, str], None],
                           warn: Callable[[str, str], None]) -> None:
-        from .zhihu_html import collect_image_urls, is_remote
+        from .zhihu_html import collect_image_urls, is_remote, is_zhimg, raw_html_images
 
         o = post.options
         title = post.title.strip()
@@ -315,6 +316,10 @@ class ZhihuAdapter(PlatformAdapter):
                 err("body", f"找不到正文里引用的图片: {ref}（相对路径按 Markdown 文件所在目录解析）")
             else:
                 cls._check_image_ext(path, "body", err, warn)
+        raw_imgs = [u for u in raw_html_images(post.body) if not is_zhimg(u)]
+        if raw_imgs:
+            warn("body", f"HTML <img> 标签里的图片不会上传到知乎图床（{raw_imgs[0]} 等 {len(raw_imgs)} 张），"
+                         "发布后可能显示不出来：改用 Markdown 写法 ![说明](路径)")
         if post.cover is not None:
             cls._check_image_ext(post.cover, "cover", err, warn)
 
@@ -355,6 +360,18 @@ class ZhihuAdapter(PlatformAdapter):
         """上次遇到风控时记下的验证页地址（下次 login 打开）。不用 .json 后缀，免得被当成账号。"""
         return self.settings.accounts_dir / NAME / f"{self.ctx.account}.verify.txt"
 
+    def _ua_file(self) -> Path:
+        """登录浏览器的 User-Agent，发布时沿用（同样不用 .json 后缀）。"""
+        return self.settings.accounts_dir / NAME / f"{self.ctx.account}.ua.txt"
+
+    def _saved_user_agent(self) -> str:
+        from . import zhihu_api
+
+        try:
+            return zhihu_api.normalize_user_agent(self._ua_file().read_text(encoding="utf-8-sig"))
+        except OSError:
+            return ""
+
     def _remember_verify(self, url: str) -> None:
         if not url:
             return
@@ -375,10 +392,11 @@ class ZhihuAdapter(PlatformAdapter):
         cookies = zhihu_api.load_cookies(self.account_file, account=self.ctx.account)
         self._cookies = cookies
         cfg = self.settings.platform_config(NAME)
-        async with zhihu_api.make_client(cookies) as client:
+        async with zhihu_api.make_client(cookies, user_agent=self._saved_user_agent() or None) as client:
             api = zhihu_api.ZhihuApi(
                 client, account=self.ctx.account, log=self.ctx.log,
-                write_interval=_num(cfg, "write_interval", zhihu_api.DEFAULT_WRITE_INTERVAL),
+                write_interval=max(zhihu_api.MIN_WRITE_INTERVAL,
+                                   _num(cfg, "write_interval", zhihu_api.DEFAULT_WRITE_INTERVAL)),
                 image_timeout=_num(cfg, "image_timeout", zhihu_api.DEFAULT_IMAGE_TIMEOUT),
             )
             if not api.xsrf:
@@ -460,12 +478,26 @@ class ZhihuAdapter(PlatformAdapter):
             finally:
                 qr.cleanup()
             self.ctx.log("已登录，保存登录态")
+            await self._remember_user_agent(page)
             try:  # 再打开一次首页，补齐 _xsrf / d_c0 等 cookie
                 await page.goto(zhihu_api.WWW_HOME, wait_until="domcontentloaded", timeout=30_000)
                 await asyncio.sleep(2)
             except Exception as exc:  # noqa: BLE001
                 self.ctx.log(f"打开知乎首页失败（{exc}），直接保存", level="debug")
             return await context.storage_state()
+
+    async def _remember_user_agent(self, page: Any) -> None:
+        from . import zhihu_api
+
+        try:
+            ua = zhihu_api.normalize_user_agent(await page.evaluate("() => navigator.userAgent"))
+        except Exception as exc:  # noqa: BLE001 - 尽力而为，拿不到就用默认 UA
+            self.ctx.log(f"读取浏览器 UA 失败（{exc}），发布时用默认 UA", level="debug")
+            return
+        if ua:
+            path = self._ua_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(ua, encoding="utf-8")
 
     async def _browser_logged_in(self, context: Any, page: Any, initial_z_c0: str | None) -> bool:
         if page.is_closed():
@@ -541,6 +573,17 @@ class ZhihuAdapter(PlatformAdapter):
             self.ctx.log(f"{name}: {prepared.converted_from} 转成 JPEG 上传{extra}", level="warning")
         return await api.upload_image(prepared, source=source, referer=referer)
 
+    def _save_publish_evidence(self, api: Any) -> None:
+        """发布结果不是干净的成功时，把发布接口的原始响应存进本次运行目录（响应里没有 cookie）。"""
+        if api.last_publish is None:
+            return
+        status, text = api.last_publish
+        try:
+            path = self.ctx.evidence_path(f"{NAME}-publish-response.txt")
+            path.write_text(f"HTTP {status}\n\n{text}", encoding="utf-8")
+        except OSError as exc:
+            self.ctx.log(f"保存发布接口响应失败: {exc}", level="debug")
+
     async def _verify(self, getter: Callable[[str], Any], item_id: str) -> bool | None:
         """发布后确认能查到：True 能查到，False 查不到（可能在审核），None 没确认成。绝不抛错。"""
         try:
@@ -560,8 +603,12 @@ class ZhihuAdapter(PlatformAdapter):
                     continue
                 await api.add_article_topic(draft_id, topic)
                 self.ctx.log(f"已添加话题「{topic.get('name') or tag}」")
-            except NeedsAction:
+            except LoginRequired:
                 raise
+            except NeedsAction as exc:  # 风控 / 限流：话题只是锦上添花，跳过；真被封的话发布接口会再拦下
+                self.ctx.log(f"添加话题时被知乎拦截（{exc}），跳过剩下的话题", level="warning")
+                warnings.append("话题被知乎风控拦截，没有添加")
+                break
             except PublishError as exc:
                 self.ctx.log(f"添加话题「{tag}」失败：{exc}", level="warning")
                 warnings.append(f"话题「{tag}」没加上")
@@ -636,8 +683,17 @@ class ZhihuAdapter(PlatformAdapter):
             payload = zhihu_api.article_publish_payload(
                 draft_id=draft_id, title=title, html=html, text_len=zhihu_html.text_length(html),
                 disclaimer_type=disclaimer, toc=toc, column=column)
-            data = await api.publish_content(payload, origin=zhihu_api.ZHUANLAN, referer=edit_url,
-                                             mark_submit=self.ctx.mark_submit_started)
+            rejected = "；内容已在草稿里，可打开链接修改后手动发布"
+            try:
+                data = await api.publish_content(payload, origin=zhihu_api.ZHUANLAN, referer=edit_url,
+                                                 mark_submit=self.ctx.mark_submit_started)
+            except PublishError as exc:
+                self._save_publish_evidence(api)
+                if exc.code is ErrorCode.PLATFORM_ERROR and not isinstance(exc, NeedsAction):
+                    return self.result(Status.FAILED, kind=post.kind, url=edit_url, item_id=draft_id,
+                                       error_code=ErrorCode.PLATFORM_ERROR.value,
+                                       message=f"知乎拒绝发布：{exc}{rejected}")
+                raise _with_draft(exc, edit_url) from exc
             code = zhihu_api.publish_code(data)
             article_id = zhihu_api.parse_publish_id(data) or draft_id
             url = zhihu_api.article_url(article_id)
@@ -645,14 +701,15 @@ class ZhihuAdapter(PlatformAdapter):
                 if await self._verify(api.get_article, article_id):
                     return self.result(Status.PUBLISHED, kind=post.kind, url=url, item_id=article_id,
                                        message=_join("文章已发布", warnings))
+                self._save_publish_evidence(api)
                 raise PublishError(f"发布接口返回了无法识别的结果：先打开 {edit_url} 确认是否已发布，不要直接重发",
                                    code=ErrorCode.UNKNOWN_OUTCOME)
             if code not in (0, "0"):
+                self._save_publish_evidence(api)
                 return self.result(
                     Status.FAILED, kind=post.kind, url=edit_url, item_id=draft_id,
                     error_code=ErrorCode.PLATFORM_ERROR.value,
-                    message=f"知乎拒绝发布（{code}: {zhihu_api.error_message(data)}）；内容已在草稿里，"
-                            f"可打开链接修改后手动发布")
+                    message=f"知乎拒绝发布（{code}: {zhihu_api.error_message(data)}）{rejected}")
             visible = await self._verify(api.get_article, article_id)
         if visible is False:
             return self.result(Status.SUBMITTED, kind=post.kind, url=url, item_id=article_id,
@@ -675,13 +732,19 @@ class ZhihuAdapter(PlatformAdapter):
             html = zhihu_html.pin_html(text, images)
             payload = zhihu_api.pin_publish_payload(draft_id=draft_id, title=post.title.strip(), html=html,
                                                     text_len=zhihu_html.text_length(html), images=images)
-            data = await api.publish_content(payload, origin=zhihu_api.WWW, referer=zhihu_api.WWW_HOME,
-                                             mark_submit=self.ctx.mark_submit_started)
+            try:
+                data = await api.publish_content(payload, origin=zhihu_api.WWW, referer=zhihu_api.WWW_HOME,
+                                                 mark_submit=self.ctx.mark_submit_started)
+            except PublishError:
+                self._save_publish_evidence(api)
+                raise
             code = zhihu_api.publish_code(data)
             if code not in (None, 0, "0"):
+                self._save_publish_evidence(api)
                 raise PublishError(f"知乎拒绝发布想法（{code}: {zhihu_api.error_message(data)}）")
             pin_id = zhihu_api.parse_publish_id(data)
             if not pin_id:
+                self._save_publish_evidence(api)
                 if code is None:
                     raise PublishError("发布接口返回了无法识别的结果：先到知乎个人主页「想法」里确认，不要直接重发",
                                        code=ErrorCode.UNKNOWN_OUTCOME)

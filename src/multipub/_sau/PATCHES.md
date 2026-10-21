@@ -21,7 +21,7 @@
 | `utils/__init__.py` | 同名 | `e69de29b` | 原样（空文件） |
 | `LICENSE` | `LICENSE` | `beeaf19c` | 原样 |
 | `conf.py` | （上游 gitignore，`conf.example.py`） | — | multipub 新写的 shim |
-| `runtime.py` | — | — | multipub 新增：钩子、截止时间、异常类型 |
+| `runtime.py` | — | — | multipub 新增：钩子、截止时间、防重复点击（`PublishGuard`）、异常类型、收尾工具 |
 
 ## 改动清单
 
@@ -58,11 +58,28 @@
   - 超时调用 `fail_step()`：截图到 `evidence_dir`，按页面特征抛 `CaptchaRequired` / `LoginPageDetected` / `StepTimeout`，
     异常带 `after_submit` 标记（是否已点过最终「发布」）。
   - 第一次点击最终「发布」按钮前调用 `_before_publish_click()` → `hooks.before_publish_click`（适配器接到
-    `ctx.mark_submit_started()`）。小红书只在按钮存在（`count()>0`）时才标记。
+    `ctx.mark_submit_started()`）。只在按钮存在（`count()>0`）时才点击/标记。
+  - **防重复发布**：上游循环每 ~3.5 秒点一次「发布」直到跳转，平台处理慢时可能提交两次。现在最终发布按钮只经
+    `_click_publish()` 点击，受 `runtime.PublishGuard` 限制：第一次之后，只有 (1) 平台弹窗拦下了上次点击
+    （短信验证已处理、抖音「请设置封面后再发布」已选推荐封面）或 (2) 距上次点击 ≥ `reclick_gap`（20 秒）且期间没观察到
+    发布请求，才允许再点；有发布请求未返回、已拿到成功回执、或已点 `max_publish_clicks`（3）次时不再点。
+    发布请求靠被动监听页面网络事件（`request` / `response` / `requestfailed`，不拦截不修改）：
+    抖音 `POST creator.douyin.com/web/api/media/aweme/create(_v2)/`，小红书 `POST *.xiaohongshu.com/web_api/sns/v2/note`
+    （与开源 xhs 客户端 ReaJason/xhs 一致）。路径未在真实账号上验证；监听不到时只剩间隔与次数两道限制。
+  - 发布接口明确返回失败（抖音 `status_code != 0`、小红书 `success: false`），`reject_grace`（15 秒）内没有弹出验证：
+    `fail_rejected()` 截图并抛 `PublishRejected`（适配器映射为 `platform_error`，不重试），不再空等到超时。
+  - 抖音视频/图文的两个发布循环合并为基类 `DouYinBaseUploader._publish_until_success(page, what, success_url)`；
+    视频特有行为（`force=True` 点击、每轮移除浮层、`handle_auto_video_cover`、宽松短信判定）通过
+    `PUBLISH_CLICK_KWARGS` / `_prepare_publish_attempt` / `_platform_blocked_publish` / `STRICT_SMS_CHECK` 保持上游原样；
+    选择器、成功 URL、日志文字不变。
   - 抖音视频上传失败重传最多 3 次（`MAX_UPLOAD_RETRIES`），之后抛 `UploadFailed`（上游无限重传）。
   - 循环里的 `except Exception` 前加 `except SauError: raise`，保证这些异常不被吞掉。
   - `upload()` 出错时先整页截图（`save_screenshot`）再抛出；抖音视频补上 `finally` 关闭浏览器。
+  - 发布成功后的收尾（回写 cookie `storage_state`、关闭 context/browser）改用 `save_state_quietly()` / `close_quietly()`：
+    出错只告警，不会把已成功的发布报成失败，也不会掩盖原异常；被 worker 超时取消时同样会关闭浏览器。
   - `validate_base_args()` 改抛 `CookieInvalid`（原 `RuntimeError`），适配器据此提示重新登录。
+  - 抖音 `apply_self_declaration()` 失败改抛 `DeclarationFailed`（原 `RuntimeError`）并先截图；适配器映射为 `validation`，
+    提示检查 `declaration` 文字。仍然“设置失败就拒绝发布”（上游行为）。
   - 删除循环里 `if self.debug: page.screenshot(full_page=True)`（没有路径，什么也不保存）。
 - 原因：页面改版时上游会无限卡住；也无法区分“没点发布”与“点了但不知道结果”。
 
@@ -95,7 +112,9 @@
     图文流程用 `strict=True`：除了输入框，还要求出现验证组件特征（`SMS_DIALOG_MARKERS`），避免误判。
   - 检测到弹窗：先删除残留的 `verify_code.txt`，点「获取验证码」，`hooks.sms_code_required(path)` 通知一次，
     按 `poll_interval` 轮询文件，超过 `sms_timeout` 截图并抛 `SmsCodeTimeout`（适配器映射为 `NeedsAction(SMS_CODE_REQUIRED)`）。
-    提交验证码后重置发布循环的截止时间。
+    提交验证码后重置发布循环的截止时间，并告诉 `PublishGuard` 上次点击被拦下（允许再点一次「发布」，与上游一致）。
+  - 每次发布最多处理 `MAX_SMS_ROUNDS`（3）轮短信验证；第 4 次检测到弹窗（验证码错误/过期）截图并抛 `SmsVerifyFailed`
+    （同样映射为 `sms_code_required`），避免反复发短信、无限循环。
   - `_submit_sms_verify_code()` 移到基类，日志里不再打印验证码本身。
   - 文件路径来自 `conf.verify_code_file()`（= `settings.sau_home/verify_code.txt`，与 `mpub verify-code douyin` 一致）。
 
@@ -114,10 +133,17 @@
   的响应，记录 `item_id`（`published_item_id`）或 `status_msg`（`publish_api_error`）；点击发布后超时时两者都附在错误信息里。
   不拦截、不修改请求；接口路径未在真实账号上验证，拿不到时不影响流程。
 - w5 小红书 `cookie_auth`：去掉 `LOCAL_CHROME_PATH` 分支，统一走 `launch_kwargs()`（行为等价）。
+- w6 抖音 `_save_douyin_qrcode`：定位不到二维码元素时（上游只告警继续等），把登录页截图当作二维码图片经
+  `qrcode_callback` 上报（payload 带 `fallback: True`），无头登录或窗口不在前台时用户也能扫。
+- w7 小红书：新增 `_watch_publish_response()`（见 d），创建笔记接口成功时记录 `published_note_id`（24 位十六进制），
+  适配器作为 `item_id` 返回（不拼链接：小红书分享链接需要 xsec_token）。
+- w8 小红书 `apply_declarations()`：AI 声明没选上时记入 `declaration_warnings`，适配器写进结果消息，提醒人工补充。
+- w9 抖音创建接口回执：成功判定增加 HTTP 2xx（与 postsail 的同类监听一致），并把请求进出告知 `PublishGuard`。
 
 ## 升级上游时
 
 1. 在上游新提交上 diff 上表中的文件；
 2. 逐条重放 a–i、w1–w5（搜索 `# multipub patch:`）；
-3. 特别确认：上游是否又加了默认声明 / 强制开关、是否新增了 `while True` 循环、是否有新的 `print()` 或 stdout 输出；
+3. 特别确认：上游是否又加了默认声明 / 强制开关、是否新增了 `while True` 循环、是否有新的 `print()` 或 stdout 输出、
+   是否有新的直接点击最终「发布」按钮的地方（必须改走 `_click_publish()`）；
 4. 跑 `pytest tests/test_douyin_xhs.py`，更新本文件的提交号与 blob。

@@ -37,6 +37,8 @@ class XiaohongshuAdapter(PlatformAdapter):
         if not post.title.strip():
             if post.kind is Kind.VIDEO:
                 c.error("title", "小红书视频需要标题")
+            elif not post.body.strip():
+                c.error("title", "小红书图文需要标题（或至少有正文，用正文前 20 字作标题）")
             else:
                 c.warn("title", "未填标题，将使用正文前 20 字作为标题")
         # SAU 会静默截断到 20 字，这里直接报错
@@ -54,6 +56,8 @@ class XiaohongshuAdapter(PlatformAdapter):
                 c.error("images", f"小红书图文需要 1-{IMAGES_MAX} 张图片，当前 {len(post.images)} 张")
             for img in post.images:
                 c.ext("images", img, bridge.IMAGE_EXTS)
+            if any(img.suffix.lower() == ".bmp" for img in post.images):
+                c.warn("images", "小红书网页端可能不接受 BMP，建议转成 JPG / PNG")
             if post.cover is not None:
                 c.warn("cover", "小红书图文以第一张图片为封面，cover 已忽略")
         c.options(opts, KNOWN_OPTIONS, post.kind)
@@ -96,8 +100,13 @@ class XiaohongshuAdapter(PlatformAdapter):
             status, msg = Status.SCHEDULED, f"已设置定时发布（{post.schedule:%Y-%m-%d %H:%M}）"
         else:
             status, msg = Status.SUBMITTED, "已提交，审核通过后公开"
-        msg += "；小红书未返回笔记链接，请到创作服务平台「笔记管理」查看"
-        return self.result(status, kind=post.kind, message=msg)
+        note_id = getattr(uploader, "published_note_id", None) or None
+        if note_id:
+            msg += f"；笔记 ID {note_id}"
+        msg += "；小红书不返回可分享的笔记链接，请到创作服务平台「笔记管理」查看"
+        for warning in getattr(uploader, "declaration_warnings", None) or []:
+            msg += f"；注意：{warning}"
+        return self.result(status, kind=post.kind, message=msg, item_id=note_id)
 
     def build_uploader(self, xhs: Any, post: PlatformPost) -> Any:
         """PlatformPost → vendored SAU 的 XiaoHongShuVideo / XiaoHongShuNote。"""
