@@ -5,7 +5,7 @@
 .DESCRIPTION
     1. 检查 uv；没有时显示官方安装命令，征得同意后才运行。
     2. uv sync 安装依赖（失败时退回 uv venv + uv pip install -e .）。
-    3. uv run mpub setup：安装浏览器内核、下载 biliup（已装好的会跳过）。
+    3. uv run mpub setup：安装浏览器内核、准备 biliup（会问你用本机已有的还是下载；已装好的会跳过）。
     4. uv run mpub doctor：环境自检。
 
 .PARAMETER China
@@ -154,7 +154,7 @@ function Invoke-Main {
     }
     $setupArgs = @('run', 'mpub', 'setup')
     if ($SkipBrowser) { $setupArgs += '--skip-browser' }
-    Write-Step '安装浏览器内核、下载 biliup（mpub setup）'
+    Write-Step '安装浏览器内核、准备 biliup（mpub setup，会问你 biliup 用哪个）'
     $code = Invoke-Native $uv $setupArgs
     if ($code -ne 0) {
         $result = 1
@@ -162,7 +162,8 @@ function Invoke-Main {
         Write-Hint '- Chromium 下载失败：镜像可能没有 patchright 需要的版本。可以改用本机 Chrome / Edge，'
         Write-Hint '  在 %LOCALAPPDATA%\multipub\config.toml 写入  [browser]  channel = "chrome"（或 "msedge"），'
         Write-Hint '  然后加 -SkipBrowser 重新运行本脚本。'
-        Write-Hint '- biliup 下载失败：在 config.toml 设置  github_mirror = "https://ghfast.top/"  后重试。'
+        Write-Hint '- biliup 下载失败：在 config.toml 设置  github_mirror = "https://ghfast.top/"  后重试；'
+        Write-Hint '  或用本机已有的 biliup：uv run mpub biliup find，再 uv run mpub biliup use <编号或路径>。'
         Write-Hint '详见 docs\windows.md'
     }
 

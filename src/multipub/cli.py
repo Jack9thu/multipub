@@ -203,6 +203,13 @@ def cmd_setup(args: argparse.Namespace, settings: Settings, out: Printer) -> int
     return EXIT_OK if ok else EXIT_FAILED
 
 
+def _ask(prompt: str) -> str:
+    """提问写到 stderr 再读一行。stdout 可能经管道转发（install.ps1 的 | Out-Host 按行显示），
+    交给 input() 的不换行提示会一直看不到。"""
+    print(prompt, end="", file=sys.stderr, flush=True)
+    return input()
+
+
 def _setup_biliup_choice(args: argparse.Namespace, settings: Settings, out: Printer) -> dict[str, Any] | None:
     """mpub setup 里 biliup 的来源由用户决定。返回 None 表示已经有来源（或刚选好），照常执行 B站 setup；
     返回一个步骤表示还需要用户选择（非交互环境不擅自下载）。"""
@@ -238,14 +245,14 @@ def _setup_biliup_choice(args: argparse.Namespace, settings: Settings, out: Prin
     default = "2" if usable else "3"
     while True:
         try:
-            ans = input(f"请选择 [{default}]: ").strip() or default
+            ans = _ask(f"请选择 [{default}]: ").strip() or default
         except EOFError:
             ans = default
         if ans == "1":
-            path = input("biliup 路径: ").strip()
+            path = _ask("biliup 路径: ").strip()
             ok, msg, _ = bili_locate.use(settings, path)
         elif ans == "2" and usable:
-            pick = input("编号（回车 = 自动）: ").strip()
+            pick = _ask("编号（回车 = 自动）: ").strip()
             ok, msg, _ = bili_locate.use(settings, pick) if pick else bili_locate.use(settings, mode="auto")
         elif ans == "3":
             ok, msg, _ = bili_locate.use(settings, mode="download")
