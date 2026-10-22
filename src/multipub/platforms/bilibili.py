@@ -434,6 +434,7 @@ class BilibiliAdapter(PlatformAdapter):
         if exe is None:
             raise PublishError("未找到 biliup：先运行 mpub setup（或在 config.toml 设置 biliup_path）",
                                code=ErrorCode.INTERNAL)
+        await self._preflight_biliup(exe)
         # 先做一次与 biliup 相同的只读令牌校验：登录失效时在"开始上传"之前就报 login_required
         try:
             await asyncio.wait_for(self._token(cred, timeout=TOKEN_PRECHECK_TIMEOUT), TOKEN_PRECHECK_TIMEOUT * 2)
@@ -459,8 +460,21 @@ class BilibiliAdapter(PlatformAdapter):
         outcome = bili_biliup.parse_upload_output(lines, rc, echo=echo)
         return self._video_result(post, outcome, timeout)
 
+    async def _preflight_biliup(self, exe: Path) -> None:
+        """标记投稿之前先试运行 `biliup --version`（纯本地）：缺 VC++ 运行库这类起不来的情况在这里报，
+        而不是标记 submit_started 之后得到一个看不懂的退出码。"""
+        from . import bili_biliup
+
+        probe = await asyncio.to_thread(bili_biliup.probe_cached, exe)
+        if probe.ok:
+            return
+        message = f"{probe.detail}；没有启动上传（尚未投稿）"
+        if probe.timed_out:
+            raise PublishError(message, code=ErrorCode.TIMEOUT, retryable=True)
+        raise PublishError(f"{message}，处理后重新发布", code=ErrorCode.INTERNAL)
+
     def _video_result(self, post: PlatformPost, o: Any, timeout: float) -> Result:
-        from .bili_biliup import video_url
+        from .bili_biliup import startup_failure_hint, video_url
 
         url = video_url(o.bvid, o.aid)
         if o.submitted:
@@ -481,6 +495,9 @@ class BilibiliAdapter(PlatformAdapter):
                                code=ErrorCode.UNKNOWN_OUTCOME)
         if o.response_code not in (None, 0):
             raise PublishError(f"B站拒绝投稿（{o.response_code}: {o.response_message}）")
+        hint = startup_failure_hint(o.returncode)
+        if hint and not o.uploaded:  # 进程根本没起来（缺 DLL 等），什么都没发
+            raise PublishError(f"{hint}；尚未投稿，处理后重新发布", code=ErrorCode.INTERNAL)
         if o.returncode == 0:
             return self.result(Status.SUBMITTED, kind=post.kind,
                                message="biliup 正常退出但没解析到投稿结果，请到创作中心确认")

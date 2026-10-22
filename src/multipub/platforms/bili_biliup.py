@@ -7,6 +7,8 @@
   其他版本首次下载时记录（trust-on-first-use），写在二进制旁边的 install.json / *.sha256。
 - 命令行参数按 biliup v1.3.1 源码（crates/biliup-cli/src/cli.rs、
   crates/biliup/src/uploader/bilibili.rs 的 Studio）核对过；全局参数必须写在子命令前面。
+- Windows 版 biliup.exe 静态导入 VCRUNTIME140.dll（压缩包里没带），缺 VC++ 运行库时进程根本起不来。
+  安装后、doctor、每次上传视频前都用 `biliup --version`（probe_binary）试启动一次。
 
 本模块只依赖标准库（httpx 在下载时才导入），主进程可以导入。
 """
@@ -25,10 +27,11 @@ import sys
 import tarfile
 import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from ..config import Settings
 
@@ -141,15 +144,115 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def binary_version(path: Path, timeout: float = 15) -> str | None:
-    """运行 `biliup --version`（纯本地，不联网）。注意不带参数的 biliup 会启动 Web 服务。"""
-    try:
-        proc = subprocess.run([str(path), "--version"], capture_output=True, timeout=timeout,
-                              **_no_window_kwargs())
-    except (OSError, subprocess.SubprocessError):
+# ------------------------------------------------------------------ 能否启动（--version 试运行）
+
+VCREDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+VCRUNTIME_HINT = f"缺少 Microsoft Visual C++ 运行库（VCRUNTIME140.dll），请安装 {VCREDIST_URL}"
+# Windows 加载器失败时的进程退出码（NTSTATUS）。Python 给的是无符号值，也兼容有符号写法
+STATUS_DLL_NOT_FOUND = 0xC0000135  # 3221225781 / -1073741515
+_LOADER_FAILURES = {
+    0xC000007B: "STATUS_INVALID_IMAGE_FORMAT",  # 常见于找到了 32 位的 DLL
+    0xC0000138: "STATUS_ORDINAL_NOT_FOUND",
+    0xC0000139: "STATUS_ENTRYPOINT_NOT_FOUND",  # 运行库太旧
+}
+PROBE_TIMEOUT = 30.0  # 正常不到 1 秒；首次运行可能被杀毒软件扫描
+SEM_FAILCRITICALERRORS = 0x0001
+SEM_NOGPFAULTERRORBOX = 0x0002
+
+
+def startup_failure_hint(returncode: int | None) -> str | None:
+    """退出码表示进程根本没启动起来（Windows 加载 DLL 失败）时，返回原因和处理办法；否则 None。"""
+    if returncode is None:
         return None
-    m = re.search(r"(\d+\.\d+\.\d+\S*)", proc.stdout.decode("utf-8", "replace"))
-    return f"v{m.group(1)}" if m else None
+    code = returncode & 0xFFFFFFFF
+    if code == STATUS_DLL_NOT_FOUND:
+        return f"biliup 无法启动：{VCRUNTIME_HINT}"
+    if code in _LOADER_FAILURES:
+        return (f"biliup 无法启动（0x{code:08X} {_LOADER_FAILURES[code]}）：Microsoft Visual C++ 运行库"
+                f"可能损坏或版本太旧，请重新安装 {VCREDIST_URL}")
+    return None
+
+
+def _kernel32() -> Any:
+    import ctypes
+
+    return ctypes.WinDLL("kernel32")  # type: ignore[attr-defined]
+
+
+@contextmanager
+def quiet_error_mode() -> Iterator[None]:
+    """Windows：子进程继承调用方的错误模式。默认缺 DLL 时系统弹出错误框、一直等人点掉（无人值守就卡住）；
+    启动 biliup 期间关掉这类弹框，让它直接以 0xC0000135 退出，由我们给出提示。其他系统什么都不做。"""
+    k32: Any = None
+    old = 0
+    if sys.platform == "win32":
+        try:
+            k32 = _kernel32()
+            old = int(k32.GetErrorMode())
+            k32.SetErrorMode(old | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)
+        except (OSError, AttributeError, ValueError):
+            k32 = None
+    try:
+        yield
+    finally:
+        if k32 is not None:
+            k32.SetErrorMode(old)
+
+
+@dataclass
+class Probe:
+    """`biliup --version` 试运行的结果。"""
+
+    ok: bool
+    version: str | None = None
+    returncode: int | None = None
+    timed_out: bool = False
+    detail: str = ""  # 不 ok 时：原因和处理办法
+
+
+def probe_binary(path: Path, timeout: float = PROBE_TIMEOUT) -> Probe:
+    """运行 `biliup --version`（纯本地、不联网）确认它能启动。
+
+    注意不带参数的 biliup 会启动 Web 服务，绝不能那样调用。"""
+    try:
+        with quiet_error_mode():
+            proc = subprocess.run([str(path), "--version"], stdin=subprocess.DEVNULL, capture_output=True,
+                                  timeout=timeout, env=biliup_env(), **_no_window_kwargs())
+    except subprocess.TimeoutExpired:
+        return Probe(False, timed_out=True,
+                     detail=f"biliup --version {timeout:g} 秒没有结束（可能正被杀毒软件扫描或拦截），稍后重试")
+    except OSError as exc:
+        return Probe(False, detail=f"无法运行 biliup（{path}）：{exc}")
+    hint = startup_failure_hint(proc.returncode)
+    if hint:
+        return Probe(False, returncode=proc.returncode, detail=hint)
+    stdout = strip_ansi(proc.stdout.decode("utf-8", "replace"))
+    if proc.returncode != 0:
+        text = stdout + "\n" + strip_ansi(proc.stderr.decode("utf-8", "replace"))
+        tail = " | ".join(x.strip() for x in text.splitlines() if x.strip())[-300:]
+        return Probe(False, returncode=proc.returncode,
+                     detail=f"biliup --version 失败（退出码 {proc.returncode}）" + (f"：{tail}" if tail else ""))
+    m = re.search(r"(\d+\.\d+\.\d+\S*)", stdout)
+    return Probe(True, version=f"v{m.group(1)}" if m else None, returncode=0)
+
+
+_PROBE_OK: dict[tuple[str, int, int], Probe] = {}
+
+
+def probe_cached(path: Path, timeout: float = PROBE_TIMEOUT) -> Probe:
+    """同一进程里同一个文件（路径、大小、修改时间都没变）试运行成功过就不再试；失败的每次都重试。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return probe_binary(path, timeout)
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    hit = _PROBE_OK.get(key)
+    if hit is not None:
+        return hit
+    probe = probe_binary(path, timeout)
+    if probe.ok:
+        _PROBE_OK[key] = probe
+    return probe
 
 
 def _no_window_kwargs() -> dict[str, Any]:
@@ -165,9 +268,11 @@ def doctor_items(settings: Settings) -> list[dict[str, Any]]:
         p = Path(settings.biliup_path).expanduser()
         if not p.is_file():
             return [{"name": "biliup", "ok": False, "detail": f"biliup_path 指向的文件不存在: {p}"}]
-        ver = binary_version(p)
+        probe = probe_binary(p)
+        if not probe.ok:
+            return [{"name": "biliup", "ok": False, "detail": f"{p}（biliup_path）：{probe.detail}"}]
         return [{"name": "biliup", "ok": True,
-                 "detail": f"{p}（biliup_path，版本 {ver or '未知'}，不受 mpub setup 管理）"}]
+                 "detail": f"{p}（biliup_path，版本 {probe.version or '未知'}，不受 mpub setup 管理）"}]
     exe = managed_path(settings)
     if not exe.is_file():
         detail = f"未安装 {settings.biliup_version}：运行 mpub setup（国内网络可设置 github_mirror）"
@@ -184,7 +289,18 @@ def doctor_items(settings: Settings) -> list[dict[str, Any]]:
     if expected and sha256_file(exe) != expected:
         return [{"name": "biliup", "ok": False,
                  "detail": f"{exe} 与安装时记录的 sha256 不一致（被替换或损坏）：删除该目录后重新 mpub setup"}]
+    probe = probe_binary(exe)  # 文件没问题不等于能运行（例如缺 VC++ 运行库）
+    if not probe.ok:
+        return [{"name": "biliup", "ok": False, "detail": f"{exe}：{probe.detail}"}]
     return [{"name": "biliup", "ok": True, "detail": detail}]
+
+
+def _installed_item(dest: Path, detail: str) -> dict[str, Any]:
+    """安装结果：再试运行一次 `--version`，起不来就算失败（文件留着，装好运行库后不用重新下载）。"""
+    probe = probe_binary(dest)
+    if not probe.ok:
+        return {"name": "biliup", "ok": False, "detail": f"{detail}；但{probe.detail}"}
+    return {"name": "biliup", "ok": True, "detail": detail}
 
 
 def install(settings: Settings, *, force: bool = False, transport: Any = None,
@@ -193,11 +309,12 @@ def install(settings: Settings, *, force: bool = False, transport: Any = None,
     say = log or (lambda msg: print(msg, file=sys.stderr, flush=True))
     if settings.biliup_path:
         p = Path(settings.biliup_path).expanduser()
-        return {"name": "biliup", "ok": p.is_file(),
-                "detail": f"使用 biliup_path={p}" + ("" if p.is_file() else "（文件不存在）")}
+        if not p.is_file():
+            return {"name": "biliup", "ok": False, "detail": f"使用 biliup_path={p}（文件不存在）"}
+        return _installed_item(p, f"使用 biliup_path={p}")
     dest = managed_path(settings)
     if dest.is_file() and not force:
-        return {"name": "biliup", "ok": True, "detail": f"已安装 {settings.biliup_version}: {dest}"}
+        return _installed_item(dest, f"已安装 {settings.biliup_version}: {dest}")
 
     version = settings.biliup_version
     try:
@@ -238,7 +355,7 @@ def install(settings: Settings, *, force: bool = False, transport: Any = None,
     (folder / f"{asset}.sha256").write_text(f"{digest}  {asset}\n", encoding="utf-8")
     note = "与内置校验值一致" if expected else "首次下载，已记录（trust-on-first-use，请自行核对）"
     say(f"biliup 压缩包 sha256={digest}（{note}）")
-    return {"name": "biliup", "ok": True, "detail": f"已安装 {version}: {dest}；sha256={digest}（{note}）"}
+    return _installed_item(dest, f"已安装 {version}: {dest}；sha256={digest}（{note}）")
 
 
 DOWNLOAD_DEADLINE = 30 * 60  # 整个下载最多 30 分钟
@@ -485,9 +602,10 @@ async def run_streaming(args: list[str], *, cwd: Path, timeout: float,
                         on_line: LineHandler | None = None, heartbeat: float = 30) -> tuple[int | None, list[str]]:
     """运行命令，逐行收集 stdout+stderr。超时杀进程并返回 (None, 已有输出)。"""
     cwd.mkdir(parents=True, exist_ok=True)
-    proc = await asyncio.create_subprocess_exec(
-        *args, cwd=str(cwd), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT, env=biliup_env(), limit=STREAM_LIMIT, **_no_window_kwargs())
+    with quiet_error_mode():  # 无人值守：缺 DLL / 崩溃时不弹系统错误框
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=str(cwd), stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT, env=biliup_env(), limit=STREAM_LIMIT, **_no_window_kwargs())
     assert proc.stdout is not None
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -534,7 +652,7 @@ async def renew(exe: Path, cookie_file: Path, *, cwd: Path, timeout: float = 90)
     rc, lines = await run_streaming([str(exe), "--rust-log", "info", "-u", str(cookie_file), "renew"],
                                     cwd=cwd, timeout=timeout)
     tail = " | ".join(x for x in lines[-5:] if x.strip())
-    return rc == 0, tail
+    return rc == 0, startup_failure_hint(rc) or tail
 
 
 def run_interactive_login(settings: Settings, account: str) -> int:
@@ -555,4 +673,7 @@ def run_interactive_login(settings: Settings, account: str) -> int:
     proc = subprocess.run([str(exe), "-u", str(cookie_file), "login"], cwd=str(cookie_file.parent))
     if proc.returncode == 0 and cookie_file.is_file() and cookie_file.stat().st_mtime >= started - 1:
         print(f"登录信息已保存: {cookie_file}", file=sys.stderr)
+    hint = startup_failure_hint(proc.returncode)
+    if hint:
+        print(hint, file=sys.stderr)
     return proc.returncode
