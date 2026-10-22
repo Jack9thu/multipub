@@ -21,7 +21,6 @@ import json
 import os
 import platform as _platform
 import re
-import shutil
 import subprocess
 import sys
 import tarfile
@@ -120,11 +119,11 @@ def managed_path(settings: Settings) -> Path:
 
 
 def find_biliup(settings: Settings) -> Path | None:
-    if settings.biliup_path:
-        p = Path(settings.biliup_path).expanduser()
-        return p if p.is_file() else None
-    p = managed_path(settings)
-    return p if p.is_file() else None
+    """按用户的选择找到要用的 biliup（见 bili_locate）；用不了时返回 None，原因用 bili_locate.resolve() 查看。"""
+    from .bili_locate import resolve
+
+    res = resolve(settings)
+    return res.path if res.ok else None
 
 
 def read_install_info(settings: Settings) -> dict[str, Any] | None:
@@ -265,23 +264,19 @@ def _no_window_kwargs() -> dict[str, Any]:
 # ------------------------------------------------------------------ doctor / setup
 
 def doctor_items(settings: Settings) -> list[dict[str, Any]]:
-    if settings.biliup_path:
-        p = Path(settings.biliup_path).expanduser()
-        if not p.is_file():
-            return [{"name": "biliup", "ok": False, "detail": f"biliup_path 指向的文件不存在: {p}"}]
-        probe = probe_binary(p)
-        if not probe.ok:
-            return [{"name": "biliup", "ok": False, "detail": f"{p}（biliup_path）：{probe.detail}"}]
+    from .bili_locate import MODE_ZH, forget_checks, resolve
+
+    forget_checks()
+    res = resolve(settings)
+    if res.mode not in ("download", "default"):
+        # 用户指定的 / 自动找到的 / config 配置的：报告来源和兼容性
+        if not res.ok:
+            return [{"name": "biliup", "ok": False, "detail": f"{res.detail}：{res.problem}"}]
         return [{"name": "biliup", "ok": True,
-                 "detail": f"{p}（biliup_path，版本 {probe.version or '未知'}，不受 mpub setup 管理）"}]
+                 "detail": f"{res.detail}（来源：{MODE_ZH[res.mode]}，不受 mpub setup 管理）"}]
     exe = managed_path(settings)
     if not exe.is_file():
-        detail = f"未安装 {settings.biliup_version}：运行 mpub setup（国内网络可设置 github_mirror）"
-        on_path = shutil.which("biliup") or shutil.which("biliupR")
-        if on_path:
-            detail += (f"；也可以直接用已安装的 {on_path}：在 config.toml 的 [platforms.bilibili] 写 "
-                       f"biliup_path（参数按 {settings.biliup_version} 核对过，版本差太多可能不兼容）")
-        return [{"name": "biliup", "ok": False, "detail": detail}]
+        return [{"name": "biliup", "ok": False, "detail": f"{res.detail}：{res.problem}"}]
     info = read_install_info(settings) or {}
     detail = f"{settings.biliup_version} {exe}"
     if info.get("archive_sha256"):
@@ -290,9 +285,8 @@ def doctor_items(settings: Settings) -> list[dict[str, Any]]:
     if expected and sha256_file(exe) != expected:
         return [{"name": "biliup", "ok": False,
                  "detail": f"{exe} 与安装时记录的 sha256 不一致（被替换或损坏）：删除该目录后重新 mpub setup"}]
-    probe = probe_binary(exe)  # 文件没问题不等于能运行（例如缺 VC++ 运行库）
-    if not probe.ok:
-        return [{"name": "biliup", "ok": False, "detail": f"{exe}：{probe.detail}"}]
+    if not res.ok:  # resolve() 已经试运行过：文件没问题不等于能运行（例如缺 VC++ 运行库）
+        return [{"name": "biliup", "ok": False, "detail": f"{exe}：{res.problem}"}]
     return [{"name": "biliup", "ok": True, "detail": detail}]
 
 
@@ -309,11 +303,15 @@ def install(settings: Settings, *, force: bool = False, transport: Any = None,
             log: Callable[[str], None] | None = None) -> dict[str, Any]:
     """下载并安装固定版本的 biliup。已安装则什么都不做（不自动更新）。"""
     say = log or (lambda msg: print(msg, file=sys.stderr, flush=True))
-    if settings.biliup_path:
-        p = Path(settings.biliup_path).expanduser()
-        if not p.is_file():
-            return {"name": "biliup", "ok": False, "detail": f"使用 biliup_path={p}（文件不存在）"}
-        return _installed_item(p, f"使用 biliup_path={p}", managed=False)
+    from .bili_locate import MODE_ZH, forget_checks, resolve
+
+    forget_checks()
+    res = resolve(settings)
+    if res.mode in ("configured", "path", "auto"):
+        # 用户选了用本机已有的 biliup：不下载，只确认它能用
+        if not res.ok:
+            return {"name": "biliup", "ok": False, "detail": f"{res.detail}：{res.problem}"}
+        return {"name": "biliup", "ok": True, "detail": f"{res.detail}（来源：{MODE_ZH[res.mode]}，不下载）"}
     dest = managed_path(settings)
     if dest.is_file() and not force:
         return _installed_item(dest, f"已安装 {settings.biliup_version}: {dest}")
@@ -422,13 +420,15 @@ def creation_statement_for(options: dict[str, Any], ai_generated: bool) -> int |
     return 1 if ai_generated else None
 
 
-def build_upload_args(exe: Path, cookie_file: Path, post: Any) -> list[str]:
-    """拼 `biliup -u <file> upload ...`。字符串一律用 --opt=value，避免值以 - 开头被误解析。"""
+def build_upload_args(exe: Path, cookie_file: Path, post: Any, *, rust_log: bool = True) -> list[str]:
+    """拼 `biliup -u <file> upload ...`。字符串一律用 --opt=value，避免值以 - 开头被误解析。
+
+    rust_log=False：本机 biliup 太旧、不认识全局 --rust-log 时去掉它（见 bili_locate.supports_rust_log）。"""
     o = post.options
     title = post.title.strip()
     desc = post.body.strip() or title  # B站简介不能为空：没写就用标题
     copyright_ = int(o.get("copyright", 1))
-    args = [str(exe), "--rust-log", "info", "-u", str(cookie_file), "upload",
+    args = [str(exe), *(["--rust-log", "info"] if rust_log else []), "-u", str(cookie_file), "upload",
             f"--title={title}", f"--desc={desc}", f"--tid={int(o['tid'])}",
             f"--tag={','.join(post.tags)}", f"--copyright={copyright_}"]
     if copyright_ == 2:
@@ -482,10 +482,34 @@ _SUBMIT_OK_RE = re.compile(r"(?:APP|Web|BCUT)\s*接口投稿成功")
 LOGIN_ERROR_MARKERS = ("credential validation failed", "credential refresh failed",
                        "open cookies file", "账号未登录", "未知平台", "missing field `token_info`")
 _ECHO_MIN_LEN = 4  # 太短的回显串不做替换，免得把标记本身抹掉
+# biliup 出错时打印的 error-stack 报告："Error: <标题>"，下面每层原因一行 "├─▶ <消息>" / "╰─▶ <消息>"，
+# 其余是 "├╴at <源码位置>"、backtrace 等装饰（backtrace 有十几行，输出末尾往往只剩它们）
+_REPORT_HEAD_RE = re.compile(r"^Error: (.+)$")
+_REPORT_CAUSE_RE = re.compile(r"^[│\s]*[├╰]─▶ (.+)$")
+_REPORT_DECOR_RE = re.compile(r"^[│\s]*(?:[├╰]╴|━|backtrace no\.|\d+: |at \S)")
 
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
+
+
+# 上面这些日志格式 / 标记按这些版本的源码核对过（biliup_path 指向的其他版本不保证）
+OUTPUT_VERIFIED_VERSIONS = frozenset({"v1.3.1"})
+
+
+def output_format_verified(version: str | None) -> bool:
+    return version in OUTPUT_VERIFIED_VERSIONS
+
+
+def marks_submit_phase(line: str) -> bool:
+    """这一行说明视频已全部传完（或已经到了投稿这一步）：biliup 接下来就会发投稿请求。
+    只认 biliup 自己的 INFO 日志（行首是时间戳，回显的文件名伪造不了）。"""
+    log = _LOG_RE.match(strip_ansi(line))
+    if not log or log.group(1) != "INFO":
+        return False
+    msg = log.group(3).strip()
+    return msg.startswith(UPLOADED_MARKERS) or (log.group(2) == SUBMIT_TARGET and (
+        msg.startswith("ResponseData {") or bool(_SUBMIT_OK_RE.fullmatch(msg))))
 
 
 def echo_strings(*items: Path | str | None) -> list[str]:
@@ -519,10 +543,19 @@ class UploadOutcome:
     submitted: bool = False  # 投稿响应 code 0（没解析到响应时看 biliup 自己的「接口投稿成功」日志）
     login_error: bool = False
     tail: list[str] = field(default_factory=list)
+    error: list[str] = field(default_factory=list)  # 最后一份 error-stack 报告：标题 + 各层原因
 
     @property
     def tail_text(self) -> str:
         return " | ".join(line for line in self.tail if line.strip())[-600:]
+
+    @property
+    def error_text(self) -> str:
+        """给人看的失败原因：biliup 的 error-stack 报告只留各层消息（去掉 at/backtrace 等装饰）；没有报告时用输出末尾。"""
+        if self.error:
+            parts = [m for m in dict.fromkeys(self.error) if m != "Unknown Error"] or self.error[:1]
+            return " → ".join(parts)[-600:]
+        return self.tail_text
 
 
 def parse_upload_output(lines: list[str], returncode: int | None, *, echo: list[str] | tuple[str, ...] = ()
@@ -538,9 +571,23 @@ def parse_upload_output(lines: list[str], returncode: int | None, *, echo: list[
     out = UploadOutcome(returncode=returncode)
     ok_marker = False
     resp_lines: list[str] = []
+    cont = False  # 报告里的多行消息（如限流锁提示里要删除的文件路径）接在上一条后面
     for raw in lines:
         line = strip_ansi(raw)
         log = _LOG_RE.match(line)
+        report = None if log else _REPORT_HEAD_RE.match(line)
+        if report:
+            out.error, cont = [report.group(1).strip()], True
+        elif out.error and not log:
+            cause = _REPORT_CAUSE_RE.match(line)
+            text = line.strip("│ \t")
+            if cause:
+                out.error.append(cause.group(1).strip())
+                cont = True
+            elif not text or _REPORT_DECOR_RE.match(line):
+                cont = False
+            elif cont:
+                out.error[-1] += " " + text
         if log:
             level, target, msg = log.group(1), log.group(2), log.group(3).strip()
             submit_mod = target == SUBMIT_TARGET
@@ -653,15 +700,17 @@ async def renew(exe: Path, cookie_file: Path, *, cwd: Path, timeout: float = 90)
     """biliup renew：用 refresh_token 刷新整份登录文件（会重写文件）。"""
     rc, lines = await run_streaming([str(exe), "--rust-log", "info", "-u", str(cookie_file), "renew"],
                                     cwd=cwd, timeout=timeout)
-    tail = " | ".join(x for x in lines[-5:] if x.strip())
-    return rc == 0, startup_failure_hint(rc) or tail
+    return rc == 0, startup_failure_hint(rc) or parse_upload_output(lines, rc).error_text
 
 
 def run_interactive_login(settings: Settings, account: str) -> int:
     """在当前终端里运行 `biliup -u <文件> login`（需要真实终端，二维码图片写在账号目录）。"""
-    exe = find_biliup(settings)
+    from .bili_locate import resolve
+
+    res = resolve(settings)  # 已经试运行过 --version 并检查了参数
+    exe = res.path
     if exe is None:
-        print("未找到 biliup：先运行 mpub setup", file=sys.stderr)
+        print(f"biliup 不可用：{res.problem}", file=sys.stderr)
         return 1
     cookie_file = settings.account_file("bilibili", account)
     cookie_file.parent.mkdir(parents=True, exist_ok=True)
@@ -669,9 +718,8 @@ def run_interactive_login(settings: Settings, account: str) -> int:
         print("biliup 交互式登录需要在真实终端（如 Windows Terminal）里运行；"
               f"也可以直接执行: \"{exe}\" -u \"{cookie_file}\" login", file=sys.stderr)
         return 2
-    probe = probe_binary(exe)  # 缺 VC++ 运行库时先说清楚，而不是让系统弹一个找不到 DLL 的对话框
-    if not probe.ok and not probe.timed_out:
-        print(probe.detail, file=sys.stderr)
+    if res.problem:  # 缺 VC++ 运行库等：先说清楚，而不是让系统弹一个找不到 DLL 的对话框
+        print(res.problem, file=sys.stderr)
         return 1
     print(f"即将运行 biliup 登录，推荐选择「扫码登录」。终端二维码显示不全时打开: "
           f"{cookie_file.parent / 'qrcode.png'}", file=sys.stderr, flush=True)

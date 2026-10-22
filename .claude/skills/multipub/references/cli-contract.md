@@ -12,7 +12,7 @@
   - **stderr**：进度。事件是单行 JSON（以 `{"event":` 开头），其余是普通中文提示行（如「→ 发布到 抖音/main ……」）。
 - 平台名不分大小写，别名：`bilibili|bili|b站|b`、`douyin|dy|抖音`、`xiaohongshu|xhs|小红书|rednote`、`zhihu|zh|知乎`。
 - `<post>`：`post.yaml` 的路径或其所在目录。
-- argparse 用法错误：退出码 2，stderr 打印 usage，没有 JSON。Ctrl+C：退出码 130。
+- argparse 用法错误：退出码 2，stderr 打印 usage，没有 JSON。Ctrl+C / 终止：退出码 130（`publish --json` 仍会输出 JSON，见下）。
 
 ## 退出码
 
@@ -22,6 +22,7 @@
 | 1 | 至少一个结果 `failed`；`doctor` 有核心检查项不通过；`setup` 有步骤失败 |
 | 2 | 用法错误、清单错误（`error: manifest`）、校验错误（`error: validation`）、`publish` 没加 `--yes` 又不在交互终端（`error: confirmation_required`）、交互确认时回答了「否」、`new` 目标已存在、`verify-code` 平台不是抖音、`login --interactive` 用在不支持的平台 |
 | 3 | 没有失败，但至少一个结果 `needs_action` |
+| 130 | 被 Ctrl+C / SIGTERM 中断（`publish --json` 输出 `error: interrupted`） |
 
 ## 命令
 
@@ -42,12 +43,28 @@ mpub doctor [--json]
 ### setup
 
 ```
-mpub setup [--skip-browser]
+mpub setup [--skip-browser] [--biliup auto|download|<路径>]
 ```
 
-安装 patchright Chromium（`browser.channel = "chromium"` 且没设 `executable_path` 时；`--skip-browser` 跳过）、下载 biliup。
+安装 patchright Chromium（`browser.channel = "chromium"` 且没设 `executable_path` 时；`--skip-browser` 跳过），并准备 biliup。
 已安装的会跳过，可重复运行。**会联网下载**。`--json` 输出 `{"ok": bool, "steps": [{"name", "ok", "detail"}]}`（下载进度在 stderr）；
 退出码 0 成功，1 有失败。
+
+biliup 的来源由用户选：还没选过、也没下载过固定版本时，非交互运行**不会下载**，`bilibili.biliup` 步骤为
+`{"ok": false, "needs_choice": true, "candidates": [{"index", "path", "version", "source", "compatible", "reason", "cookies"}], "detail"}`。
+这时**问用户**选哪种，再用 `--biliup <路径>` / `--biliup auto`（本机找到的兼容版本）/ `--biliup download`（下载固定版本 v1.3.1）重跑。
+
+### biliup
+
+```
+mpub biliup find   [--json]                         # 本机找到的 biliup：{"ok", "in_use": {...}, "candidates": [...]}
+mpub biliup status [--json]                         # 当前用哪个：{"ok", "mode", "path", "version", "detail", "problem", "choice"}
+mpub biliup use <路径或目录或编号> [--force] [--json] # 选定一个（不兼容时拒绝，--force 强行使用）
+mpub biliup use --auto | --download [--json]        # 自动挑兼容的 / 用下载的固定版本
+```
+
+`mode`：`configured`（config.toml 的 biliup_path，优先级最高）/ `path` / `auto` / `download` / `default`（没选过但已下载固定版本）/ `none`（还没选）。
+`use` 的 `--json`：`{"ok", "message", "in_use"}`，失败退出码 2；`status` 不可用时退出码 1。
 
 ### login
 
@@ -107,7 +124,8 @@ mpub new <目录> --kind video|note|article [--force]
 mpub validate <post> [--to 平台,平台] [--account <名字>] [--json]
 ```
 
-纯本地：不联网、不检查登录、不查重。
+纯本地：不联网、不检查登录是否有效、不查重。登录文件不存在时给一条 `field: account` 的 warning
+（「账号 X 还没有登录……」，会列出这个平台已登录的账号名）。
 
 ```json
 {
@@ -120,7 +138,8 @@ mpub validate <post> [--to 平台,平台] [--account <名字>] [--json]
 ```
 
 有 `level: error` 的 issue 时 `ok: false`、退出码 2。清单本身读不了（找不到文件、YAML 错误、`kind` 不对、未知平台、`body_file` 不存在、
-`schedule` 格式错、没有目标平台）时输出 `{"ok": false, "error": "manifest", "message": "..."}`，退出码 2。
+`schedule` 格式错、没有目标平台、`title`/`body`/`tags` 里不加引号的 `#话题` 会被 YAML 当成注释）时输出
+`{"ok": false, "error": "manifest", "message": "..."}`，退出码 2。
 
 ### publish
 
@@ -133,21 +152,30 @@ mpub publish <post> [--to 平台,平台] [--account <名字>] [--dry-run] [--yes
 |---|---|
 | `--to` | 替换清单里的平台列表（逗号分隔） |
 | `--account` | 所有平台统一用这个账号（覆盖清单） |
-| `--dry-run` | 只做与 validate 相同的本地校验，每个平台返回 `status: dry_run`；不查重、不检查登录 |
+| `--dry-run` | 只做与 validate 相同的本地校验，每个平台返回 `status: dry_run`；会读本地发布记录，查重会命中的平台直接返回查重的 `skipped`（加 `--force` 则不查）；不联网、不检查登录 |
 | `--yes` / `-y` | 不再询问确认。stdin 不是终端时**必须**加，否则 stderr 提示、退出码 2、没有 JSON |
 | `--headed` | 显示浏览器窗口（默认按 config `browser.headless`，默认无头） |
 | `--gap` | 平台之间等待秒数（默认 config `gap_seconds` = 30） |
 | `--timeout` | 单个平台的总超时秒数（默认 `[timeouts] publish_<kind>`：视频 3600、图文/文章 1800） |
-| `--force` | 忽略查重，强制再发 |
+| `--force` | 忽略查重，强制再发。对本次**所有**目标平台生效，所以要配合 `--to <平台>` 只写要重发的平台 |
 
 流程：解析清单 → 不支持该类型的平台记为 `skipped` → 校验（有 error 则输出
-`{"ok": false, "error": "validation", "issues": [...]}`、退出码 2）→ `--dry-run` 到此为止 → 查重（同一内容已
-`published`/`submitted`/`scheduled` 或上次 `unknown_outcome` 的平台记为 `skipped`，`error_code: validation`，
-消息「同一内容已于 … 发过…确认要再发请加 --force」）→ 逐个平台串行发布（每个平台一个 worker 子进程）→ 写 `history.jsonl`。
+`{"ok": false, "error": "validation", "issues": [...]}`、退出码 2）→ 查重（见下）→ `--dry-run` 到此为止 →
+逐个平台串行发布（每个平台一个 worker 子进程；拿到账号锁后再查一次重，防止两个 mpub 同时发同一条）→ 写 `history.jsonl`。
+
+查重：同一平台、同一账号、同样内容有 `published`/`submitted`/`scheduled` 记录，或上次是 `unknown_outcome`
+（包括发布途中 mpub 被强行结束留下的「结果待定」记录）时，该平台记为 `skipped`、`error_code: validation`，
+消息以「同一内容已于 …」开头（结果未知的会说明「可能已经发出：先到平台后台确认……--to <平台> --force」）。
+点了发布之后平台明确拒绝（`platform_error` 等，适配器确定没发出才这样报）不拦，可以改了再发。
 
 ```json
-{"ok": true, "run_id": "20261021-200000", "results": [<Result action=publish>, ...]}
+{"ok": true, "run_id": "20261021-200000", "results": [<Result action=publish>, ...], "issues": [<Issue>, ...]}
 ```
+
+`issues` 是本地校验的 warning（与 validate 相同）。`run_id` 同一秒里有两次运行时带后缀（`20261021-200000-2`）。
+被 Ctrl+C / SIGTERM 中断：退出码 130，输出 `{"ok": false, "error": "interrupted", "run_id", "results", "issues"}`；
+正在发的平台按中断时的状态（已点发布 → `unknown_outcome`，否则 `internal`、`retryable: true`），
+还没开始的平台 `failed` / `internal`，消息「已中断，这个平台还没开始发布」。
 
 期间的 stderr 事件：`log`、`submit_started`、`needs_input`（抖音短信）。
 
@@ -160,6 +188,12 @@ mpub history [--limit N] [--json]      # 默认最近 30 条
 ```json
 {"history": [{"run_id": "...", "fingerprint": "...", "source": "D:\\posts\\ep12\\post.yaml", "title": "...", <Result 字段>...}]}
 ```
+
+worker 一报 `submit_started`，主进程就先在 `<数据目录>\pending\` 记一笔「结果待定」（`unknown_outcome`），
+发布结束、写入最终结果时删掉。正在发布时 `history` 末尾会带上这条（多一个字段 `"pending": true`）。
+如果 mpub 在发布中途被强行结束（任务管理器、关窗口、`kill -9`），它会留下来：查重据此拦住原样重发；
+下一次 `publish` / `history` 发现没有任务在用这个账号时，把它转成一条正式的 `unknown_outcome` 记录
+（消息「发布途中 mpub 被结束，已点过发布：结果未知……」）。
 
 ### verify-code
 
@@ -248,10 +282,10 @@ mpub verify-code douyin <验证码>
 | `captcha` | needs_action | 页面停在人机验证（滑块、极验）（抖音/小红书只在点发布之前出现；点发布之后的验证以 `unknown_outcome` 返回） | `submit_started: false`：加 `--headed` 重发，让用户在窗口里过验证；否则先去后台确认 |
 | `risk_control` | needs_action | 风控拦截：知乎 40352 / 429、B站 412 / -352 | 知乎：`mpub login zhihu --account <账号>`（有头）打开验证页完成验证；B站：别用 `mode: http`，稍后 `--headed` 重试；降低频率 |
 | `consent_required` | needs_action | B站动态需要确认《动态发布规范》，无头模式下发布前就停了（什么都没发） | 让用户选：阅读规范后在清单写 `platforms.bilibili.confirm_rules: true` 或 config `[platforms.bilibili] confirm_dynamic_rules = true`；或 `--headed` 重发并亲手点确认 |
-| `unknown_outcome` | failed | 已点发布，但超时 / 断网 / 进程异常，结果未知 | **绝不重试**。请用户去平台后台确认；确认没发出且用户要求时才 `--force` |
+| `unknown_outcome` | failed | 已点发布，但超时 / 断网 / 进程异常 / 被中断，结果未知 | **绝不重试**。请用户去平台后台确认；确认没发出且用户要求时才 `--to <平台> --force` |
 | `platform_error` | failed | 平台明确拒绝（内容违规、参数不对、账号限制等），或上传失败 | 看 `message`（附平台原文）。`submit_started: true` 时先去后台确认；修改内容后由用户决定是否重发 |
 | `timeout` | failed | 发布动作之前某一步超时（页面改版、网络慢、上传太久） | 可在用户同意后重发；大文件加大 `--timeout`（或 config `[timeouts] publish_video`；抖音/小红书的上传等待 = 任务超时 − 600 秒）；可加 `--headed` 观察 |
-| `validation` | failed / skipped | `failed`：发布前校验失败、抖音自主声明文字与页面不符、正文图片找不到。`skipped`：查重命中（同一内容已发过） | `failed`：改清单后重新 validate；`skipped`：告诉用户已经发过，用户明确要求才 `--force` |
+| `validation` | failed / skipped | `failed`：发布前校验失败、抖音自主声明文字与页面不符、正文图片找不到。`skipped`：查重命中（同一内容已发过，或上次点过发布但结果未知） | `failed`：改清单后重新 validate；`skipped`：告诉用户已经发过（或请用户先去后台确认），用户明确要求才 `--to <平台> --force` |
 | `unsupported` | skipped | 平台不支持该内容类型 | 无需处理（知乎不支持视频；B站/抖音/小红书不支持文章） |
 | `internal` | failed | 环境问题或程序错误：缺 biliup、worker 崩溃、账号被另一个任务占用 | 看 `message` 和 `evidence` 里的日志：缺 biliup → `mpub setup`；「正被另一个任务使用」→ 等它结束；其余报告问题 |
 

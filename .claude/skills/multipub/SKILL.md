@@ -25,12 +25,15 @@ multipub 是本仓库里的命令行工具 `mpub`。它用浏览器自动化和�
 1. **发布前必须 dry-run 并取得明确确认**：先 `uv run mpub publish <post> --dry-run --json`，把汇总给用户看，
    用户明确说「发」「确认」之类之后，才运行 `uv run mpub publish <post> --yes --json`。不确定就再问。
 2. **不加 `--force`**，除非用户明确要求再发一次同样的内容（查重跳过时，告诉用户已经发过，问要不要强制再发）。
+   `--force` **一定和 `--to <平台>` 一起用**，只写要重发的那个平台：`--force` 会让本次所有目标平台都忽略查重，
+   不加 `--to` 会把已经发出去的平台再发一遍。
 3. **结果里 `submit_started: true` 或 `error_code: unknown_outcome` 的平台绝不重试**：告诉用户先去平台后台确认是否已发出
    （B站 member.bilibili.com / t.bilibili.com，抖音 creator.douyin.com「作品管理」，小红书 creator.xiaohongshu.com「笔记管理」，
    知乎创作中心），由用户决定下一步。
 4. 不替用户做声明或同意：AI 声明、转载声明、B站《动态发布规范》确认，只有用户明确表示后才写进清单或配置。
 5. 不读取、不打印、不外传 `accounts\` 下的登录文件（等同账号密码）。
-6. 正在运行的 `mpub publish` 不要中途杀掉（可能导致结果未知）。
+6. 正在运行的 `mpub publish` 不要中途杀掉（可能导致结果未知）。万一被结束了，已点过发布的平台在发布记录里是
+   `unknown_outcome`，查重会拦住原样重发；按铁律 3 处理。
 
 ## 流程
 
@@ -40,7 +43,11 @@ multipub 是本仓库里的命令行工具 `mpub`。它用浏览器自动化和�
 uv run mpub doctor --json
 ```
 
-`ok: false` 时看 `checks` 里 `ok: false` 的项：缺浏览器/biliup → `uv run mpub setup --json`。它要下载几百 MB，
+`ok: false` 时看 `checks` 里 `ok: false` 的项：缺浏览器/biliup → `uv run mpub setup --json`。
+**biliup 的来源由用户决定**：`setup` 结果里 `bilibili.biliup` 带 `needs_choice: true` 时，把 `candidates`（路径、版本、是否兼容）
+列给用户，问他：①直接告诉你 biliup 路径 ②用本机找到的（选编号，或让软件自动挑兼容的）③下载固定版本 v1.3.1；
+然后对应运行 `uv run mpub biliup use "<路径>"` / `uv run mpub biliup use <编号>`（或 `--auto`）/ `uv run mpub setup --biliup download --json`。
+不要替用户选，也不要直接下载。之后可用 `uv run mpub biliup status --json` 确认。它要下载几百 MB，
 **一定用 Bash 的 `run_in_background` 运行，`timeout: 1800000`**（前台默认 2 分钟会被杀掉，留下半截下载），先告诉用户；
 已改用本机 Chrome/Edge 时加 `--skip-browser` 只下载 biliup。国内网络见 troubleshooting。
 `bilibili.biliup` 提示缺少 VC++ 运行库时，请用户安装 https://aka.ms/vs/17/release/vc_redist.x64.exe 。
@@ -53,7 +60,10 @@ uv run mpub doctor --json
 - 字段与平台限制见 `docs/manifest.md`。要点：`platforms` 下列出目标平台；B站视频必须有 `platforms.bilibili.tid`；
   抖音视频标题 ≤30、小红书标题 ≤20、B站动态/抖音图文标题 ≤20；知乎不支持视频和定时。
 - 校验：`uv run mpub validate posts/<名字> --json`，直到 `ok: true`。`issues` 里 `level: error` 必须改，`warning` 转告用户。
-  `skipped` 是该平台不支持这个内容类型，会自动跳过。
+  `skipped` 是该平台不支持这个内容类型，会自动跳过。`field: account` 的 warning 表示这个账号名还没有登录文件
+  （常见原因：登录时用了 `--account main`，清单却没写 `account`，默认是 `default`），按提示改清单或去登录。
+- 写清单时：标题、正文里带 `#话题` 要给整个值加引号（`body: "今天去徒步 #徒步"`），`tags` 直接写 `[徒步, 周末]`；
+  不加引号的 `#xxx` 会被 YAML 当成注释，validate 会报「会被 YAML 当成注释而丢掉」。Windows 路径用单引号。
 
 ### 3. 检查登录
 
@@ -72,7 +82,9 @@ uv run mpub validate posts/<名字> --json            # 取每个平台实际要
 uv run mpub publish posts/<名字> --dry-run --json    # 发布前的最终本地校验
 ```
 
-两者都不联网。给用户一张汇总表，每个平台一行：平台 / 账号 / 内容类型（发成什么：B站视频或动态、抖音视频或图文、小红书笔记、知乎想法或文章）/
+两者都不联网。dry-run 会读本地发布记录：`status: skipped` 且消息「同一内容已于…」的平台真正发布时会被查重跳过，
+汇总时单独列出（已发过 / 点过发布但结果未知），问用户是否要对这个平台强制再发（`--to <平台> --force`）。
+给用户一张汇总表，每个平台一行：平台 / 账号 / 内容类型（发成什么：B站视频或动态、抖音视频或图文、小红书笔记、知乎想法或文章）/
 标题 / 定时（`schedule`，没有就写「立即」）/ 声明（`ai_generated`；抖音 `declaration`、B站 `creation_statement` 与 `copyright`/`source`、
 小红书 `repost_source`、知乎 `statement`、知乎 `draft`）/ 标签 / 媒体文件。再列出跳过的平台和所有 warning。
 然后问：「确认发布到以上平台吗？」只有明确的肯定回答才继续。
@@ -93,7 +105,8 @@ uv run mpub publish posts/<名字> --yes --json
     用户用 `--headed` 时也可以直接在弹出的浏览器窗口里输入验证码。
   - `{"event": "submit_started"}`：已经点了发布，此后这个平台无论结果如何都不能自动重发。
   - `{"event": "log", ...}`：进度，可以简要转告用户。
-- 结束后读 stdout 的 JSON：`{"ok", "run_id", "results": [...]}`。
+- 结束后读 stdout 的 JSON：`{"ok", "run_id", "results": [...], "issues": [...]}`。被中断（Ctrl+C、终止）时退出码 130，
+  JSON 是 `{"ok": false, "error": "interrupted", "run_id", "results"}`：没开始的平台 `message` 是「已中断，这个平台还没开始发布」。
 
 ### 6. 汇报结果
 
@@ -105,7 +118,7 @@ uv run mpub publish posts/<名字> --yes --json
 | `submitted` | 平台已接收，可能在审核；有 `url` 就给，没有就说去哪个后台看（小红书不返回链接，`item_id` 是笔记 ID） |
 | `scheduled` | 已设置定时 |
 | `draft` | 只存了草稿（知乎 `draft: true`），给出编辑页 `url`，提醒用户自己点发布 |
-| `skipped` | 跳过：平台不支持该类型（`unsupported`），或同一内容已发过（`validation`，消息「同一内容已于…发过」） |
+| `skipped` | 跳过：平台不支持该类型（`unsupported`），或查重命中（`validation`，消息「同一内容已于…」：已发过，或上次点过发布但结果未知——后者请用户先去后台确认） |
 | `needs_action` | 按下节处理 |
 | `failed` | 说明 `message`；按 `submit_started` / `error_code` 判断能否重试 |
 
@@ -137,7 +150,8 @@ uv run mpub publish posts/<名字> --yes --json
      或在数据目录 `config.toml` 的 `[platforms.bilibili]` 写 `confirm_dynamic_rules = true`（以后所有账号都代为确认）；
   2. 或者加 `--headed` 重发，由用户在弹出的窗口里亲手点「确认并发送」（会记住这个账号，以后不再问）。
   不要替用户选，也不要为了绕开弹窗改用定时或 HTTP 模式。
-- **`unknown_outcome`**：已点发布但没拿到确定结果。**不要重试**，请用户去平台后台确认；确认没发出、用户要求再发时才用 `--force`。
+- **`unknown_outcome`**：已点发布但没拿到确定结果。**不要重试**，请用户去平台后台确认；确认没发出、用户要求再发时才用
+  `--to <该平台> --force`（不要漏了 `--to`）。
 - **`timeout`** / **`platform_error`** / **`internal`** / **`validation`**：看 `message`。`submit_started: false` 且 `retryable: true` 可以在用户同意后重发；
   缺 biliup → `uv run mpub setup`；缺 VC++ 运行库 → 请用户安装（见 doctor 提示）；「正被另一个任务使用」→ 等前一个任务结束；
   `validation` → 改清单后重新 validate。定时/声明没能在页面上设置成功也是 `validation`，此时作品没有发出，可以安全重发。

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>抖音创作者中心</title>
+<style>
+  body { font-family: sans-serif; margin: 0; background: #161823; color: #fff; }
+  .login-card { width: 400px; margin: 80px auto; background: #fff; color: #333; padding: 24px; }
+  .tabs { display: flex; gap: 24px; margin-bottom: 16px; }
+  .tabs span { cursor: pointer; }
+  #animate_qrcode_container { width: 180px; height: 180px; margin: 0 auto; position: relative; }
+  #animate_qrcode_container img { width: 180px; height: 180px; }
+  .qr-expired { position: absolute; inset: 0; background: rgba(255,255,255,.92); display: flex; flex-direction: column;
+                align-items: center; justify-content: center; cursor: pointer; }
+  .qr-expired[hidden] { display: none; }
+</style>
+<script>window.SIM = __SIM__;</script>
+</head>
+<body>
+<div class="header"><span>抖音创作者中心</span></div>
+<div id="app"></div>
+<script>
+(function () {
+  const S = window.SIM;
+  // 登录卡是前端异步渲染的：先出框架，二维码稍后才拿到
+  setTimeout(() => {
+    document.getElementById("app").innerHTML =
+      '<div class="login-card"><div class="tabs"><span class="tab active">扫码登录</span><span class="tab">手机号登录</span></div>' +
+      '<div class="scan_qrcode_login_content-x"><div id="animate_qrcode_container" class="animate_qrcode_container-a">' +
+      '<img aria-label="二维码" alt=""><div class="qr-expired" hidden><p>二维码失效</p><p>点击刷新</p></div></div>' +
+      '<p class="hint">打开「抖音APP」扫码登录</p></div>' +
+      // 手机号登录面板（默认隐藏）：登录页上也有 div[class^=container] 里的输入框
+      '<div class="container-phone-x" style="display:none"><input type="tel" placeholder="请输入手机号">' +
+      '<input placeholder="请输入验证码"><span>获取验证码</span></div></div>';
+    const img = document.querySelector("#animate_qrcode_container img");
+    const expired = document.querySelector(".qr-expired");
+    let token = 0;
+    async function loadQr() {
+      const r = await fetch("/sim/qr");
+      const j = await r.json();
+      img.src = j.qrcode;
+      token = j.token;
+      expired.hidden = true;
+    }
+    expired.addEventListener("click", loadQr);
+    setTimeout(loadQr, (S.login && S.login.qr_delay_ms) || 0);
+    setInterval(async () => {
+      if (!token) return;
+      try {
+        const r = await fetch("/sim/qr_status?token=" + token);
+        const j = await r.json();
+        if (j.status === "confirmed") location.href = j.redirect_url;
+        else if (j.status === "expired") expired.hidden = false;
+      } catch (e) {}
+    }, 1000);
+  }, 300);
+})();
+</script>
+</body>
+</html>

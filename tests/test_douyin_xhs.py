@@ -108,9 +108,11 @@ class FakeLocator:
     async def is_checked(self) -> bool:
         return self.page.attrs.get((self.key, "checked")) is not None
 
-    async def click(self, **_: Any) -> None:
+    async def click(self, trial: bool = False, **_: Any) -> None:
         if not self.page.visible.get(self.key):
             raise RuntimeError(f"找不到元素 {self.key}")
+        if trial:  # 只做可点性检查，不点击
+            return
         self.page.clicks.append(self.key)
         self.page.focused = self.key
         hook = self.page.on_click.get(self.key)
@@ -620,6 +622,87 @@ async def test_douyin_explicit_rejection_fails_fast(sau, tmp_path: Path):
     assert page.clicks.count(DY_PUBLISH) == 1
 
 
+async def test_douyin_covered_publish_button_is_not_clicked(sau, tmp_path: Path):
+    """「发布」被弹窗 / 遮罩盖住：force 点击会落在遮罩上，不能记作已点击（以前最后报 unknown_outcome）。"""
+    _, dy, _ = sau
+    from multipub._sau.runtime import StepTimeout
+
+    marked: list[int] = []
+    video = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json",
+                           hooks=_fast_hooks(tmp_path, before_publish_click=lambda: marked.append(1)))
+    page = FakePage({DY_PUBLISH: True})
+    page.attrs[(DY_PUBLISH, "evaluate")] = "semi-modal-mask"  # 命中测试：中心点上是遮罩
+    with pytest.raises(StepTimeout) as info:
+        await video._publish_until_success(page, "视频", "**/manage**")
+    assert DY_PUBLISH not in page.clicks and marked == [] and video.publish_guard.clicks == 0
+    assert not info.value.after_submit and "没有点击" in str(info.value)
+
+    # 弹窗关掉之后照常点击
+    page.attrs[(DY_PUBLISH, "evaluate")] = ""
+    page.on_click[DY_PUBLISH] = lambda p: setattr(p, "succeeded", True)
+    await video._publish_until_success(page, "视频", "**/manage**")
+    assert page.clicks.count(DY_PUBLISH) == 1 and marked == [1]
+
+
+async def test_douyin_success_receipt_without_redirect_is_success(sau, tmp_path: Path):
+    _, dy, _ = sau
+    note = dy.DouYinNote(["1.jpg"], "正文", [], 0, "x.json", title="标题",
+                         hooks=_fast_hooks(tmp_path, publish_timeout=30, receipt_grace=0.2))
+    page = FakePage({DY_PUBLISH: True})
+
+    def submit(p: FakePage) -> None:  # 回执成功，但页面一直不跳转
+        req = FakeRequest(DY_CREATE)
+        p.emit("request", req)
+        p.emit("response", FakeResponse(req, {"status_code": 0, "item_id": "7400000000000000002"}))
+
+    page.on_click[DY_PUBLISH] = submit
+    await note._publish_until_success(page, "图文", "**/manage**")
+    assert note.published_item_id == "7400000000000000002" and page.clicks.count(DY_PUBLISH) == 1
+
+
+async def test_douyin_gateway_error_detail(sau, tmp_path: Path):
+    _, dy, _ = sau
+    from multipub._sau.runtime import StepTimeout
+
+    note = dy.DouYinNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", hooks=_fast_hooks(tmp_path))
+    page = FakePage({DY_PUBLISH: True})
+
+    class HtmlResponse(FakeResponse):
+        async def json(self) -> Any:
+            raise ValueError("not json")
+
+    def submit(p: FakePage) -> None:
+        req = FakeRequest(DY_CREATE)
+        p.emit("request", req)
+        p.emit("response", HtmlResponse(req, "<html>Bad Gateway</html>", status=502))
+
+    page.on_click[DY_PUBLISH] = submit
+    with pytest.raises(StepTimeout) as info:
+        await note._publish_until_success(page, "图文", "**/manage**")
+    assert info.value.after_submit and "HTTP 502" in str(info.value)
+    assert page.clicks.count(DY_PUBLISH) == 1  # 结果不明：不补点
+
+
+async def test_douyin_title_read_back(sau, tmp_path: Path):
+    """网页按 UTF-16 截断标题（emoji 算 2 个字）：点「发布」之前拒绝，而不是发出被截断的标题。"""
+    _, dy, _ = sau
+    from multipub._sau.runtime import DeclarationFailed
+
+    title_sel, desc_sel = 'input[placeholder*="填写作品标题"]', 'div.zone-container[contenteditable="true"]'
+    video = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json", hooks=_fast_hooks(tmp_path))
+    want = "一" * 29 + "😀"
+    page = FakePage({title_sel: True, desc_sel: True})
+    page.readonly.add(title_sel)
+    page.attrs[(title_sel, "value")] = "一" * 29  # 页面上的值：emoji 被 maxlength 截掉了
+    with pytest.raises(DeclarationFailed) as info:
+        await video.fill_title_and_description(page, want, "简介", [])
+    assert "UTF-16" in str(info.value) and "没有发出" in str(info.value)
+
+    page = FakePage({title_sel: True, desc_sel: True})
+    await video.fill_title_and_description(page, "正常标题", "第一行\n第二行", ["科技"])
+    assert page.filled[title_sel] == "正常标题"
+
+
 async def test_douyin_sms_after_click_allows_one_reclick(sau, tmp_path: Path):
     conf, dy, _ = sau
     sms_input = dy.DouYinBaseUploader.SMS_INPUT_SELECTOR
@@ -970,12 +1053,33 @@ async def test_cleanup_helpers_never_raise():
     await close_quietly(Broken(), None, Broken())
 
 
-async def test_douyin_qrcode_fallback_screenshot(sau, tmp_path: Path):
+async def test_douyin_qrcode_fallback_screenshot(sau, tmp_path: Path, monkeypatch):
     _, dy, _ = sau
+    monkeypatch.setattr(dy, "DOUYIN_QRCODE_WAIT", 0.2)
     reported: list[dict[str, Any]] = []
     info = await dy._save_douyin_qrcode(FakePage(), str(tmp_path / "acct.json"), qrcode_callback=reported.append)
     assert info["fallback"] and Path(info["image_path"]).is_file()
     assert reported == [info]
+
+    # 刷新二维码时用户已扫码、页面跳到了登录后页面：立即返回，不把首页截图当二维码上报
+    page = FakePage()
+    page.url = "https://creator.douyin.com/creator-micro/home"
+    reported.clear()
+    old = tmp_path / "old.png"
+    info = await dy._save_douyin_qrcode(page, str(tmp_path / "acct.json"), old, qrcode_callback=reported.append)
+    assert reported == [] and info["image_path"] == str(old) and not info.get("fallback")
+
+    # 二维码 src 是普通图片地址：截取二维码元素（上游 save_data_url_image 会直接报错、登录失败）
+    sel = dy.DOUYIN_QRCODE_SELECTORS[-1]
+    page = FakePage({sel: True})
+    page.attrs[(sel, "src")] = "https://p3.douyinpic.com/qrcode.png"
+
+    async def element_png(**_: Any) -> bytes:
+        return b"\x89PNG element"
+
+    monkeypatch.setattr(FakeLocator, "screenshot", lambda self, **kw: element_png(**kw))
+    info = await dy._save_douyin_qrcode(page, str(tmp_path / "acct.json"), qrcode_callback=reported.append)
+    assert Path(info["image_path"]).read_bytes() == b"\x89PNG element" and not info.get("fallback")
 
 
 def test_login_qrcode_without_opencv(monkeypatch, tmp_path: Path, capsys):
@@ -1359,8 +1463,9 @@ def test_schedule_value_matches():
 XHS_LOGIN_BOX = "div[class*='login-box']"
 
 
-async def test_xhs_qrcode_fallback_screenshot(sau, tmp_path: Path):
+async def test_xhs_qrcode_fallback_screenshot(sau, tmp_path: Path, monkeypatch):
     _, _, xhs = sau
+    monkeypatch.setattr(xhs, "XHS_QR_SWITCH_WAIT", 0.6)
     reported: list[dict[str, Any]] = []
     page = FakePage({XHS_LOGIN_BOX: True})  # 登录框在，但切换按钮（哈希类名）和二维码都找不到
     info = await xhs._save_xhs_qrcode(page, str(tmp_path / "acct.json"), qrcode_callback=reported.append)
@@ -1369,7 +1474,8 @@ async def test_xhs_qrcode_fallback_screenshot(sau, tmp_path: Path):
 
     # 「扫码登录」文字可点：切到扫码面板
     page = FakePage({XHS_LOGIN_BOX: True, "text=扫码登录": True})
-    page.on_click["text=扫码登录"] = lambda p: p.visible.__setitem__("div:has-text('扫一扫')", True)
+    # （扫码面板以二维码图片可见为准：只是隐藏在 DOM 里的扫码面板不算）
+    page.on_click["text=扫码登录"] = lambda p: p.visible.__setitem__("xpath=..//following-sibling::div//img", True)
     assert await xhs._open_xhs_qrcode_panel(page) is True and page.clicks == ["text=扫码登录"]
 
 
@@ -1418,6 +1524,7 @@ def _fake_playwright(page: FakePage) -> tuple[Any, _FakeBrowser]:
 async def test_xhs_login_without_qrcode_still_waits_for_manual_login(sau, tmp_path: Path, monkeypatch):
     """二维码定位不到时不再立刻失败关窗口：上报登录页截图，继续等用户在窗口里登录。"""
     _, _, xhs = sau
+    monkeypatch.setattr(xhs, "XHS_QR_SWITCH_WAIT", 0.6)
     page = FakePage({XHS_LOGIN_BOX: True})
     manager, browser = _fake_playwright(page)
     monkeypatch.setattr(xhs, "async_playwright", manager)
@@ -1457,6 +1564,7 @@ def test_qrcode_relay_fallback_note(settings, tmp_path: Path):
         callback({"image_path": str(shot), "fallback": True})
         note = events[-1]["note"]
         assert "登录页截图" in note and ("浏览器窗口里扫码或登录" in note) is window_hint
+        assert ("去掉 --headless" in note) is headless  # 无头时截图里可能根本没有二维码
 
 
 # ------------------------------------------------------------------ validate()
@@ -1527,6 +1635,22 @@ def test_douyin_validate_note_rules(media: Path):
     assert _levels(issues, "options.declaration") == {"warning"}  # 图文不支持，忽略
     assert DouyinAdapter.validate(dy_note(media, images=[])) and \
         _levels(DouyinAdapter.validate(dy_note(media, images=[])), "images") == {"error"}
+
+
+def test_douyin_validate_title_with_emoji_near_limit(media: Path):
+    # 30 个字符没超限，但按 UTF-16 是 31：网页可能截断 → 提醒（发布前还会读回核对）
+    assert _levels(DouyinAdapter.validate(dy_video(media, title="一" * 29 + "😀")), "title") == {"warning"}
+    assert _levels(DouyinAdapter.validate(dy_video(media, title="一" * 28 + "😀")), "title") == set()
+    assert _levels(DouyinAdapter.validate(dy_note(media, title="一" * 19 + "😀")), "title") == {"warning"}
+    # 正文没超 1000，但加上「 #话题」超了
+    assert _levels(DouyinAdapter.validate(dy_note(media, body="字" * 997, tags=["徒步"])), "tags") == {"warning"}
+    assert _levels(DouyinAdapter.validate(dy_note(media, body="字" * 990, tags=["徒步"])), "tags") == set()
+
+
+def test_douyin_success_message_lists_notes(settings, tmp_path: Path, media: Path):
+    adapter = DouyinAdapter(make_ctx(settings, "douyin", tmp_path)[0])
+    r = adapter._success(dy_video(media), "7400000000000000003", notes=["自定义封面没能设置上，抖音会用推荐封面"])
+    assert r.url == "https://www.douyin.com/video/7400000000000000003" and "推荐封面" in r.message
 
 
 def xhs_post(media: Path, kind: Kind = Kind.NOTE, **kw: Any) -> PlatformPost:
@@ -1983,3 +2107,160 @@ async def test_goto_resilient_retries_once_on_timeout():
     with pytest.raises(PWTimeout):
         await goto_resilient(bad, "https://example.com")
     assert len(bad.calls) == 2
+
+
+# ------------------------------------------------------------------ 小红书：本地仿真测试发现的问题（tests/sim/test_sim_xhs.py）
+
+class _CoveredLocator(FakeLocator):
+    """可见、可用，但被弹窗遮罩挡住：Playwright 的可点性检查（trial）会超时。"""
+
+    async def click(self, trial: bool = False, **kw: Any) -> None:
+        raise RuntimeError("<div class=\"d-modal-mask\"> intercepts pointer events")
+
+
+class _CoveredPage(FakePage):
+    def locator(self, selector: str) -> FakeLocator:
+        if selector == XHS_PUBLISH:
+            return _CoveredLocator(self, selector)
+        return super().locator(selector)
+
+
+async def test_xhs_covered_publish_button_is_not_clicked(sau, tmp_path: Path):
+    """封面弹窗等挡住「发布」时不算点击、不标记已提交：超时报 timeout（可重试），不是 unknown_outcome。"""
+    _, _, xhs = sau
+    from multipub._sau.runtime import StepTimeout
+
+    clicked: list[int] = []
+    hooks = _fast_hooks(tmp_path, platform="xiaohongshu", publish_timeout=0.5,
+                        before_publish_click=lambda: clicked.append(1))
+    video = xhs.XiaoHongShuVideo("标题", "v.mp4", [], 0, "x.json", hooks=hooks)
+    page = _CoveredPage({XHS_PUBLISH: True})
+    with pytest.raises(StepTimeout) as info:
+        await video._publish_until_success(page, "视频")
+    assert not info.value.after_submit and clicked == [] and not video._publish_clicked
+    assert video.publish_guard.clicks == 0 and "Escape" in page.keyboard.pressed
+
+
+async def test_xhs_cover_failure_closes_modal_and_warns(sau, tmp_path: Path):
+    _, _, xhs = sau
+    video = xhs.XiaoHongShuVideo("标题", "v.mp4", [], 0, "x.json", thumbnail_path="c.png",
+                                 hooks=_fast_hooks(tmp_path, platform="xiaohongshu"))
+    # 弹窗打开了，但没有「上传封面」页签、也没有上传框；弹窗不响应 Escape，点「取消」才关
+    page = FakePage({"div.upload-cover": True, xhs.XHS_MODAL_SELECTOR: True, "text=取消": True})
+    page.on_click["text=取消"] = lambda p: p.visible.update({xhs.XHS_MODAL_SELECTOR: False})
+    await video.set_thumbnail(page, "c.png")
+    assert "text=取消" in page.clicks and not page.visible[xhs.XHS_MODAL_SELECTOR]
+    assert video.declaration_warnings and "封面" in video.declaration_warnings[0]
+    assert (tmp_path / "xiaohongshu-cover.png").is_file()
+
+
+async def test_xhs_title_read_back(sau, tmp_path: Path):
+    _, _, xhs = sau
+    from multipub._sau.runtime import DeclarationFailed
+
+    key = 'input[placeholder*="填写标题"]'
+    want = "三分钟学会做饭🔥超简单的家常菜做法分享"
+    hooks = _fast_hooks(tmp_path, platform="xiaohongshu")
+    ok = xhs.XiaoHongShuVideo(want, "v.mp4", [], 0, "x.json", hooks=hooks)
+    page = FakePage({key: True})
+    await ok.fill_title(page)
+    assert page.filled[key] == want and ok.declaration_warnings == []
+
+    # 标题框按 UTF-16 计数，把末尾截掉了：重填一次仍然如此 → 拒绝发布
+    cut = xhs.XiaoHongShuVideo(want, "v.mp4", [], 0, "x.json", hooks=hooks)
+    page = FakePage({key: True})
+    page.readonly.add(key)
+    page.attrs[(key, "value")] = want[:-1]
+    with pytest.raises(DeclarationFailed, match="缩短标题"):
+        await cut.fill_title(page)
+
+    # 读回来完全不一样：只告警（写进结果消息）
+    odd = xhs.XiaoHongShuVideo(want, "v.mp4", [], 0, "x.json", hooks=hooks)
+    page.attrs[(key, "value")] = "别的标题"
+    await odd.fill_title(page)
+    assert odd.declaration_warnings and "别的标题" in odd.declaration_warnings[0]
+
+
+async def test_xhs_desc_escapes_suggestions_before_newline(sau):
+    """正文里的 #话题 / @某人 会弹出候选框，候选框开着时回车会选中第一个候选：这样的行回车前先按 Escape。"""
+    _, _, xhs = sau
+    video = xhs.XiaoHongShuVideo("标题", "v.mp4", [], 0, "x.json", desc="去爬山 #徒步\n第二行\n@小明 你好")
+    page = FakePage({xhs.XHS_DESC_SELECTOR: True})
+    await video.fill_desc(page)
+    assert page.keyboard.pressed[3:] == ["Escape", "Enter", "Enter", "Escape", "Enter"]
+
+
+class _UploadStatePage(FakePage):
+    def __init__(self, states: list[dict[str, str]], **kw: Any):
+        super().__init__(**kw)
+        self.states = states
+
+    async def evaluate(self, script: str = "", arg: Any = None) -> Any:
+        from multipub._sau.uploader.xiaohongshu_uploader import main as xhs
+
+        if script == xhs._UPLOAD_STATE_JS:
+            return self.states.pop(0) if len(self.states) > 1 else self.states[0]
+        return await super().evaluate(script, arg)
+
+
+async def test_xhs_failed_image_upload_is_refused_before_publish(sau, tmp_path: Path):
+    _, _, xhs = sau
+    from multipub._sau.runtime import Deadline, UploadFailed
+
+    note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题",
+                               hooks=_fast_hooks(tmp_path, platform="xiaohongshu"))
+    busy = {"busy": "上传中", "failed": ""}
+    page = _UploadStatePage([busy, {"busy": "", "failed": "上传失败"}])
+    with pytest.raises(UploadFailed, match="笔记没有发出"):
+        await note._wait_uploads_settled(page, Deadline(30, "等待图片上传完成"))
+    assert (tmp_path / "xiaohongshu-upload-failed.png").is_file()
+    await note._wait_uploads_settled(_UploadStatePage([busy, {"busy": "", "failed": ""}]),
+                                     Deadline(30, "等待图片上传完成"))  # 传完了：正常返回
+
+
+class _GatewayResponse(FakeResponse):
+    async def json(self) -> Any:
+        raise ValueError("not json")
+
+
+async def test_xhs_gateway_error_detail(sau, tmp_path: Path):
+    _, _, xhs = sau
+    from multipub._sau.runtime import StepTimeout
+
+    video = xhs.XiaoHongShuVideo("标题", "v.mp4", [], 0, "x.json",
+                                 hooks=_fast_hooks(tmp_path, platform="xiaohongshu", publish_timeout=0.5))
+    page = FakePage({XHS_PUBLISH: True})
+
+    def submit(p: FakePage) -> None:
+        req = FakeRequest(XHS_CREATE)
+        p.emit("request", req)
+        p.emit("response", _GatewayResponse(req, None, status=502))
+
+    page.on_click[XHS_PUBLISH] = submit
+    with pytest.raises(StepTimeout, match="HTTP 502") as info:
+        await video._publish_until_success(page, "视频")
+    assert info.value.after_submit and page.clicks.count(XHS_PUBLISH) == 1
+
+
+async def test_xhs_classify_failure(sau, tmp_path: Path):
+    """填表时的 Playwright 超时：页面停在登录页 / 人机验证时改报对应的错误（适配器给 login_required / captcha）。"""
+    _, _, xhs = sau
+    from multipub._sau.runtime import CaptchaRequired, LoginPageDetected
+
+    note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题",
+                               hooks=_fast_hooks(tmp_path, platform="xiaohongshu"))
+    err = TimeoutError("Locator.fill: Timeout 30000ms exceeded.")
+    login = FakePage()
+    login.url = "https://creator.xiaohongshu.com/login?redirectReason=401"
+    with pytest.raises(LoginPageDetected) as info:
+        await note._classify_failure(login, err)
+    assert not info.value.after_submit
+    with pytest.raises(CaptchaRequired):
+        await note._classify_failure(FakePage({"text=请完成验证": True}), err)
+    await note._classify_failure(FakePage(), err)  # 看不出原因：交给调用方原样抛出
+
+
+def test_xiaohongshu_validate_emoji_title(media: Path):
+    issues = XiaohongshuAdapter.validate(xhs_post(media, title="三分钟学会做饭🔥超简单的家常菜做法分享啊"))
+    assert _levels(issues, "title") == {"warning"}
+    assert XiaohongshuAdapter.validate(xhs_post(media, title="三分钟学会做饭🔥")) == []

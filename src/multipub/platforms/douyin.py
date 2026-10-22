@@ -37,6 +37,11 @@ def resolve_declaration(post: PlatformPost) -> str | None:
     return str(value).strip()
 
 
+def utf16_len(text: str) -> int:
+    """网页 input 的 maxlength 按 UTF-16 码元计数：emoji 等补充平面字符算 2 个。"""
+    return len(text.encode("utf-16-le")) // 2
+
+
 def _is_landscape(path: Path) -> bool:
     try:
         from PIL import Image
@@ -112,6 +117,13 @@ class DouyinAdapter(PlatformAdapter):
                 c.warn("ai_generated", "抖音图文流程不支持自动勾选 AI 声明，发布后请在抖音 App 内补充")
         else:
             c.error("kind", f"抖音不支持 {post.kind.value}")
+        limit = TITLE_MAX_VIDEO if post.kind is Kind.VIDEO else TITLE_MAX_NOTE
+        if len(post.title) <= limit < utf16_len(post.title):
+            c.warn("title", f"标题含 emoji 等字符：抖音网页按 2 个字计数时会超过 {limit} 字被截断"
+                            "（发布前会读回核对，被截断则中止、不会发出），建议缩短")
+        typed = len(post.body.strip()) + sum(len(t) + 2 for t in post.tags)  # 话题以「 #话题」接在正文后面
+        if len(post.body) <= BODY_MAX < typed:
+            c.warn("tags", f"正文加话题共 {typed} 字，超过 {BODY_MAX} 字时末尾的话题可能被平台截掉")
         c.tags(post.tags, soft_limit=TAGS_SOFT_MAX)
         c.schedule(post.schedule)
         return c.issues
@@ -148,7 +160,8 @@ class DouyinAdapter(PlatformAdapter):
                     await uploader.douyin_upload_video()
                 else:
                     await uploader.douyin_upload_note()
-        return self._success(post, getattr(uploader, "published_item_id", None))
+        return self._success(post, getattr(uploader, "published_item_id", None),
+                             notes=list(getattr(uploader, "notes", None) or []))
 
     def build_uploader(self, dy: Any, post: PlatformPost) -> Any:
         """PlatformPost → vendored SAU 的 DouYinVideo / DouYinNote。"""
@@ -191,7 +204,7 @@ class DouyinAdapter(PlatformAdapter):
             **common,
         )
 
-    def _success(self, post: PlatformPost, item_id: str | None) -> Result:
+    def _success(self, post: PlatformPost, item_id: str | None, notes: list[str] | None = None) -> Result:
         url = None
         if item_id:
             url = f"https://www.douyin.com/{'video' if post.kind is Kind.VIDEO else 'note'}/{item_id}"
@@ -201,5 +214,7 @@ class DouyinAdapter(PlatformAdapter):
             status, msg = Status.SUBMITTED, "已提交，审核通过后公开"
         if not url:
             msg += "；抖音未返回作品链接，请到创作者中心「作品管理」查看"
+        for note in notes or []:  # 与清单不一致的地方（封面没设上、合集没找到等）
+            msg += f"；{note}"
         return self.result(status, kind=post.kind, message=msg, url=url, item_id=item_id)
 

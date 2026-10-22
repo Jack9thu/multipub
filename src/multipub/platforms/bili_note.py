@@ -45,6 +45,12 @@ SEL_DATETIME = ".bili-dyn-publishing__datetime"
 SEL_PUBLISH = (".bili-dyn-publishing__action.launcher",)
 SEL_CAPTCHA = (".geetest_panel", ".geetest_box", "iframe[src*='geetest']")
 SEL_LOGIN_ENTRY = (".header-login-entry", ".bili-header .login-btn")
+# 整页风控（HTTP 412，「由于触发哔哩哔哩安全风控策略，该次访问请求被拒绝」）
+SEL_RISK_PAGE = ("text=安全风控策略", "text=错误号: 412")
+PAGE_RISK_MESSAGE = ("B站风控拦截了动态页（412），动态没有发出：稍后再试；频繁出现时先用浏览器正常访问一次 B站，"
+                     "或加 --headed 运行看看页面")
+PUBLISHER_WAIT = 30  # 等发布框出现的秒数
+LOGIN_ENTRY_GRACE = 8  # 页头「登录」按钮持续这么久（且没有发布框）才算未登录（慢网络下页头可能先显示登录按钮）
 # 迷你登录框（mini-login）的遮罩：点发布后弹出说明网页登录态失效
 SEL_LOGIN_POPUP = (".bili-mini-mask",)
 # 《动态发布规范》确认框：立即发布时，若 cookie dy_spec_agreed != 1 就会弹出，点「确认并发送」才真正发出
@@ -56,6 +62,8 @@ SPEC_URL = "https://t.bilibili.com/h5/dynamic/specification"
 SPEC_HUMAN_WAIT = 180  # 有头模式下等人点确认 / 过人机验证的秒数
 SPEC_CANCEL_GRACE = 8  # 弹窗关闭后这么久还没有发出请求，视为点了「取消」
 POLL_SECONDS = 0.5  # 等待发布结果时的轮询间隔
+CHOOSER_AUTO_WAIT = 3  # 点「图片」后等发布框自己弹出选文件框的秒数
+PUBLISH_WAIT = 60  # 点了发布之后等发布接口结果的秒数（config.toml [platforms.bilibili] publish_wait）
 
 UPLOAD_BFS_PATH = "/x/dynamic/feed/draw/upload_bfs"
 SUBMIT_CHECK_PATH = "/x/dynamic/feed/create/submit_check"
@@ -211,11 +219,12 @@ class BrowserNotePublisher:
     """spec_consent：用户已同意《动态发布规范》（配置项或之前亲手点过确认）；spec_marker：记住同意的文件。"""
 
     def __init__(self, ctx: JobContext, *, account: str, spec_consent: bool = False,
-                 spec_marker: Path | None = None):
+                 spec_marker: Path | None = None, publish_wait: float = PUBLISH_WAIT):
         self.ctx = ctx
         self.account = account
         self.spec_consent = spec_consent
         self.spec_marker = spec_marker
+        self.publish_wait = publish_wait  # 点了发布之后等发布接口结果的秒数
         self.net = _NetTracker()
         self.warnings: list[str] = []  # 要写进结果的提醒（选项没生效等）
         self.scheduled_at: int | None = None  # 实际提交的定时时间（epoch 秒）；None 表示立即发布
@@ -250,12 +259,10 @@ class BrowserNotePublisher:
                    timer_pub_time: int | None, aigc: bool, pic_mode: int | None) -> dict[str, Any]:
         log = self.ctx.log
         log("打开 t.bilibili.com 动态发布框")
-        await page.goto(PUBLISH_PAGE, wait_until="domcontentloaded", timeout=60_000)
-        publisher = await _first_visible(page, SEL_PUBLISHER, 30_000)
-        if publisher is None:
-            if "passport.bilibili.com" in page.url or await _any_visible(page, SEL_LOGIN_ENTRY):
-                raise LoginRequired(f"B站网页未登录：运行 mpub login bilibili --account {self.account}")
-            raise PublishError("找不到动态发布框（.bili-dyn-publishing），页面可能改版")
+        resp = await page.goto(PUBLISH_PAGE, wait_until="domcontentloaded", timeout=60_000)
+        if resp is not None and resp.status == 412:
+            raise NeedsAction(PAGE_RISK_MESSAGE, code=ErrorCode.RISK_CONTROL)
+        await self._wait_publisher(page)
 
         # 定时发布走另一条分支，不弹规范确认框；立即发布且没同意过时，无头模式先停下来问人（还没传图）
         spec_pending = not timer_pub_time and not await self._spec_agreed(page)
@@ -294,6 +301,28 @@ class BrowserNotePublisher:
         data = await self._wait_created(page)
         self._verify_sent(timer_pub_time=timer_pub_time, aigc=aigc, pic_mode=pic_mode)
         return data
+
+    async def _wait_publisher(self, page: Any) -> None:
+        """等发布框出现；跳到登录页、页头一直显示「登录」或整页风控（412）时立即停下，不干等 30 秒。"""
+        deadline = time.monotonic() + PUBLISHER_WAIT
+        login_since: float | None = None
+        while True:
+            if await _any_visible(page, SEL_PUBLISHER):
+                return
+            if "passport.bilibili.com" in page.url:
+                raise LoginRequired(f"B站网页未登录（跳到了登录页）：运行 mpub login bilibili --account {self.account}")
+            if await _any_visible(page, SEL_RISK_PAGE):
+                raise NeedsAction(PAGE_RISK_MESSAGE, code=ErrorCode.RISK_CONTROL)
+            # 页头的「登录」按钮在加载过程中可能一闪而过：持续出现一段时间才算未登录
+            if await _any_visible(page, SEL_LOGIN_ENTRY):
+                login_since = login_since or time.monotonic()
+                if time.monotonic() - login_since >= LOGIN_ENTRY_GRACE:
+                    raise LoginRequired(f"B站网页未登录：运行 mpub login bilibili --account {self.account}")
+            else:
+                login_since = None
+            if time.monotonic() > deadline:
+                raise PublishError("找不到动态发布框（.bili-dyn-publishing），页面可能改版；动态没有发出")
+            await asyncio.sleep(0.3)
 
     async def _spec_agreed(self, page: Any) -> bool:
         """与网页端 _checkSpecification 相同的判断：cookie dy_spec_agreed 为 1 就不弹框。"""
@@ -357,27 +386,47 @@ class BrowserNotePublisher:
 
     async def _upload_images(self, page: Any, images: list[Path]) -> None:
         log = self.ctx.log
-        panel = page.locator(SEL_PIC_PANEL).first
-        if not await panel.is_visible():
-            tool = await _first_visible(page, SEL_PIC_TOOL, 10_000)
-            if tool is None:
-                raise PublishError("找不到「图片」按钮（.bili-dyn-publishing__tools__item.pic）")
-            await tool.click()
         files = [str(p) for p in images]
         log(f"上传 {len(files)} 张图片")
         pending = list(files)
-        while pending:
-            add = await _first_visible(page, SEL_PIC_ADD, 10_000)
-            if add is None:
-                raise PublishError("找不到添加图片的按钮（.bili-pics-uploader__add）")
-            async with page.expect_file_chooser(timeout=15_000) as chooser_info:
-                await add.click()
-            chooser = await chooser_info.value
-            batch = pending if chooser.is_multiple() else pending[:1]
-            await chooser.set_files(batch)
-            pending = pending[len(batch):]
-            if pending:
-                await asyncio.sleep(1)
+        # 整个选图阶段都接管选文件框：线上发布框在「图片」面板出现且还没有图片时会立刻自己弹出选文件框，
+        # 不接管的话有头模式下会弹出系统的「打开」对话框（用户可能在里面再选一遍图）
+        choosers: asyncio.Queue[Any] = asyncio.Queue()
+
+        def on_chooser(chooser: Any) -> None:
+            choosers.put_nowait(chooser)
+
+        page.on("filechooser", on_chooser)
+        try:
+            chooser: Any = None
+            panel = page.locator(SEL_PIC_PANEL).first
+            if not await panel.is_visible():
+                tool = await _first_visible(page, SEL_PIC_TOOL, 10_000)
+                if tool is None:
+                    raise PublishError("找不到「图片」按钮（.bili-dyn-publishing__tools__item.pic）")
+                await tool.click()
+                try:
+                    chooser = await asyncio.wait_for(choosers.get(), CHOOSER_AUTO_WAIT)
+                except asyncio.TimeoutError:
+                    chooser = None  # 没有自动弹出：下面点「添加」
+            while pending:
+                if chooser is None:
+                    add = await _first_visible(page, SEL_PIC_ADD, 10_000)
+                    if add is None:
+                        raise PublishError("找不到添加图片的按钮（.bili-pics-uploader__add）")
+                    await add.click()
+                    try:
+                        chooser = await asyncio.wait_for(choosers.get(), 15)
+                    except asyncio.TimeoutError:
+                        raise PublishError("点了添加图片但没有弹出选文件框，动态没有发出") from None
+                batch = pending if chooser.is_multiple() else pending[:1]
+                await chooser.set_files(batch)
+                chooser = None
+                pending = pending[len(batch):]
+                if pending:
+                    await asyncio.sleep(1)
+        finally:
+            page.remove_listener("filechooser", on_chooser)
 
         deadline = time.monotonic() + 60 + 30 * len(files)
         while self.net.uploaded < len(files):
@@ -453,7 +502,7 @@ class BrowserNotePublisher:
     async def _wait_created(self, page: Any) -> dict[str, Any]:
         """点了发布之后：等 create/dyn 的响应，顺带处理规范确认框、人机验证和登录框。"""
         log = self.ctx.log
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + self.publish_wait
         spec_seen = False  # 看到了规范确认框
         spec_closed_at: float | None = None
         captcha_seen = False
@@ -513,7 +562,8 @@ class BrowserNotePublisher:
         if not self.net.create_sent:
             raise PublishError("点了发布但没有观察到发布请求（可能弹出了确认框），大概率没发出；"
                                "先到 B站动态页确认，再决定是否重发", code=ErrorCode.UNKNOWN_OUTCOME)
-        raise PublishError("发布请求已发出但 60 秒内没有拿到结果：先到 B站动态页确认是否已发出，不要直接重发",
+        raise PublishError(f"发布请求已发出但 {self.publish_wait:g} 秒内没有拿到结果：先到 B站动态页确认是否已发出，"
+                           "不要直接重发",
                            code=ErrorCode.UNKNOWN_OUTCOME)
 
     def _parse_created(self, data: dict[str, Any]) -> dict[str, Any]:

@@ -45,6 +45,7 @@ NOTE_TITLE_MAX = 20
 NOTE_TEXT_MAX = 1000
 NOTE_IMAGES_MAX = 9
 NOTE_IMAGE_BYTES_MAX = 20 * 1024 * 1024
+NOTE_GIF_BYTES_MAX = 8 * 1024 * 1024
 NOTE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif"}
 NOTE_SCHEDULE_MIN = timedelta(minutes=5)
 NOTE_SCHEDULE_SAFE = timedelta(minutes=10)
@@ -93,13 +94,17 @@ def note_text(post: PlatformPost) -> str:
 
 
 class _ProgressLog:
-    """biliup 输出：全部写 stderr（worker 日志），重要的行和心跳低频转发给 ctx.log。"""
+    """biliup 输出：全部写 stderr（worker 日志），重要的行和心跳低频转发给 ctx.log。
+
+    on_uploaded：看到「视频已全部传完」（之后 biliup 马上发投稿请求）时调用一次，用来标记 submit_started。"""
 
     IMPORTANT = ("user:", "Upload completed", "投稿成功", "ERROR", "WARN", "Error", "限流")
 
-    def __init__(self, ctx: JobContext, min_interval: float = 5.0):
+    def __init__(self, ctx: JobContext, min_interval: float = 5.0,
+                 on_uploaded: Callable[[], None] | None = None):
         self.ctx = ctx
         self.min_interval = min_interval
+        self.on_uploaded = on_uploaded
         self.started = time.monotonic()
         self.last = 0.0
 
@@ -110,6 +115,12 @@ class _ProgressLog:
             self.last = now
             return
         print(line, file=sys.stderr, flush=True)
+        if self.on_uploaded is not None:
+            from .bili_biliup import marks_submit_phase
+
+            if marks_submit_phase(line):
+                self.on_uploaded()
+                self.on_uploaded = None
         if any(m in line for m in self.IMPORTANT) and now - self.last >= self.min_interval:
             self.ctx.log(f"biliup: {line[-200:]}")
             self.last = now
@@ -243,10 +254,16 @@ class BilibiliAdapter(PlatformAdapter):
         if len(post.images) > NOTE_IMAGES_MAX:
             err("images", f"B站动态最多 {NOTE_IMAGES_MAX} 张图（当前 {len(post.images)}）")
         for img in post.images:
-            if img.suffix.lower() not in NOTE_IMAGE_EXTS:
+            suffix = img.suffix.lower()
+            if suffix not in NOTE_IMAGE_EXTS:
                 err("images", f"{img.name}: B站动态只支持 jpg / png / gif")
-            elif img.is_file() and img.stat().st_size > NOTE_IMAGE_BYTES_MAX:
-                err("images", f"{img.name}: 单张图片不能超过 20MB")
+                continue
+            size = img.stat().st_size if img.is_file() else 0
+            # 发布框的校验：floor(大小 / 1MB) >= 上限就拒绝（GIF 8MB，其他 20MB）
+            if suffix == ".gif" and size >= NOTE_GIF_BYTES_MAX:
+                err("images", f"{img.name}: GIF 必须小于 8MB")
+            elif size >= NOTE_IMAGE_BYTES_MAX:
+                err("images", f"{img.name}: 单张图片必须小于 20MB")
         if o.get("pic_mode") not in (None, "") and _as_int(o.get("pic_mode")) not in (0, 1):
             err("platforms.bilibili.pic_mode", "只能是 0（九宫格，默认）或 1（大封面）")
         for key in ("confirm_rules", "tags_in_text"):
@@ -284,8 +301,10 @@ class BilibiliAdapter(PlatformAdapter):
 
     # ================================================================ 登录
     def _load_cred(self, *, require_token: bool) -> Any:
-        from .bili_cookies import CredentialError, load_credential
+        from .bili_cookies import CredentialError, load_credential, strip_bom
 
+        if strip_bom(self.account_file):  # 同一个文件要交给 biliup，它不认 BOM
+            self.ctx.log(f"登录文件开头有 BOM，已去掉：{self.account_file}", level="warning")
         try:
             cred = load_credential(self.account_file)
         except CredentialError as exc:
@@ -430,11 +449,17 @@ class BilibiliAdapter(PlatformAdapter):
         from . import bili_biliup
 
         cred = self._load_cred(require_token=True)
-        exe = bili_biliup.find_biliup(self.settings)
-        if exe is None:
-            raise PublishError("未找到 biliup：先运行 mpub setup（或在 config.toml 设置 biliup_path）",
+        from . import bili_locate
+
+        res = await asyncio.to_thread(bili_locate.resolve, self.settings)
+        if res.path is None:
+            raise PublishError(f"biliup 不可用（{res.detail}）：{res.problem}；没有启动上传（尚未投稿）",
                                code=ErrorCode.INTERNAL)
-        await self._preflight_biliup(exe)
+        exe = res.path
+        probe = await self._preflight_biliup(exe)  # 起不来（缺运行库 / 超时）在这里按原因报
+        if res.problem:
+            raise PublishError(f"biliup 不兼容（{res.detail}）：{res.problem}；没有启动上传（尚未投稿）。"
+                               "换一个：mpub biliup find / mpub biliup use --download", code=ErrorCode.INTERNAL)
         # 先做一次与 biliup 相同的只读令牌校验：登录失效时在"开始上传"之前就报 login_required
         try:
             await asyncio.wait_for(self._token(cred, timeout=TOKEN_PRECHECK_TIMEOUT), TOKEN_PRECHECK_TIMEOUT * 2)
@@ -442,7 +467,13 @@ class BilibiliAdapter(PlatformAdapter):
             raise
         except (PublishError, asyncio.TimeoutError) as exc:  # 网络 / 风控：交给 biliup 自己校验
             self.ctx.log(f"预先校验登录令牌失败（{str(exc) or '超时'}），交给 biliup 处理", level="warning")
-        args = bili_biliup.build_upload_args(exe, self.account_file, post)
+        rust_log = await asyncio.to_thread(bili_locate.supports_rust_log, exe)
+        args = bili_biliup.build_upload_args(exe, self.account_file, post, rust_log=rust_log)
+        missing = await asyncio.to_thread(bili_locate.unsupported_flags, exe, args)
+        if missing:
+            raise PublishError(f"当前 biliup（{res.detail}）不支持参数 {', '.join(missing)}；没有启动上传（尚未投稿）。"
+                               "去掉清单里对应的选项，或换一个兼容的 biliup：mpub biliup find / "
+                               "mpub biliup use --download", code=ErrorCode.INTERNAL)
         timeout = self._video_timeout()
         if timeout < VIDEO_MIN_BUDGET:
             raise PublishError(f"剩余时间只有 {max(0, int(timeout))} 秒，不够上传视频，没有启动 biliup（尚未投稿）："
@@ -451,23 +482,30 @@ class BilibiliAdapter(PlatformAdapter):
         assert post.video is not None
         size_mb = post.video.stat().st_size / 1024 / 1024
         self.ctx.log(f"biliup 上传 {post.video.name}（{size_mb:.1f} MB），完成后自动投稿")
-        # biliup 是「上传 + 投稿」一条命令：启动前就标记，之后任何失败都不自动重试
-        self.ctx.mark_submit_started()
+        # biliup 是「上传 + 投稿」一条命令，投稿请求在视频全部传完之后才发。输出格式核对过的版本（v1.3.1）
+        # 等看到「上传完成」再标记 submit_started：上传途中被中断 / 超时 / 出错都确定没投稿，不会被查重拦住；
+        # 其他版本输出可能不同，保守起见启动前就标记。之后的任何失败都不自动重试
+        watch = bili_biliup.output_format_verified(probe.version)
+        if not watch:
+            self.ctx.mark_submit_started()
+        progress = _ProgressLog(self.ctx, on_uploaded=self.ctx.mark_submit_started if watch else None)
         rc, lines = await bili_biliup.run_streaming(args, cwd=self.ctx.run_dir, timeout=timeout,
-                                                    on_line=_ProgressLog(self.ctx), heartbeat=60)
+                                                    on_line=progress, heartbeat=60)
         # 文件名 / 路径 / 标题会被 biliup 回显（如 pre_upload、Upload completed、file <路径>），解析时抹掉
         echo = bili_biliup.echo_strings(post.video, post.cover, self.account_file, post.title.strip())
         outcome = bili_biliup.parse_upload_output(lines, rc, echo=echo)
+        if outcome.uploaded or outcome.submitted or outcome.response_code is not None or rc == 0:
+            self.ctx.mark_submit_started()  # 兜底：只有「确定没传完就失败了」才保持未投稿
         return self._video_result(post, outcome, timeout)
 
-    async def _preflight_biliup(self, exe: Path) -> None:
+    async def _preflight_biliup(self, exe: Path) -> Any:
         """标记投稿之前先试运行 `biliup --version`（纯本地）：缺 VC++ 运行库这类起不来的情况在这里报，
-        而不是标记 submit_started 之后得到一个看不懂的退出码。"""
+        而不是标记 submit_started 之后得到一个看不懂的退出码。返回 Probe（含版本号）。"""
         from . import bili_biliup
 
         probe = await asyncio.to_thread(bili_biliup.probe_cached, exe)
         if probe.ok:
-            return
+            return probe
         message = f"{probe.detail}；没有启动上传（尚未投稿）"
         if probe.timed_out:
             raise PublishError(message, code=ErrorCode.TIMEOUT, retryable=True)
@@ -507,10 +545,10 @@ class BilibiliAdapter(PlatformAdapter):
             raise PublishError(f"上传超过 {int(timeout)} 秒，已终止，尚未投稿；可在 config.toml [timeouts] "
                                "调大 publish_video 或加大 --timeout 后重新发布", code=ErrorCode.TIMEOUT)
         if o.login_error and not o.uploaded:
-            raise LoginRequired(f"B站登录已失效（biliup: {o.tail_text[-200:]}）；{_login_hint(self.ctx.account)}")
+            raise LoginRequired(f"B站登录已失效（biliup: {o.error_text[-200:]}）；{_login_hint(self.ctx.account)}")
         if o.uploaded:
             raise PublishError(f"biliup 退出码 {o.returncode}；{unknown}", code=ErrorCode.UNKNOWN_OUTCOME)
-        raise PublishError(f"biliup 上传失败（退出码 {o.returncode}）：{o.tail_text}；"
+        raise PublishError(f"biliup 上传失败（退出码 {o.returncode}）：{o.error_text}；"
                            "尚未投稿，确认原因后可重新发布")
 
     async def _web_session(self) -> tuple[Any, dict[str, Any], dict[str, str]]:
@@ -564,8 +602,9 @@ class BilibiliAdapter(PlatformAdapter):
                 consent = post.options["confirm_rules"] is True
             else:
                 consent = self.settings.platform_config(NAME).get(CONFIRM_RULES_CONFIG) is True or marker.is_file()
+            wait = _as_int(self.settings.platform_config(NAME).get("publish_wait"))
             publisher = BrowserNotePublisher(self.ctx, account=self.ctx.account, spec_consent=consent,
-                                             spec_marker=marker)
+                                             spec_marker=marker, publish_wait=max(10, wait or 60))
             data = await publisher.publish(
                 storage_state=bili_cookies.to_storage_state(cred, extra), title=title, text=text,
                 images=post.images, timer_pub_time=timer, aigc=post.ai_generated, pic_mode=pic_mode)

@@ -105,6 +105,7 @@ class Hooks:
     reclick_gap: float = 20  # 上次点击「发布」没有任何反应时，至少隔这么久才再点
     max_publish_clicks: int = 3  # 最终「发布」按钮最多点几次（含被平台弹窗拦下的那次）
     reject_grace: float = 15  # 发布接口明确失败后，等这么久仍没有验证弹窗就判定为被拒
+    receipt_grace: float = 10  # 发布接口已明确成功（有作品 ID）但页面一直不跳转：等这么久后按成功处理
 
     def publish_guard(self) -> "PublishGuard":
         return PublishGuard(reclick_gap=self.reclick_gap, max_clicks=self.max_publish_clicks)

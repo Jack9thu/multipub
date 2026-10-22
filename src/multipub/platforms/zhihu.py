@@ -53,6 +53,10 @@ VERIFY_HEADLESS_WAIT = 20.0  # 无头模式打开验证页后，等它自动放�
 QR_FALLBACK_AFTER = 8.0  # 这么久还没从接口拿到二维码，就截图
 QR_API_PATH = "/api/v3/account/api/login/qrcode"
 QR_SELECTORS = (".Qrcode-img", ".Qrcode-content img", "img[alt*='二维码']", ".Qrcode canvas")
+XSRF_WAIT = 5.0  # 打开首页后等 _xsrf cookie 出现的秒数
+EMBED_SEARCH_DEPTH = 6  # Obsidian ![[图.png]] 按文件名找图片时，往子目录里找几层
+EMBED_SEARCH_MAX_DIRS = 3000  # 最多翻这么多个目录（库很大或认不出库根目录时不至于卡住）
+OBSIDIAN_ROOT_LEVELS = 8  # 往上找几层父目录来认 Obsidian 库根目录（.obsidian）
 
 _TRUE = {"true", "yes", "on", "1", "是"}
 _FALSE = {"false", "no", "off", "0", "否", ""}
@@ -129,8 +133,51 @@ def asset_dirs(post: PlatformPost) -> list[Path]:
     return list(dict.fromkeys(d.resolve() for d in dirs))
 
 
-def resolve_local_image(ref: str, dirs: list[Path]) -> Path | None:
-    """Markdown 里的本地图片引用 → 文件路径（支持百分号编码、file:// 与绝对路径）。"""
+def _vault_root(d: Path) -> Path | None:
+    """d 所在的 Obsidian 库根目录（含 .obsidian 文件夹的那层祖先目录）。"""
+    for r in [d, *list(d.parents)[:OBSIDIAN_ROOT_LEVELS]]:
+        if (r / ".obsidian").is_dir():
+            return r
+    return None
+
+
+def _find_embed(ref: str, dirs: list[Path]) -> Path | None:
+    """Obsidian 的 ![[图.png]] / ![[附件/图.png]]：路径相对库根目录，或只写文件名（库里任意位置，常见的是库根目录下的
+    附件文件夹）。能认出库根目录（有 .obsidian）就只在库里找；认不出就在素材目录和它的上一层里找。
+    广度优先、越浅越优先，总共最多翻 EMBED_SEARCH_MAX_DIRS 个目录，免得翻遍整个用户目录、挑中同名的别的图。"""
+    rel = Path(ref)
+    roots: list[Path] = []
+    for d in dirs:
+        vault = _vault_root(d)
+        for r in ([vault] if vault else [d, d.parent]):
+            if r not in roots:
+                roots.append(r)
+    for r in roots:
+        if (r / rel).is_file():
+            return (r / rel).resolve()
+    want = [part.casefold() for part in rel.parts]
+    scanned = 0
+    for root in roots:
+        queue = [(root, 0)]
+        while queue and scanned < EMBED_SEARCH_MAX_DIRS:
+            d, depth = queue.pop(0)
+            scanned += 1
+            try:
+                entries = sorted(d.iterdir(), key=lambda e: e.name)
+            except OSError:
+                continue
+            for e in entries:
+                if e.name.casefold() == want[-1] and [x.casefold() for x in e.parts[-len(want):]] == want \
+                        and e.is_file():
+                    return e.resolve()
+            if depth < EMBED_SEARCH_DEPTH:
+                queue += [(e, depth + 1) for e in entries if not e.name.startswith((".", "__")) and e.is_dir()]
+    return None
+
+
+def resolve_local_image(ref: str, dirs: list[Path], *, search: bool = False) -> Path | None:
+    """Markdown 里的本地图片引用 → 文件路径（支持百分号编码、file:// 与绝对路径）。
+    search=True（Obsidian 嵌入）时找不到再按文件名在子目录 / 父目录里找。"""
     candidates = [ref]
     if ref.lower().startswith("file://"):
         candidates = [urllib.parse.unquote(urllib.parse.urlsplit(ref).path)]
@@ -149,7 +196,18 @@ def resolve_local_image(ref: str, dirs: list[Path]) -> Path | None:
             q = d / p
             if q.is_file():
                 return q.resolve()
+    if search and not Path(ref).is_absolute():
+        return _find_embed(ref, dirs)
     return None
+
+
+def display_ref(ref: str | Path) -> str:
+    """进度日志里显示的图片名：本地文件不显示百分号编码。"""
+    if isinstance(ref, Path):
+        return ref.name
+    from .zhihu_html import is_remote
+
+    return ref if is_remote(ref) else urllib.parse.unquote(ref)
 
 
 def _num(cfg: dict[str, Any], key: str, default: float) -> float:
@@ -296,7 +354,7 @@ class ZhihuAdapter(PlatformAdapter):
     @classmethod
     def _validate_article(cls, post: PlatformPost, err: Callable[[str, str], None],
                           warn: Callable[[str, str], None]) -> None:
-        from .zhihu_html import collect_image_urls, is_remote, is_zhimg, raw_html_images
+        from .zhihu_html import collect_image_refs, is_remote, is_zhimg, raw_html_images, unrecognized_images
 
         o = post.options
         title = post.title.strip()
@@ -308,17 +366,20 @@ class ZhihuAdapter(PlatformAdapter):
             err("body", "文章正文为空")
 
         dirs = asset_dirs(post)
-        for ref in collect_image_urls(post.body):
+        for ref, kind in collect_image_refs(post.body):
             if is_remote(ref):
                 continue
             if ref.lower().startswith("data:"):
                 err("body", "不支持 data: 内嵌图片，请改成图片文件")
                 continue
-            path = resolve_local_image(ref, dirs)
+            path = resolve_local_image(ref, dirs, search=kind == "embed")
             if path is None:
-                err("body", f"找不到正文里引用的图片: {ref}（相对路径按 Markdown 文件所在目录解析）")
+                err("body", f"找不到正文里引用的图片: {display_ref(ref)}（相对路径按 Markdown 文件所在目录解析）")
             else:
                 cls._check_image_ext(path, "body", err, warn)
+        for raw in unrecognized_images(post.body)[:3]:
+            err("body", f"{raw} 不是图片，会原样当成文字发出去：知乎文章不能嵌入笔记，请删掉或改成正文；"
+                        "图片请写成 ![说明](<图片路径>)")
         raw_imgs = [u for u in raw_html_images(post.body) if not is_zhimg(u)]
         if raw_imgs:
             warn("body", f"HTML <img> 标签里的图片不会上传到知乎图床（{raw_imgs[0]} 等 {len(raw_imgs)} 张），"
@@ -403,7 +464,8 @@ class ZhihuAdapter(PlatformAdapter):
                 image_timeout=_num(cfg, "image_timeout", zhihu_api.DEFAULT_IMAGE_TIMEOUT),
             )
             if not api.xsrf:
-                self.ctx.log("登录文件里没有 _xsrf cookie，写接口可能被拒；可重新登录", level="warning")
+                self.ctx.log(f"登录文件里没有 _xsrf cookie，写接口可能被拒：运行 mpub login zhihu --account "
+                             f"{self.ctx.account} 补齐（不用重新扫码）", level="warning")
             yield api
 
     # ================================================================ 登录
@@ -414,6 +476,26 @@ class ZhihuAdapter(PlatformAdapter):
         budget = float(self.ctx.timeout) if self.ctx.timeout else self.settings.timeout_for("login") - 30
         return max(60.0, budget - LOGIN_RESERVE)
 
+    def _browser_state(self) -> dict[str, Any] | None:
+        """现有登录文件 → 浏览器能用的 storage_state。登录文件也可能是手动放的 cookie 列表或 {name: value}
+        （zhihu_api.load_cookies 都认），直接交给浏览器会报错，这里统一转换。没有 / 读不了 → None。"""
+        from . import zhihu_api
+
+        try:
+            data = json.loads(self.account_file.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return None
+        if isinstance(data, dict) and isinstance(data.get("cookies"), list) and all(
+                isinstance(c, dict) and c.get("domain") and c.get("sameSite") in ("Strict", "Lax", "None")
+                for c in data["cookies"]):
+            return data  # patchright 自己存的 storage_state
+        cookies = zhihu_api.normalize_cookies(data)
+        if not cookies:
+            return None
+        return {"cookies": [{"name": c["name"], "value": c["value"], "domain": c["domain"], "path": c["path"],
+                             "expires": c["expires"] if c["expires"] > 0 else -1, "httpOnly": False,
+                             "secure": c["secure"], "sameSite": "Lax"} for c in cookies], "origins": []}
+
     def _save_state(self, state: dict[str, Any]) -> None:
         self.account_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.account_file.with_suffix(".tmp")
@@ -421,22 +503,29 @@ class ZhihuAdapter(PlatformAdapter):
         tmp.replace(self.account_file)
 
     async def login(self) -> Result:
-        from ..browser import load_storage_state
         from . import zhihu_api
 
         # 从任务开始算：前面的接口检查也占 worker 的总超时
         self._login_deadline = asyncio.get_running_loop().time() + self._login_wait()
-        state = load_storage_state(self.account_file)
+        state = self._browser_state()
         pending = self._pending_verify() if state is not None else ""  # 没有登录态时验证无意义
+        refresh = False  # 登录有效但缺 _xsrf：带着现有登录态打开首页补齐，不用重新扫码
         if state is not None:
             try:
                 async with self._api() as api:
                     me = await api.me()
-                if not pending:
+                    has_xsrf = bool(api.xsrf)
+                if not pending and has_xsrf:
                     return self.result(Status.OK, message=f"已登录：{me.get('name')}，无需重新登录；"
                                                           f"要换号先删除 {self.account_file}")
-                # 读接口正常不代表发布接口的风控已解除：仍打开上次记下的验证页（已放行时会自动跳走）
-                self.ctx.log("上次发布被知乎风控拦截，打开验证页确认", level="warning")
+                if pending:
+                    # 读接口正常不代表发布接口的风控已解除：仍打开上次记下的验证页（已放行时会自动跳走）
+                    self.ctx.log("上次发布被知乎风控拦截，打开验证页确认", level="warning")
+                else:
+                    # 只有 z_c0 的登录文件写接口会被拒，而 /me 照样正常：不处理的话这里永远说「已登录」，发布永远失败
+                    refresh = True
+                    self.ctx.log("登录文件里没有 _xsrf cookie（发布时会被拒），用现有登录态打开知乎首页补齐",
+                                 level="warning")
             except zhihu_api.RiskControl as exc:
                 pending = exc.url or pending  # 用最新的验证页地址，旧地址里的 session 可能已过期
                 self._remember_verify(pending)
@@ -447,10 +536,15 @@ class ZhihuAdapter(PlatformAdapter):
             except PublishError as exc:
                 self.ctx.log(f"登录检查失败（{exc}），{'打开验证页' if pending else '重新登录'}", level="debug")
 
-        # 只有需要过安全验证时才带上旧登录态；正常登录用干净的浏览器上下文
-        new_state = await self._browser_login(state if pending else None, pending)
+        # 只有需要过安全验证 / 补 cookie 时才带上旧登录态；正常登录用干净的浏览器上下文
+        if refresh:
+            new_state = await self._browser_login(state, zhihu_api.WWW_HOME, refresh=True)
+        else:
+            new_state = await self._browser_login(state if pending else None, pending)
         self._save_state(new_state)
         self._verify_file().unlink(missing_ok=True)
+        no_xsrf = not any(isinstance(c, dict) and c.get("name") == "_xsrf" and c.get("value")
+                          for c in new_state.get("cookies") or [])
 
         who = ""
         try:
@@ -463,9 +557,16 @@ class ZhihuAdapter(PlatformAdapter):
             raise LoginRequired(f"浏览器里拿到了 z_c0，但接口仍提示未登录（{exc}）") from exc
         except PublishError as exc:
             self.ctx.log(f"登录后校验失败（{exc}），登录文件已保存", level="warning")
-        return self.result(Status.OK, message=f"登录成功{('：' + who) if who else ''}；登录文件: {self.account_file}")
+        message = f"登录成功{('：' + who) if who else ''}；登录文件: {self.account_file}"
+        if no_xsrf:
+            message += (f"；注意：没拿到 _xsrf cookie（知乎首页没打开），发布时会被拒：再运行一次 "
+                        f"mpub login zhihu --account {self.ctx.account} 补齐，不用重新扫码")
+        return self.result(Status.OK, message=message)
 
-    async def _browser_login(self, state: dict[str, Any] | None, verify_url: str) -> dict[str, Any]:
+    async def _browser_login(self, state: dict[str, Any] | None, verify_url: str, *,
+                             refresh: bool = False) -> dict[str, Any]:
+        """打开登录页等人扫码；verify_url 非空时带着旧登录态打开验证页等人过验证；
+        refresh=True 时 verify_url 是首页，只是用现有登录态补齐 cookie（落到登录页就照常扫码）。"""
         from ..browser import open_context, snapshot
         from . import zhihu_api
 
@@ -473,7 +574,8 @@ class ZhihuAdapter(PlatformAdapter):
         deadline = self._login_deadline or loop.time() + self._login_wait()
         qr = _QrCapture(self.ctx, self.settings.qrcode_dir / f"zhihu-{self.ctx.account}.png")
         hint = f"mpub login zhihu --account {self.ctx.account}"
-        if verify_url:
+        verifying = bool(verify_url) and not refresh
+        if verifying:
             self.ctx.log(f"请在打开的浏览器窗口里完成知乎安全验证：{verify_url}")
             if self.ctx.headless:
                 self.ctx.log("安全验证需要人操作，无头模式下看不到页面：页面不自动放行的话请去掉 --headless 重新运行",
@@ -482,7 +584,7 @@ class ZhihuAdapter(PlatformAdapter):
 
         async with open_context(self.settings, headless=self.ctx.headless, storage_state=state) as context:
             page = await context.new_page()
-            if not verify_url:
+            if not verifying:
                 page.on("response", qr.on_response)
             try:
                 await page.goto(verify_url or zhihu_api.SIGNIN_URL, wait_until="domcontentloaded", timeout=60_000)
@@ -492,7 +594,7 @@ class ZhihuAdapter(PlatformAdapter):
             opened = loop.time()
             try:
                 while not await self._browser_logged_in(context, page, initial):
-                    if verify_url and self.ctx.headless and loop.time() - opened > VERIFY_HEADLESS_WAIT:
+                    if verifying and self.ctx.headless and loop.time() - opened > VERIFY_HEADLESS_WAIT:
                         await snapshot(page, self.ctx, "login-verify")
                         raise NeedsAction(f"知乎要求安全验证，无头模式下没法操作：去掉 --headless 重新运行 {hint}，"
                                           f"在弹出的窗口里完成验证（验证页: {verify_url}）",
@@ -500,21 +602,39 @@ class ZhihuAdapter(PlatformAdapter):
                     if loop.time() > deadline:
                         await snapshot(page, self.ctx, "login-timeout")
                         raise PublishError(f"等待登录超时：重新运行 {hint}", code=ErrorCode.TIMEOUT)
-                    if not verify_url and not qr.done and loop.time() - opened > QR_FALLBACK_AFTER:
+                    if not verifying and not qr.done and loop.time() - opened > QR_FALLBACK_AFTER:
                         await qr.fallback(page)
                     await asyncio.sleep(LOGIN_POLL_SECONDS)
             finally:
                 qr.cleanup()
             self.ctx.log("已登录，保存登录态")
-            # 先存一份：后面刷新首页慢或整个任务超时，也不至于白扫一次码
-            self._save_state(await context.storage_state())
-            await self._remember_user_agent(page)
-            try:  # 再打开一次首页，补齐 _xsrf / d_c0 等 cookie
+            # 先存一份：后面刷新首页慢、窗口被关或整个任务超时，也不至于白扫一次码
+            first = await context.storage_state()
+            self._save_state(first)
+            try:  # 再打开一次首页，补齐 _xsrf / d_c0 等 cookie（没有 _xsrf 写接口会被拒）
+                if page.is_closed():  # 扫完码马上关了窗口：cookie 还在上下文里，开个新页面接着补
+                    page = await context.new_page()
+                await self._remember_user_agent(page)
                 await page.goto(zhihu_api.WWW_HOME, wait_until="domcontentloaded", timeout=30_000)
-                await asyncio.sleep(2)
-            except Exception as exc:  # noqa: BLE001
-                self.ctx.log(f"打开知乎首页失败（{exc}），直接保存", level="debug")
-            return await context.storage_state()
+            except Exception as exc:  # noqa: BLE001 - 也可能是页面自己正在跳转（打断了这次打开）
+                self.ctx.log(f"打开知乎首页失败（{exc}）", level="debug")
+            await self._wait_xsrf(context)
+            try:
+                return await context.storage_state()
+            except Exception as exc:  # noqa: BLE001 - 浏览器已经被关掉：用扫码后存的那份
+                self.ctx.log(f"读取登录态失败（{exc}），使用扫码后保存的登录态", level="debug")
+                return first
+
+    async def _wait_xsrf(self, context: Any) -> None:
+        """等首页把 _xsrf 等 cookie 下发完：先等 2 秒，没有 _xsrf 再最多等 XSRF_WAIT 秒。浏览器没了就算了。"""
+        try:
+            await asyncio.sleep(2)
+            for _ in range(int(XSRF_WAIT / 0.5)):
+                if any(c.get("name") == "_xsrf" for c in await context.cookies("https://www.zhihu.com")):
+                    return
+                await asyncio.sleep(0.5)
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.log(f"等待 _xsrf cookie 失败（{exc}）", level="debug")
 
     async def _remember_user_agent(self, page: Any) -> None:
         from . import zhihu_api
@@ -530,18 +650,19 @@ class ZhihuAdapter(PlatformAdapter):
             path.write_text(ua, encoding="utf-8")
 
     async def _browser_logged_in(self, context: Any, page: Any, initial_z_c0: str | None) -> bool:
-        if page.is_closed():
-            raise PublishError("浏览器窗口已关闭，登录没有完成")
+        closed = page.is_closed()
         try:
             cookies = await context.cookies("https://www.zhihu.com")
-            url = page.url
+            url = "" if closed else page.url
         except Exception as exc:  # noqa: BLE001 - 用户关掉了浏览器
             raise PublishError(f"浏览器已关闭，登录没有完成（{type(exc).__name__}）") from exc
         z_c0 = next((c.get("value") for c in cookies if c.get("name") == "z_c0" and c.get("value")), None)
+        if z_c0 and (initial_z_c0 is None or z_c0 != initial_z_c0):
+            return True  # 新拿到的登录凭证：扫完码马上关掉窗口也算登录成功（cookie 还在上下文里）
+        if closed:
+            raise PublishError("浏览器窗口已关闭，登录没有完成")
         if not z_c0:
             return False
-        if initial_z_c0 is None or z_c0 != initial_z_c0:
-            return True  # 新拿到的登录凭证
         # 带着旧登录态过验证：离开验证页 / 登录页才算完成
         return not any(p in url for p in ("/signin", "/account/unhuman", "/account/risk_control"))
 
@@ -552,6 +673,7 @@ class ZhihuAdapter(PlatformAdapter):
         try:
             async with self._api() as api:
                 me = await api.me()
+                has_xsrf = bool(api.xsrf)
         except zhihu_api.RiskControl as exc:
             self._remember_verify(exc.url)
             raise
@@ -561,6 +683,9 @@ class ZhihuAdapter(PlatformAdapter):
         days = zhihu_api.cookie_days_left(self._cookies)
         if days is not None:
             message += f"，登录凭证约 {max(0, int(days))} 天后过期"
+        if not has_xsrf:
+            message += (f"；注意：登录文件里没有 _xsrf cookie，发布会被拒：运行 mpub login zhihu --account "
+                        f"{self.ctx.account} 补齐（不用重新扫码）")
         return self.result(Status.OK, message=message)
 
     # ================================================================ 发布
@@ -588,7 +713,7 @@ class ZhihuAdapter(PlatformAdapter):
         return result
 
     async def _image(self, api: Any, ref: str | Path, *, source: str, referer: str,
-                     dirs: list[Path]) -> Any:
+                     dirs: list[Path], search: bool = False) -> Any:
         """读取 / 下载一张图片，必要时转成 JPEG，传到知乎图床。"""
         from . import zhihu_api, zhihu_html
 
@@ -596,9 +721,9 @@ class ZhihuAdapter(PlatformAdapter):
             name = urllib.parse.urlsplit(ref).path.rsplit("/", 1)[-1][:80] or "remote-image"
             raw = await zhihu_api.download_image(ref)
         else:
-            path = ref if isinstance(ref, Path) else resolve_local_image(ref, dirs)
+            path = ref if isinstance(ref, Path) else resolve_local_image(ref, dirs, search=search)
             if path is None:
-                raise ValidationFailed(f"找不到正文里引用的图片: {ref}")
+                raise ValidationFailed(f"找不到正文里引用的图片: {display_ref(ref)}")
             name = path.name
             try:
                 raw = path.read_bytes()
@@ -677,15 +802,19 @@ class ZhihuAdapter(PlatformAdapter):
             self.ctx.log(f"以「{me.get('name')}」的身份发布知乎文章")
 
             # 1. 图片先传图床（失败不会留下草稿）
-            refs = [r for r in zhihu_html.collect_image_urls(post.body) if not zhihu_html.is_zhimg(r)]
-            referenced = {p for p in (resolve_local_image(r, dirs) for r in refs if not zhihu_html.is_remote(r)) if p}
+            found = [(r, k) for r, k in zhihu_html.collect_image_refs(post.body) if not zhihu_html.is_zhimg(r)]
+            refs = [r for r, _ in found]
+            embeds = {r for r, k in found if k == "embed"}  # Obsidian ![[图.png]]：按文件名找
+            referenced = {p for p in (resolve_local_image(r, dirs, search=r in embeds)
+                                      for r in refs if not zhihu_html.is_remote(r)) if p}
             extra = [p for p in post.images if p.resolve() not in referenced]
             total = len(refs) + len(extra)
             images: dict[str, Any] = {}
             tail: list[Any] = []
             for i, ref in enumerate([*refs, *extra], start=1):
-                self.ctx.log(f"上传图片 {i}/{total}: {ref.name if isinstance(ref, Path) else ref}")
-                img = await self._image(api, ref, source="article", referer=write_url, dirs=dirs)
+                self.ctx.log(f"上传图片 {i}/{total}: {display_ref(ref)}")
+                img = await self._image(api, ref, source="article", referer=write_url, dirs=dirs,
+                                        search=ref in embeds)
                 if isinstance(ref, Path):
                     tail.append(img)
                 else:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -249,3 +249,161 @@ def test_check_reports_busy_account_as_json(home: Path, capsys):
         assert main(["check", "fake", "--json"]) == 1
     out = json.loads(capsys.readouterr().out)
     assert out["results"][0]["error_code"] == "internal" and "正被另一个" in out["results"][0]["message"]
+
+
+def test_manifest_keeps_text_fields_verbatim(media: Path):
+    """YAML 1.1 会把 12:30 读成 750、1.10 读成 1.1、no 读成 False、007 读成 7：标题/正文/账号要按原文。"""
+    write_post(media, """
+kind: note
+title: 12:30
+body: 1.10
+tags: [1.10, yes, 科技]
+account: 007
+images: [images/1.jpg]
+schedule: 2030-01-02 03:04:00+00:00
+platforms:
+  douyin: {title: no, collection: 2024}
+  xiaohongshu: {}
+""")
+    m = load_manifest(media)
+    dy, xhs = m.for_platform("douyin"), m.for_platform("xiaohongshu")
+    assert (xhs.title, xhs.body, xhs.account) == ("12:30", "1.10", "007")
+    assert xhs.tags == ["1.10", "yes", "科技"]
+    assert dy.title == "no" and dy.options == {"collection": "2024"}
+    # 带时区的时间换算成本机时间
+    assert dy.schedule == datetime(2030, 1, 2, 3, 4, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    assert parse_tags([None, "#a", None]) == ["a"]
+    for text, want in (('"false"', False), ("否", False), ("'yes'", True), ("true", True)):
+        write_post(media, f"kind: note\nimages: [images/1.jpg]\nai_generated: {text}\nplatforms: [xhs]\n")
+        assert load_manifest(media).for_platform("xhs").ai_generated is want, text
+
+
+@pytest.mark.parametrize("snippet", [
+    "tags: #早餐 #打卡",
+    "body: 今天去徒步了 #徒步",
+    "tags:\n  - #早餐\n  - 打卡",
+    "title: #话题 标题",
+])
+def test_manifest_rejects_hashtags_swallowed_as_comments(media: Path, snippet: str):
+    write_post(media, f"kind: note\nimages: [images/1.jpg]\nplatforms: [xhs]\n{snippet}\n")
+    with pytest.raises(ManifestError, match="当成注释"):
+        load_manifest(media)
+
+
+def test_manifest_hashtag_check_ignores_quotes_comments_and_blocks(media: Path):
+    write_post(media, """kind: note
+title: "早安 #打卡"   # 注释
+body: |
+  第一段 #徒步
+  tags: #不是字段
+# tags: #整行注释
+tags: '#早餐 #打卡'
+images: [images/1.jpg]
+platforms: [xhs]
+""")
+    post = load_manifest(media).for_platform("xhs")
+    assert post.title == "早安 #打卡" and post.tags == ["早餐", "打卡"] and "#徒步" in post.body
+
+
+def test_manifest_windows_path_hints(media: Path):
+    write_post(media, 'kind: video\ntitle: t\nvideo: "D:\\视频\\a.mp4"\nplatforms: [fake]\n')
+    with pytest.raises(ManifestError, match="单引号"):
+        load_manifest(media)
+    write_post(media, 'kind: video\ntitle: t\nvideo: "D:\\new\\test.mp4"\nplatforms: [fake]\n')
+    issues = common_issues(load_manifest(media).for_platform("fake"))
+    assert any("单引号" in i.message for i in issues)
+
+
+def test_config_rejects_bad_values_with_config_error(home: Path, capsys):
+    from multipub.config import ConfigError
+
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text("[timeouts]\npublish_video = '1h'\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="publish_video"):
+        load_settings()
+    assert main(["history", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "config"
+    (home / "config.toml").write_text("gap_seconds = 2.5\n[browser]\nheadless = 'false'\n", encoding="utf-8")
+    s = load_settings()
+    assert s.gap_seconds == 2 and s.browser.headless is False
+
+
+def test_history_pending_records_and_dedupe(home: Path):
+    from filelock import FileLock
+
+    settings = load_settings()
+    post = PlatformPost(platform="fake", account="a", kind=Kind.VIDEO, title="t")
+    fp = history.post_fingerprint(post)
+    pending = Result(platform="fake", account="a", action="publish", status=Status.FAILED,
+                     error_code="unknown_outcome", submit_started=True)
+    history.mark_pending(settings, pending, run_id="r1", fingerprint=fp)
+    # 还在发布（或进程被强杀）：只有「结果待定」，查重拦住；history.jsonl 本身不变
+    assert history.find_previous(settings, fp)["pending"] is True
+    assert not settings.history_file.exists()
+    # 最终结果覆盖它
+    final = Result(platform="fake", account="a", action="publish", status=Status.FAILED,
+                   error_code="platform_error", submit_started=True, message="内容违规")
+    history.append(settings, final, run_id="r1", fingerprint=fp)
+    assert history.find_previous(settings, fp) is None  # 平台明确拒绝 = 没发出，可以重发
+    assert [r.get("pending") for r in history.read(settings)] == [None]
+    # 进程被强杀留下的：账号还在用时不动，空闲时转成正式记录
+    history.mark_pending(settings, pending, run_id="r2", fingerprint=fp)
+    settings.locks_dir.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(settings.locks_dir / "fake-a.lock")):
+        history.settle_pending(settings)
+        assert history.read(settings)[-1]["pending"] is True
+    history.settle_pending(settings)
+    rows = history.read(settings)
+    assert len(rows) == 2 and "pending" not in rows[-1] and rows[-1]["error_code"] == "unknown_outcome"
+    assert not list((home / "pending").glob("*.json"))
+    prev = history.find_previous(settings, fp)
+    assert prev["run_id"] == "r2" and "--to fake --force" in history.describe_previous(prev)
+
+
+def test_dry_run_previews_dedupe_and_reports_issues(home: Path, media: Path, capsys):
+    write_post(media, "kind: video\ntitle: t\nvideo: video.mp4\ncover: cover.jpg\nplatforms: [fake]\n")
+    assert main(["publish", str(media), "--yes", "--json", "--gap", "0"]) == 0
+    capsys.readouterr()
+    assert main(["publish", str(media), "--dry-run", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["results"][0]["status"] == "skipped" and "issues" in out
+    assert main(["publish", str(media), "--dry-run", "--force", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["results"][0]["status"] == "dry_run"
+
+
+def test_validate_warns_when_account_not_logged_in(home: Path, media: Path, capsys):
+    settings = load_settings()
+    f = settings.account_file("douyin", "default")
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("{}", encoding="utf-8")
+    write_post(media, "kind: note\ntitle: t\nimages: [images/1.jpg]\naccount: main\nplatforms: [douyin]\n")
+    assert main(["validate", str(media), "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    msgs = [i["message"] for i in out["issues"] if i["field"] == "account"]
+    assert msgs and "已登录: default" in msgs[0] and "--account default" in msgs[0]
+
+
+def test_run_dirs_are_unique_within_a_second(home: Path):
+    from multipub.cli import _new_run_dir
+
+    settings = load_settings()
+    ids = {_new_run_dir(settings)[0] for _ in range(3)}
+    assert len(ids) == 3
+
+
+def test_platforms_as_plain_string(media: Path):
+    write_post(media, "kind: note\nimages: [images/1.jpg]\nplatforms: b站，抖音 xhs\n")
+    assert load_manifest(media).targets() == ["bilibili", "douyin", "xiaohongshu"]
+
+
+def test_manifest_and_body_file_in_windows_encodings(media: Path):
+    """PowerShell 5.1 的 > / Out-File 写出 UTF-16，记事本「ANSI」是 GBK：都要能读，不能抛异常。"""
+    text = "kind: note\ntitle: 周末徒步\nbody_file: 正文.md\nimages: [images/1.jpg]\nplatforms: [xhs]\n"
+    (media / "正文.md").write_bytes("西山环线 🔥".encode("utf-16"))
+    (media / "post.yaml").write_bytes(text.encode("utf-16"))
+    post = load_manifest(media).for_platform("xhs")
+    assert post.title == "周末徒步" and post.body == "西山环线 🔥"
+    (media / "post.yaml").write_bytes(text.encode("gbk"))
+    (media / "正文.md").write_bytes("西山环线".encode("gbk"))
+    post = load_manifest(media).for_platform("xhs")
+    assert post.title == "周末徒步" and post.body == "西山环线"

@@ -34,6 +34,7 @@ from .platforms import DISPLAY_NAMES, available, load_adapter
 from .runner import WorkerInterrupted, run_worker
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_NEEDS_ACTION = 0, 1, 2, 3
+EXIT_INTERRUPTED = 130
 
 
 # ------------------------------------------------------------------ output
@@ -96,6 +97,21 @@ def exit_code_for(results: list[Result]) -> int:
 
 def _run_id() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _new_run_dir(settings: Settings, suffix: str = "") -> tuple[str, Path]:
+    """新建本次运行的证据目录。同一秒里启动的两次运行不能共用目录（日志会互相覆盖）。"""
+    settings.runs_dir.mkdir(parents=True, exist_ok=True)
+    base = _run_id()
+    for n in range(1, 1000):
+        run_id = base if n == 1 else f"{base}-{n}"
+        path = settings.runs_dir / f"{run_id}{suffix}"
+        try:
+            path.mkdir()
+        except FileExistsError:
+            continue
+        return run_id, path
+    raise RuntimeError(f"无法在 {settings.runs_dir} 下创建运行目录")
 
 
 def _accounts(settings: Settings, platform: str) -> list[str]:
@@ -171,7 +187,11 @@ def cmd_setup(args: argparse.Namespace, settings: Settings, out: Printer) -> int
                               stdout=sys.stderr if out.as_json else None)
         steps.append({"name": "browser", "ok": proc.returncode == 0,
                       "detail": "Chromium 已安装" if proc.returncode == 0 else f"Chromium 安装失败（退出码 {proc.returncode}）"})
+    biliup_step = _setup_biliup_choice(args, settings, out)
     for name in PLATFORMS:
+        if name == "bilibili" and biliup_step is not None:
+            steps.append(biliup_step)  # 还没选 biliup 来源：先不下载，等用户选
+            continue
         for item in load_adapter(name).setup(settings):
             steps.append({"name": f"{name}.{item['name']}", "ok": item["ok"], "detail": item.get("detail", "")})
     ok = all(s["ok"] for s in steps)
@@ -181,6 +201,100 @@ def cmd_setup(args: argparse.Namespace, settings: Settings, out: Printer) -> int
         for s in steps:
             print(f"  {'✔' if s['ok'] else '✘'} {s['name']}: {s['detail']}")
     return EXIT_OK if ok else EXIT_FAILED
+
+
+def _setup_biliup_choice(args: argparse.Namespace, settings: Settings, out: Printer) -> dict[str, Any] | None:
+    """mpub setup 里 biliup 的来源由用户决定。返回 None 表示已经有来源（或刚选好），照常执行 B站 setup；
+    返回一个步骤表示还需要用户选择（非交互环境不擅自下载）。"""
+    from .platforms import bili_locate
+
+    if args.biliup:
+        choice = args.biliup.strip()
+        if choice in ("auto", "download"):
+            ok, msg, _ = bili_locate.use(settings, mode=choice)
+        else:
+            ok, msg, _ = bili_locate.use(settings, choice)
+        out.info(f"biliup：{msg}")
+        return None if ok else {"name": "bilibili.biliup", "ok": False, "detail": msg}
+    if not bili_locate.needs_choice(settings):
+        return None
+    cands = bili_locate.discover(settings)
+    if not (sys.stdin.isatty() and not out.as_json):
+        return {"name": "bilibili.biliup", "ok": False, "needs_choice": True,
+                "candidates": [c.to_dict(i) for i, c in enumerate(cands, 1)],
+                "detail": "还没选 biliup 来源（B站视频上传需要），没有下载。请选择："
+                          "mpub setup --biliup <路径> / --biliup auto（用本机找到的兼容版本） / "
+                          f"--biliup download（下载固定版本 {settings.biliup_version}）"}
+    print("\nB站视频上传需要 biliup。", file=sys.stderr)
+    if cands:
+        print("本机找到这些 biliup：", file=sys.stderr)
+        for i, c in enumerate(cands, 1):
+            state = "兼容" if c.compatible else f"不兼容：{c.reason}"
+            print(f"  [{i}] {c.path}（{c.version or '版本未知'}，{c.source}，{state}）", file=sys.stderr)
+    usable = any(c.compatible for c in cands)
+    print("怎么找到 biliup？\n  1) 我直接输入 biliup.exe 的路径"
+          + ("\n  2) 用上面找到的（输入编号；直接回车 = 自动挑最合适的兼容版本）" if usable else "")
+          + f"\n  3) 下载经过验证的固定版本 {settings.biliup_version}（约 40 MB）", file=sys.stderr)
+    default = "2" if usable else "3"
+    while True:
+        try:
+            ans = input(f"请选择 [{default}]: ").strip() or default
+        except EOFError:
+            ans = default
+        if ans == "1":
+            path = input("biliup 路径: ").strip()
+            ok, msg, _ = bili_locate.use(settings, path)
+        elif ans == "2" and usable:
+            pick = input("编号（回车 = 自动）: ").strip()
+            ok, msg, _ = bili_locate.use(settings, pick) if pick else bili_locate.use(settings, mode="auto")
+        elif ans == "3":
+            ok, msg, _ = bili_locate.use(settings, mode="download")
+        else:
+            continue
+        print(f"  {msg}", file=sys.stderr)
+        if ok:
+            return None
+
+
+def cmd_biliup(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
+    """mpub biliup find / use / status：选择 B站视频上传用哪个 biliup。"""
+    from .platforms import bili_locate
+
+    if args.biliup_cmd == "find":
+        cands = bili_locate.discover(settings)
+        res = bili_locate.resolve(settings)
+        if out.as_json:
+            out.emit_json({"ok": True, "in_use": res.to_dict(),
+                           "candidates": [c.to_dict(i) for i, c in enumerate(cands, 1)]})
+            return EXIT_OK
+        print(f"当前使用：{res.detail}" + (f"（{res.problem}）" if res.problem else ""))
+        if not cands:
+            print("本机没找到 biliup（查找了 PATH、social-auto-upload 工具目录、下载文件夹、当前目录、multipub 下载目录）")
+        for i, c in enumerate(cands, 1):
+            state = "兼容" if c.compatible else f"不兼容：{c.reason}"
+            print(f"  [{i}] {c.path}\n      {c.version or '版本未知'} · {c.source} · {state}")
+            for ck in c.cookies:
+                print(f"      旁边有登录文件 {ck}（可复制成 <数据目录>\\accounts\\bilibili\\<账号>.json 复用）")
+        print("选择：mpub biliup use <编号或路径> / mpub biliup use --auto / mpub biliup use --download")
+        return EXIT_OK
+    if args.biliup_cmd == "use":
+        if args.auto or args.download:
+            ok, msg, res = bili_locate.use(settings, mode="auto" if args.auto else "download")
+        else:
+            ok, msg, res = bili_locate.use(settings, args.target, force=args.force)
+        if out.as_json:
+            out.emit_json({"ok": ok, "message": msg, "in_use": res.to_dict() if res else None})
+        else:
+            print(msg)
+        return EXIT_OK if ok else EXIT_USAGE
+    res = bili_locate.resolve(settings)  # status
+    choice = bili_locate.read_choice(settings)
+    if out.as_json:
+        out.emit_json({**res.to_dict(), "choice": choice})
+    else:
+        print(f"{'✔' if res.ok else '✘'} {res.detail}" + (f"\n  {res.problem}" if res.problem else ""))
+        print(f"  来源：{bili_locate.MODE_ZH.get(res.mode, res.mode)}")
+    return EXIT_OK if res.ok else EXIT_FAILED
 
 
 def cmd_login(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
@@ -197,7 +311,7 @@ def cmd_login(args: argparse.Namespace, settings: Settings, out: Printer) -> int
     try:
         with history.account_lock(settings, platform, args.account):
             result = run_worker(settings, action="login", platform=platform, account=args.account,
-                                headless=headless, run_dir=settings.runs_dir / f"{_run_id()}-login",
+                                headless=headless, run_dir=_new_run_dir(settings, "-login")[1],
                                 on_event=out.event)
     except history.AccountBusy as exc:
         result = _busy(platform, args.account, "login", str(exc))
@@ -211,7 +325,7 @@ def cmd_login(args: argparse.Namespace, settings: Settings, out: Printer) -> int
 def cmd_check(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
     settings.ensure_dirs()
     platforms = parse_platform_list(args.platforms) or list(PLATFORMS)
-    run_dir = settings.runs_dir / f"{_run_id()}-check"
+    run_dir = _new_run_dir(settings, "-check")[1]
     results: list[Result] = []
     for platform in platforms:
         accounts = [args.account] if args.account else _accounts(settings, platform)
@@ -223,8 +337,10 @@ def cmd_check(args: argparse.Namespace, settings: Settings, out: Printer) -> int
         for account in accounts:
             try:
                 with history.account_lock(settings, platform, account):
+                    # 每个账号单独的目录：同一平台几个账号的日志、截图不会互相覆盖
                     results.append(run_worker(settings, action="check", platform=platform, account=account,
-                                              headless=True, run_dir=run_dir, on_event=out.event))
+                                              headless=True, run_dir=run_dir / f"{platform}-{account}",
+                                              on_event=out.event))
             except history.AccountBusy as exc:
                 results.append(_busy(platform, account, "check", str(exc)))
     if out.as_json:
@@ -278,7 +394,22 @@ def cmd_new(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
     return EXIT_OK
 
 
-def _collect(args: argparse.Namespace) -> tuple[Any, list[PlatformPost], list[Result], list[Issue]]:
+def _login_issue(settings: Settings, post: PlatformPost) -> Issue | None:
+    """本地看一眼登录文件在不在（不联网）：最常见的是用 --account main 登录了，清单却没写 account。"""
+    if post.platform not in PLATFORMS or settings.account_file(post.platform, post.account).is_file():
+        return None
+    others = _accounts(settings, post.platform)
+    login = f"mpub login {post.platform} --account {post.account}"
+    if others:
+        msg = (f"账号 {post.account} 还没有登录（这个平台已登录: {', '.join(others)}）：要用已登录的账号就在 post.yaml "
+               f"写 account: {others[0]} 或加 --account {others[0]}，否则运行 {login}")
+    else:
+        msg = f"账号 {post.account} 还没有登录：运行 {login}"
+    return Issue("warning", "account", msg, post.platform)
+
+
+def _collect(args: argparse.Namespace, settings: Settings | None = None
+             ) -> tuple[Any, list[PlatformPost], list[Result], list[Issue]]:
     manifest = load_manifest(args.post)
     targets = manifest.targets(parse_platform_list(args.to))
     if not targets:
@@ -295,12 +426,15 @@ def _collect(args: argparse.Namespace) -> tuple[Any, list[PlatformPost], list[Re
             continue
         issues.extend(common_issues(post))
         issues.extend(cls.validate(post))
+        login = _login_issue(settings, post) if settings is not None else None
+        if login is not None:
+            issues.append(login)
         posts.append(post)
     return manifest, posts, skipped, issues
 
 
 def cmd_validate(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
-    manifest, posts, skipped, issues = _collect(args)
+    manifest, posts, skipped, issues = _collect(args, settings)
     errors = [i for i in issues if i.level == "error"]
     if out.as_json:
         out.emit_json({
@@ -321,8 +455,16 @@ def cmd_validate(args: argparse.Namespace, settings: Settings, out: Printer) -> 
     return EXIT_USAGE if errors else EXIT_OK
 
 
+def _dedupe(settings: Settings, post: PlatformPost, force: bool) -> Result | None:
+    if force:
+        return None
+    prev = history.find_previous(settings, history.post_fingerprint(post))
+    return _skip(post, history.describe_previous(prev), ErrorCode.VALIDATION) if prev else None
+
+
 def cmd_publish(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
-    manifest, posts, skipped, issues = _collect(args)
+    manifest, posts, skipped, issues = _collect(args, settings)
+    history.settle_pending(settings)
     errors = [i for i in issues if i.level == "error"]
     for i in issues:
         out.info(f"  {'✘' if i.level == 'error' else '!'} {i}")
@@ -332,24 +474,22 @@ def cmd_publish(args: argparse.Namespace, settings: Settings, out: Printer) -> i
         return EXIT_USAGE
 
     results: list[Result] = list(skipped)
-    run_id = _run_id()
 
     if args.dry_run:
+        # 只读本地发布记录，提前告诉用户哪些平台真正发布时会被查重跳过
         for post in posts:
-            results.append(Result(platform=post.platform, account=post.account, action="publish",
-                                  status=Status.DRY_RUN, kind=post.kind.value,
-                                  message="本地校验通过（未联网、未发布）", finished_at=now_iso()))
-        return _finish(out, results, run_id, posts)
+            dup = _dedupe(settings, post, args.force)
+            results.append(dup or Result(platform=post.platform, account=post.account, action="publish",
+                                         status=Status.DRY_RUN, kind=post.kind.value,
+                                         message="本地校验通过（未联网、未发布）", finished_at=now_iso()))
+        return _finish(out, results, _run_id(), issues)
 
     # 查重：同一内容已经发过（或结果未知）的平台默认跳过
     pending: list[PlatformPost] = []
     for post in posts:
-        prev = None if args.force else history.find_previous(settings, history.post_fingerprint(post))
-        if prev:
-            when = prev.get("finished_at", "")
-            results.append(_skip(post, f"同一内容已于 {when} 发过（状态 {prev.get('status')}"
-                                       f"{'，结果未知' if prev.get('error_code') == ErrorCode.UNKNOWN_OUTCOME.value else ''}）；"
-                                       "确认要再发请加 --force", ErrorCode.VALIDATION))
+        dup = _dedupe(settings, post, args.force)
+        if dup:
+            results.append(dup)
         else:
             pending.append(post)
 
@@ -362,46 +502,97 @@ def cmd_publish(args: argparse.Namespace, settings: Settings, out: Printer) -> i
                 out.info(msg)
             return EXIT_USAGE
         names = "、".join(f"{DISPLAY_NAMES[p.platform]}/{p.account}" for p in pending)
-        answer = input(f"即将发布「{pending[0].title or manifest.path.parent.name}」到 {names}，确认? [y/N] ")
+        try:
+            answer = input(f"即将发布「{pending[0].title or manifest.path.parent.name}」到 {names}，确认? [y/N] ")
+        except EOFError:
+            answer = ""
         if answer.strip().lower() not in ("y", "yes"):
             out.info("已取消")
             return EXIT_USAGE
 
     settings.ensure_dirs()
-    run_dir = settings.runs_dir / run_id
+    run_id, run_dir = _new_run_dir(settings)
     gap = settings.gap_seconds if args.gap is None else args.gap
-    for index, post in enumerate(pending):
-        if index > 0 and gap > 0:
-            out.info(f"等待 {gap} 秒后发布下一个平台……")
-            time.sleep(gap)
-        out.info(f"→ 发布到 {DISPLAY_NAMES[post.platform]}/{post.account} ……")
-        try:
-            with history.account_lock(settings, post.platform, post.account):
-                result = run_worker(settings, action="publish", platform=post.platform, account=post.account,
-                                    headless=not args.headed and settings.browser.headless,
-                                    run_dir=run_dir / post.platform, post=post,
-                                    timeout=args.timeout, on_event=out.event)
-        except WorkerInterrupted as exc:
-            # 被中断也要记账：已触发发布的记为结果未知，查重会拦住下一次
-            history.append(settings, exc.result, run_id=run_id, fingerprint=history.post_fingerprint(post),
-                           source=str(manifest.path), title=post.title)
-            out.info(format_result(exc.result))
-            raise
-        except history.AccountBusy as exc:
-            result = _busy(post.platform, post.account, "publish", str(exc), post.kind.value)
-        history.append(settings, result, run_id=run_id, fingerprint=history.post_fingerprint(post),
-                       source=str(manifest.path), title=post.title)
-        if not out.as_json:
-            print(format_result(result))
-        results.append(result)
-    return _finish(out, results, run_id, posts, printed=not out.as_json)
+    started_any = False
+    try:
+        for post in pending:
+            fingerprint = history.post_fingerprint(post)
+            record = {"run_id": run_id, "fingerprint": fingerprint, "source": str(manifest.path), "title": post.title}
+            if started_any and gap > 0:
+                out.info(f"等待 {gap} 秒后发布下一个平台……")
+                time.sleep(gap)
+            try:
+                with history.account_lock(settings, post.platform, post.account):
+                    # 拿到账号锁之后再查一次：另一个 mpub 可能刚刚把同一内容发完（两个终端、计划任务同时跑）
+                    dup = _dedupe(settings, post, args.force)
+                    if dup:
+                        results.append(dup)
+                        continue
+                    started_any = True
+                    out.info(f"→ 发布到 {DISPLAY_NAMES[post.platform]}/{post.account} ……")
+                    result = run_worker(settings, action="publish", platform=post.platform, account=post.account,
+                                        headless=not args.headed and settings.browser.headless,
+                                        run_dir=run_dir / post.platform, post=post, timeout=args.timeout,
+                                        on_event=_publish_events(out, settings, post, record))
+            except WorkerInterrupted as exc:
+                # 被中断也要记账：已触发发布的记为结果未知，查重会拦住下一次
+                history.append(settings, exc.result, **record)
+                results.append(exc.result)
+                if not out.as_json:
+                    print(format_result(exc.result))
+                raise
+            except history.AccountBusy as exc:
+                result = _busy(post.platform, post.account, "publish", str(exc), post.kind.value)
+            history.append(settings, result, **record)
+            if not out.as_json:
+                print(format_result(result))
+            results.append(result)
+    except KeyboardInterrupt:
+        done = {(r.platform, r.account) for r in results}
+        for post in pending:
+            if (post.platform, post.account) not in done:
+                results.append(Result(platform=post.platform, account=post.account, action="publish",
+                                      status=Status.FAILED, kind=post.kind.value, error_code=ErrorCode.INTERNAL.value,
+                                      message="已中断，这个平台还没开始发布", retryable=True, finished_at=now_iso()))
+        if out.as_json:
+            out.emit_json({"ok": False, "error": "interrupted", "run_id": run_id,
+                           "results": [r.to_dict() for r in results], "issues": [i.__dict__ for i in issues]})
+        else:
+            for r in results:
+                if r.status is Status.SKIPPED or r.message == "已中断，这个平台还没开始发布":
+                    print(format_result(r))
+        out.info("已中断")
+        return EXIT_INTERRUPTED
+    return _finish(out, results, run_id, issues, printed=not out.as_json)
 
 
-def _finish(out: Printer, results: list[Result], run_id: str, posts: list[PlatformPost],
+def _publish_events(out: Printer, settings: Settings, post: PlatformPost, record: dict[str, Any]):
+    """转发 worker 事件；一看到 submit_started 就先记一笔「结果待定」（见 history.mark_pending）。"""
+    marked = False
+
+    def handle(event: dict[str, Any]) -> None:
+        nonlocal marked
+        if event.get("event") == "submit_started" and not marked:
+            marked = True
+            pending = Result(platform=post.platform, account=post.account, action="publish", status=Status.FAILED,
+                             kind=post.kind.value, error_code=ErrorCode.UNKNOWN_OUTCOME.value, submit_started=True,
+                             message="已点发布，结果待定（发布进程中途被结束时以此为准：请先到平台后台确认，不要直接重发）",
+                             started_at=now_iso(), finished_at=now_iso())
+            try:
+                history.mark_pending(settings, pending, **record)
+            except Exception as exc:  # noqa: BLE001 - 记账失败不能打断发布
+                out.info(f"写发布记录失败: {exc}")
+        out.event(event)
+
+    return handle
+
+
+def _finish(out: Printer, results: list[Result], run_id: str, issues: list[Issue],
             printed: bool = False) -> int:
     code = exit_code_for(results)
     if out.as_json:
-        out.emit_json({"ok": code == EXIT_OK, "run_id": run_id, "results": [r.to_dict() for r in results]})
+        out.emit_json({"ok": code == EXIT_OK, "run_id": run_id, "results": [r.to_dict() for r in results],
+                       "issues": [i.__dict__ for i in issues]})
     else:
         if not printed:
             for r in results:
@@ -414,6 +605,7 @@ def _finish(out: Printer, results: list[Result], run_id: str, posts: list[Platfo
 
 
 def cmd_history(args: argparse.Namespace, settings: Settings, out: Printer) -> int:
+    history.settle_pending(settings)
     rows = history.read(settings, args.limit)
     if out.as_json:
         out.emit_json({"history": rows})
@@ -458,8 +650,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", parents=[common], help="环境自检")
 
-    s = sub.add_parser("setup", parents=[common], help="安装浏览器内核、下载 biliup")
+    s = sub.add_parser("setup", parents=[common], help="安装浏览器内核、准备 biliup")
     s.add_argument("--skip-browser", action="store_true")
+    s.add_argument("--biliup", metavar="auto|download|<路径>",
+                   help="biliup 来源：auto 用本机找到的兼容版本；download 下载固定版本；或直接给路径")
+
+    s = sub.add_parser("biliup", parents=[common], help="选择 B站视频上传用的 biliup")
+    bsub = s.add_subparsers(dest="biliup_cmd", required=True)
+    bsub.add_parser("find", parents=[common], help="列出本机找到的 biliup 及是否兼容")
+    bsub.add_parser("status", parents=[common], help="当前使用哪个 biliup、为什么")
+    u = bsub.add_parser("use", parents=[common], help="选择：<路径>、find 列表里的 <编号>、--auto 或 --download")
+    u.add_argument("target", nargs="?", help="biliup.exe 的路径（或所在目录），或 find 列表里的编号")
+    g = u.add_mutually_exclusive_group()
+    g.add_argument("--auto", action="store_true", help="每次自动挑本机最合适的兼容版本")
+    g.add_argument("--download", action="store_true", help="用 mpub setup 下载的固定版本")
+    u.add_argument("--force", action="store_true", help="兼容性检查不通过也要用")
 
     s = sub.add_parser("login", parents=[common], help="扫码登录某个平台账号")
     s.add_argument("platform")
@@ -505,7 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "doctor": cmd_doctor, "setup": cmd_setup, "login": cmd_login, "check": cmd_check,
     "accounts": cmd_accounts, "new": cmd_new, "validate": cmd_validate, "publish": cmd_publish,
-    "history": cmd_history, "verify-code": cmd_verify_code,
+    "history": cmd_history, "verify-code": cmd_verify_code, "biliup": cmd_biliup,
 }
 
 
@@ -552,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
     except KeyboardInterrupt:
         out.info("已中断")
-        return 130
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":

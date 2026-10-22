@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>小红书创作服务平台</title>
+<style>
+  body { margin: 0; font: 14px/1.5 sans-serif; color: #333; background: #fff; }
+  .hidden { display: none !important; }
+  .sidebar { position: fixed; left: 0; top: 0; bottom: 0; width: 180px; background: #fafafa; padding: 12px; }
+  .sidebar .publish-video { background: #ff2442; color: #fff; padding: 8px; border-radius: 16px; text-align: center; cursor: pointer; }
+  .main { margin-left: 210px; padding: 16px; }
+  .skeleton { width: 600px; height: 300px; background: #eee; }
+  .header-tabs .tab { display: inline-block; padding: 6px 12px; cursor: pointer; }
+  .header-tabs .tab.active { color: #ff2442; border-bottom: 2px solid #ff2442; }
+  .upload-content { position: relative; width: 640px; min-height: 180px; border: 1px dashed #ccc; margin: 12px 0; }
+  .upload-content input.upload-input { position: absolute; left: 0; top: 0; width: 100%; height: 180px; opacity: 0; cursor: pointer; }
+  .upload-content .drag-tip { padding: 70px 0; text-align: center; color: #999; }
+  .preview-new { position: relative; padding: 12px; background: #f7f7f7; }
+  .preview-new .stage { font-weight: bold; }
+  .img-list { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px; }
+  .img-item { width: 90px; height: 90px; background: #ddd; position: relative; font-size: 11px; overflow: hidden; }
+  .img-item .mask { position: absolute; inset: 0; background: rgba(0,0,0,.5); color: #fff; display: flex; align-items: center; justify-content: center; }
+  .editor-wrap { width: 640px; }
+  .titleInput input { width: 560px; padding: 6px; font-size: 16px; }
+  .tiptap { min-height: 120px; border: 1px solid #ddd; padding: 8px; margin-top: 8px; outline: none; white-space: pre-wrap; }
+  .tiptap p { margin: 0; min-height: 1.5em; }
+  .tiptap p.is-empty::before { content: attr(data-placeholder); color: #bbb; float: left; height: 0; pointer-events: none; }
+  .tiptap-topic { color: #13386c; }
+  #creator-editor-topic-container { position: absolute; z-index: 20; background: #fff; border: 1px solid #ddd; width: 300px; box-shadow: 0 2px 8px rgba(0,0,0,.15); }
+  #creator-editor-topic-container .item { padding: 6px 10px; cursor: pointer; }
+  #creator-editor-topic-container .item:hover { background: #f5f5f5; }
+  .cover-plugin { margin: 12px 0; }
+  .upload-cover { width: 120px; height: 160px; background: #eee; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+  .d-modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 50; }
+  .d-modal { position: fixed; left: 50%; top: 80px; width: 520px; margin-left: -260px; background: #fff; z-index: 51; padding: 16px; }
+  .d-modal .tabs span { margin-right: 16px; cursor: pointer; }
+  .d-modal .tabs span.active { color: #ff2442; }
+  .d-modal-footer { text-align: right; margin-top: 16px; }
+  .d-modal-footer button { margin-left: 8px; }
+  .declaration { margin: 12px 0; position: relative; }
+  .d-select { border: 1px solid #ddd; padding: 6px 10px; width: 260px; cursor: pointer; }
+  .d-select .d-select-placeholder { color: #999; }
+  .d-dropdown { position: absolute; z-index: 30; background: #fff; border: 1px solid #ddd; width: 280px; }
+  .d-dropdown .d-option { padding: 6px 10px; cursor: pointer; }
+  .custom-switch-card { margin: 12px 0; padding: 10px; border: 1px solid #eee; width: 620px; }
+  .d-switch { display: inline-block; width: 36px; height: 20px; border-radius: 10px; background: #ccc; position: relative; cursor: pointer; vertical-align: middle; }
+  .d-switch.d-switch-checked { background: #ff2442; }
+  .d-switch input { display: none; }
+  .d-datepicker-input-filter input.d-text { width: 200px; padding: 4px; }
+  .submit { margin: 24px 0 80px; }
+  .submit button { padding: 8px 28px; margin-right: 12px; font-size: 15px; }
+  .publishBtn { background: #ff2442; color: #fff; border: none; border-radius: 20px; }
+  .publishBtn[disabled] { opacity: .5; cursor: not-allowed; }
+  .toast { position: fixed; top: 24px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,.8); color: #fff; padding: 8px 16px; border-radius: 4px; z-index: 99; }
+  .red-captcha { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 98; display: flex; align-items: center; justify-content: center; }
+  .red-captcha .box { background: #fff; padding: 24px; width: 320px; }
+</style>
+</head>
+<body>
+<div class="sidebar">
+  <div class="publish-video"><span class="btn-text">发布笔记</span></div>
+  <button class="sidebar-btn hidden" type="button">发布笔记</button>
+  <div class="menu">首页</div><div class="menu">笔记管理</div><div class="menu">数据看板</div>
+</div>
+<div class="main"><div id="publish-container" class="publish-container"><div class="skeleton"></div></div></div>
+<script>
+const SIM = /*SIM_CONFIG*/{};
+const params = new URLSearchParams(location.search);
+const TARGET = params.get('target') === 'image' ? 'image' : 'video';
+const container = document.getElementById('publish-container');
+const state = { uploadDone: false, uploadFailures: 0, files: [], images: [], cover: null, declaration: null,
+                repostSource: null, schedule: false, postTime: null, submitting: false };
+
+function report(evt) {
+  try { fetch('/__sim/event', { method: 'POST', body: JSON.stringify(evt), keepalive: true }); } catch (e) {}
+}
+function toast(text) {
+  report({ evt: 'toast', text });
+  const t = document.createElement('div');
+  t.className = 'toast'; t.textContent = text;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 2500);
+}
+function el(html) { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstChild; }
+function cookie(name) {
+  const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+  return m ? decodeURIComponent(m[1]) : '';
+}
+function pad(n) { return String(n).padStart(2, '0'); }
+function fmt(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`; }
+
+if (SIM.sidebar_button) {  // 侧栏「发布笔记」是个 <button>：button:has-text("发布") 会命中两个
+  document.querySelector('.sidebar .publish-video').classList.add('hidden');
+  document.querySelector('.sidebar-btn').classList.remove('hidden');
+  document.querySelector('.sidebar-btn').addEventListener('click', () => report({ evt: 'sidebar_publish_clicked' }));
+}
+
+// ---------------------------------------------------------------- 登录态（前端拉用户信息后跳登录页）
+const session = cookie('web_session');
+if (!session || session === 'expired' || SIM.force_logout) {  // force_logout：服务端判定会话已失效
+  setTimeout(() => location.replace('/login?redirectReason=401'), SIM.login_redirect_ms);
+}
+
+// ---------------------------------------------------------------- 渲染
+setTimeout(render, SIM.render_delay_ms);
+
+function render() {
+  const accept = TARGET === 'image' ? SIM.image_accept : '.mp4,.mov,.flv,.f4v,.mkv,.rm,.rmvb,.m4v,.mpg,.mpeg,.ts';
+  container.innerHTML = `
+    <div class="header-tabs"><span class="tab ${TARGET === 'video' ? 'active' : ''}">上传视频</span><span class="tab ${TARGET === 'image' ? 'active' : ''}">上传图文</span><span class="tab">写长文</span></div>
+    <div class="upload-content">
+      <input class="upload-input" type="file" ${TARGET === 'image' ? 'multiple' : ''} accept="${accept}">
+      <div class="drag-tip">拖拽${TARGET === 'image' ? '图片' : '视频'}到此或点击上传</div>
+    </div>
+    <div class="editor-wrap hidden"></div>`;
+  const input = container.querySelector('input.upload-input');
+  input.addEventListener('change', () => onFiles(input));
+}
+
+function onFiles(input) {
+  const files = [...input.files];
+  if (!files.length) return;
+  report({ evt: 'files', target: TARGET, names: files.map(f => f.name), sizes: files.map(f => f.size) });
+  const tip = container.querySelector('.drag-tip'); if (tip) tip.remove();
+  if (TARGET === 'video') startVideoUpload(input, files[0]); else startImageUpload(input, files);
+  showEditor();
+}
+
+// ---------------------------------------------------------------- 视频上传（进度在 input 的兄弟 div.preview-new 里）
+function startVideoUpload(input, file) {
+  state.files = [file.name];
+  state.uploadDone = false;
+  let preview = input.parentElement.querySelector('.preview-new');
+  if (!preview) {
+    preview = el('<div class="preview-new"></div>');
+    input.insertAdjacentElement('afterend', preview);
+  }
+  const total = SIM.upload_seconds * 1000, began = Date.now();
+  const failThis = state.uploadFailures < SIM.upload_fail;
+  const timer = setInterval(() => {
+    const pct = Math.min(99, Math.floor((Date.now() - began) / Math.max(total, 1) * 100));
+    if (failThis && pct >= 40) {
+      clearInterval(timer);
+      state.uploadFailures += 1;
+      preview.innerHTML = `<div class="stage">上传失败</div><div class="tips">网络异常，请重新上传</div><span class="reupload">重新上传</span>`;
+      report({ evt: 'upload_failed' });
+      return;
+    }
+    if (Date.now() - began >= total) {
+      clearInterval(timer);
+      state.uploadDone = true;
+      preview.innerHTML = `<div class="stage">上传成功</div><div class="info">${file.name} · 分辨率 1920x1080 · 时长 00:12</div><span class="reupload">重新上传</span>`;
+      report({ evt: 'upload_done' });
+      updatePublishButton();
+      return;
+    }
+    preview.innerHTML = `<div class="stage">上传中 ${pct}%</div><div class="info">${file.name}</div><span class="cancel">取消上传</span>`;
+  }, 200);
+}
+
+// ---------------------------------------------------------------- 图片上传（编辑区立即出现，缩略图上有进度遮罩）
+function startImageUpload(input, files) {
+  state.images = files.map(f => ({ name: f.name, done: false }));
+  state.uploadDone = false;
+  const list = el('<div class="img-list"></div>');
+  input.parentElement.appendChild(list);
+  state.images.forEach((img, i) => {
+    const item = el(`<div class="img-item"><span class="name">${img.name}</span><div class="mask">上传中</div></div>`);
+    list.appendChild(item);
+    setTimeout(() => {
+      if ((SIM.image_fail || []).includes(i)) {
+        // 这张图传失败了：缩略图上显示「上传失败」；drop 模式下页面照样允许发布（少一张图），否则发布时提示
+        img.failed = true; item.querySelector('.mask').textContent = '上传失败';
+        report({ evt: 'image_failed', index: i });
+      } else {
+        img.done = true; item.querySelector('.mask').remove();
+      }
+      const finished = state.images.every(x => x.done || (x.failed && SIM.image_fail_mode === 'drop'));
+      if (finished) { state.uploadDone = true; report({ evt: 'upload_done' }); updatePublishButton(); }
+    }, SIM.image_upload_seconds * 1000 * (i + 1));
+  });
+}
+
+// ---------------------------------------------------------------- 编辑区
+function showEditor() {
+  const wrap = container.querySelector('.editor-wrap');
+  if (!wrap.classList.contains('hidden')) return;
+  wrap.classList.remove('hidden');
+  const draft = SIM.draft || '';
+  wrap.innerHTML = `
+    <div class="titleInput"><input class="d-text" type="text" maxlength="20" placeholder="填写标题会有更多赞哦～" value="${draft ? draft.slice(0, 10) : ''}"><span class="count">0/20</span></div>
+    <div class="editor-container" style="position:relative">
+      <div class="tiptap ProseMirror" contenteditable="true" translate="no"><p ${draft ? '' : 'data-placeholder="输入正文描述，真诚有价值的分享予人温暖" class="is-empty is-editor-empty"'}>${draft || '<br>'}</p></div>
+    </div>
+    <div class="topic-btns"><span class="topic-btn"># 话题</span><span>@ 用户</span></div>
+    ${TARGET === 'video' ? `<div class="cover-plugin"><div class="cover-plugin-title"><span>设置封面</span></div><div class="cover-plugin-preview"><div class="upload-cover">智能推荐封面</div></div></div>` : ''}
+    <div class="declaration-wrap"></div>
+    <div class="custom-switch-card"><div class="title">定时发布</div><div class="d-switch"><input type="checkbox"></div><div class="datepicker-slot"></div></div>
+    <div class="submit"><button class="d-button publishBtn" type="button"><span class="d-text">发布</span></button><button class="d-button cancelBtn" type="button"><span class="d-text">暂存离开</span></button></div>`;
+  setupEditor(wrap.querySelector('.tiptap'));
+  setupCover(wrap);
+  setupDeclaration(wrap.querySelector('.declaration-wrap'));
+  setupSchedule(wrap.querySelector('.custom-switch-card'));
+  wrap.querySelector('.publishBtn').addEventListener('click', onPublish);
+  wrap.querySelector('.cancelBtn').addEventListener('click', () => report({ evt: 'save_draft_clicked' }));
+  updatePublishButton();
+  if (SIM.captcha_on_load) {  // 风控：编辑区出来后就弹滑块验证，遮住整个页面（包括「发布」）
+    setTimeout(() => {
+      document.body.appendChild(el('<div class="red-captcha"><div class="box"><div>请完成验证</div><div class="slider">拖动下方滑块完成拼图</div></div></div>'));
+      report({ evt: 'captcha_shown' });
+    }, 300);
+  }
+}
+
+function updatePublishButton() {
+  const btn = document.querySelector('.publishBtn');
+  if (!btn) return;
+  btn.querySelector('.d-text').textContent = state.schedule ? '定时发布' : '发布';
+  if (SIM.while_uploading === 'disabled') btn.disabled = !state.uploadDone;
+}
+
+// ---------------------------------------------------------------- 正文 + 话题联想
+let topicCtx = null, topicTimer = null, topicBox = null, dismissed = null;
+function setupEditor(editor) {
+  topicBox = el('<div id="creator-editor-topic-container" class="hidden"></div>');
+  editor.parentElement.appendChild(topicBox);
+  editor.addEventListener('input', () => { updatePlaceholder(editor); onTopicInput(); });
+  editor.addEventListener('keyup', onTopicInput);
+  // tiptap suggestion：候选框开着时回车选中第一项、Escape 收起
+  editor.addEventListener('keydown', e => {
+    const open = !topicBox.classList.contains('hidden') && topicBox.querySelector('.item');
+    if (!open) return;
+    if (e.key === 'Enter') { e.preventDefault(); topicBox.querySelector('.item').click(); report({ evt: 'topic_enter' }); }
+    else if (e.key === 'Escape') { e.preventDefault(); const c = topicCtx; hideTopics(); dismissed = c && { node: c.node, start: c.start }; }
+  });
+}
+function updatePlaceholder(editor) {
+  const empty = !editor.textContent.trim() && !editor.querySelector('.tiptap-topic');
+  editor.querySelectorAll('p').forEach((p, i) => {
+    if (empty && i === 0) { p.setAttribute('data-placeholder', '输入正文描述，真诚有价值的分享予人温暖'); p.classList.add('is-empty'); }
+    else { p.removeAttribute('data-placeholder'); p.classList.remove('is-empty', 'is-editor-empty'); }
+  });
+}
+function hideTopics() { topicBox.classList.add('hidden'); topicCtx = null; clearTimeout(topicTimer); }
+function onTopicInput() {
+  const sel = getSelection();
+  if (!sel.rangeCount) return hideTopics();
+  const r = sel.getRangeAt(0), node = r.startContainer;
+  if (node.nodeType !== 3) return hideTopics();
+  const before = node.textContent.slice(0, r.startOffset);
+  const m = before.match(/#([^\s#]*)$/);
+  if (!m) { dismissed = null; return hideTopics(); }
+  const q = m[1];
+  if (dismissed && dismissed.node === node && dismissed.start === r.startOffset - m[0].length) return;  // Escape 收起后不再弹
+  if (topicCtx && topicCtx.q === q && topicCtx.node === node) return;
+  topicCtx = { node, start: r.startOffset - m[0].length, end: r.startOffset, q };
+  if (SIM.topics === 'none') return;
+  clearTimeout(topicTimer);
+  if (SIM.topics === 'instant') {
+    // 一输入 # 就出「热门话题」，联想结果稍后才刷新
+    if (topicBox.classList.contains('hidden')) showTopics(null);
+    if (q) topicTimer = setTimeout(() => showTopics(q), SIM.topic_delay_ms);
+  } else if (q) {
+    topicTimer = setTimeout(() => showTopics(q), SIM.topic_delay_ms);
+  }
+}
+function showTopics(q) {
+  if (!topicCtx) return;
+  const names = q ? [q, q + '日常', q + '分享', '我的' + q] : ['旅行日记', '今日穿搭', '美食探店'];
+  topicBox.innerHTML = names.map(n => `<div class="item"><span class="name">#${n}</span><span class="num">${Math.floor(Math.random() * 900 + 100)}万浏览</span></div>`).join('');
+  topicBox.classList.remove('hidden');
+  topicBox.querySelectorAll('.item').forEach((it, i) => {
+    it.addEventListener('mousedown', e => e.preventDefault());  // 保持编辑器焦点（tiptap suggestion 的常见做法）
+    it.addEventListener('click', () => pickTopic(names[i]));
+  });
+}
+function pickTopic(name) {
+  if (!topicCtx) return;
+  const { node, start, end } = topicCtx;
+  const text = node.textContent;
+  const after = document.createTextNode(' ' + text.slice(end));
+  node.textContent = text.slice(0, start);
+  const span = el(`<span class="tiptap-topic" contenteditable="false" data-topic='${JSON.stringify({ name })}'>#${name}[话题]#</span>`);
+  node.after(span); span.after(after);
+  const sel = getSelection(), r = document.createRange();
+  r.setStart(after, 1); r.collapse(true); sel.removeAllRanges(); sel.addRange(r);
+  report({ evt: 'topic_picked', name });
+  hideTopics();
+}
+
+// ---------------------------------------------------------------- 封面
+function setupCover(wrap) {
+  const btn = wrap.querySelector('.upload-cover');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const mask = el('<div class="d-modal-mask"></div>');
+    // ok：「截取封面 / 上传封面」两个页签（上游 3590c52）；direct：弹窗里直接是上传框（postsail 的写法）；
+    // broken：只有截取封面；stuck：点「确定」后提示图片不合要求、弹窗不关。弹窗都不响应 Escape
+    const tabs = SIM.cover === 'ok' || SIM.cover === 'stuck' ? '<span class="active">截取封面</span><span class="up-tab">上传封面</span>'
+      : SIM.cover === 'direct' ? '' : '<span class="active">截取封面</span>';
+    const modal = el(`<div class="d-modal cover-modal"><div class="tabs">${tabs}</div><div class="body"><div class="frames">（视频帧）</div></div>
+      <div class="d-modal-footer"><button class="cancel" type="button">取消</button><button class="ok" type="button">确定</button></div></div>`);
+    document.body.append(mask, modal);
+    report({ evt: 'cover_modal', open: true });
+    const close = () => { mask.remove(); modal.remove(); report({ evt: 'cover_modal', open: false }); };
+    const showUpload = () => {
+      modal.querySelector('.body').innerHTML = '<div class="upload-wrapper"><span>点击上传图片</span><input type="file" accept="image/png,image/jpeg,image/jpg" style="opacity:0;width:80px"></div>';
+      modal.querySelector('.upload-wrapper input').addEventListener('change', e => {
+        state.pendingCover = e.target.files[0] ? e.target.files[0].name : null;
+        report({ evt: 'cover_file', name: state.pendingCover });
+      });
+    };
+    const up = modal.querySelector('.up-tab');
+    if (up) up.addEventListener('click', showUpload);
+    if (SIM.cover === 'direct') showUpload();
+    modal.querySelector('.cancel').addEventListener('click', close);
+    modal.querySelector('.ok').addEventListener('click', () => {
+      if (SIM.cover === 'stuck') { toast('封面尺寸不符合要求，请重新上传'); return; }
+      if (state.pendingCover) { state.cover = state.pendingCover; btn.textContent = '已设置封面'; }
+      close();
+    });
+  });
+}
+
+// ---------------------------------------------------------------- 内容类型声明
+const DECL_OPTIONS = ['虚构演绎，仅供娱乐', '笔记含AI合成内容', '已自主标注', '自主拍摄', '来源转载'];
+function setupDeclaration(slot) {
+  if (SIM.declaration === 'none') return;
+  slot.innerHTML = `<div class="declaration"><div class="d-select"><span class="d-select-placeholder">添加内容类型声明</span></div></div>`;
+  const select = slot.querySelector('.d-select');
+  let dropdown = null;
+  const closeDropdown = () => { if (dropdown) { dropdown.remove(); dropdown = null; } };
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDropdown(); });
+  select.addEventListener('click', () => {
+    if (dropdown) { report({ evt: 'decl_dropdown', open: false }); return closeDropdown(); }
+    report({ evt: 'decl_dropdown', open: true });
+    dropdown = el(`<div class="d-dropdown">${DECL_OPTIONS.map(o => `<div class="d-option"><span class="d-text">${o}</span></div>`).join('')}</div>`);
+    if (SIM.decl_popover === 'body') {  // 下拉框渲染在 body 下的浮层里（#publish-container 之外）
+      const r = select.getBoundingClientRect();
+      dropdown.style.left = r.left + 'px'; dropdown.style.top = (r.bottom + scrollY) + 'px';
+      document.body.appendChild(dropdown);
+    } else {
+      slot.querySelector('.declaration').appendChild(dropdown);
+    }
+    dropdown.querySelectorAll('.d-option').forEach((opt, i) => opt.addEventListener('click', () => {
+      const name = DECL_OPTIONS[i];
+      report({ evt: 'decl_option', name });
+      closeDropdown();
+      if (name === '来源转载') return openRepostDialog(select);
+      state.declaration = name; state.repostSource = null;
+      select.innerHTML = `<span class="d-select-value">${name}</span><span class="clear">×</span>`;
+    }));
+  });
+}
+function openRepostDialog(select) {
+  report({ evt: 'repost_dialog' });
+  const mask = el('<div class="d-modal-mask"></div>');
+  const modal = el(`<div class="d-modal repost-modal"><div class="title">来源转载</div><input class="d-text" placeholder="请输入媒体名称">
+    <div class="d-modal-footer"><button type="button" class="cancel">取消</button><button type="button" class="ok">确认</button></div></div>`);
+  document.body.append(mask, modal);
+  modal.querySelector('.cancel').addEventListener('click', () => { mask.remove(); modal.remove(); });
+  modal.querySelector('.ok').addEventListener('click', () => {
+    const v = modal.querySelector('input').value.trim();
+    if (!v) { toast('请输入媒体名称'); return; }
+    state.declaration = '来源转载'; state.repostSource = v;
+    select.innerHTML = `<span class="d-select-value">来源转载 · ${v}</span><span class="clear">×</span>`;
+    mask.remove(); modal.remove();
+  });
+}
+
+// ---------------------------------------------------------------- 定时发布
+function setupSchedule(card) {
+  const sw = card.querySelector('.d-switch'), box = sw.querySelector('input');
+  sw.addEventListener('click', () => {
+    if (SIM.schedule_switch === 'swallow') { report({ evt: 'switch_swallowed' }); return; }
+    state.schedule = !state.schedule;
+    box.checked = state.schedule;
+    sw.classList.toggle('d-switch-checked', state.schedule);
+    const slot = card.querySelector('.datepicker-slot');
+    if (state.schedule) {
+      const d = new Date(Date.now() + 3600e3); d.setMinutes(0);
+      state.postTime = d.getTime();
+      slot.innerHTML = `<div class="d-datepicker-input-filter"><input class="d-text" placeholder="选择日期和时间" value="${fmt(d)}"></div>`;
+      const inp = slot.querySelector('input');
+      const commit = () => {
+        const m = inp.value.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/);
+        if (SIM.schedule_switch !== 'revert' && m) {
+          state.postTime = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).getTime();
+        }
+        inp.value = fmt(new Date(state.postTime));
+      };
+      inp.addEventListener('change', commit);
+      inp.addEventListener('blur', commit);
+    } else {
+      slot.innerHTML = ''; state.postTime = null;
+    }
+    updatePublishButton();
+  });
+}
+
+// ---------------------------------------------------------------- 发布
+async function onPublish() {
+  report({ evt: 'publish_clicked', uploadDone: state.uploadDone, text: document.querySelector('.publishBtn').textContent });
+  if (state.submitting) return;
+  if (!state.uploadDone) {
+    toast(TARGET === 'video' ? (state.uploadFailures ? '视频上传失败，请重新上传' : '视频上传中，请稍后再试') : '图片上传中，请稍后');
+    return;
+  }
+  const editor = document.querySelector('.tiptap');
+  const topics = [...editor.querySelectorAll('.tiptap-topic')].map(t => JSON.parse(t.dataset.topic).name);
+  const body = {
+    common: {
+      type: TARGET === 'video' ? 'video' : 'normal',
+      title: document.querySelector('.titleInput input').value,
+      desc: editor.innerText,
+      hash_tag: topics.map(name => ({ name, type: 'topic' })),
+      post_time: state.schedule ? state.postTime : null,
+      declaration: state.declaration,
+      repost_source: state.repostSource,
+    },
+    image_info: TARGET === 'image' ? { images: state.images.filter(i => i.done).map(i => i.name) } : null,
+    video_info: TARGET === 'video' ? { file: state.files[0], cover: state.cover } : null,
+  };
+  state.submitting = true;
+  if (SIM.api === 'captcha') {
+    document.body.appendChild(el('<div class="red-captcha"><div class="box"><div>请完成验证</div><div class="slider">拖动下方滑块完成拼图</div></div></div>'));
+  }
+  let res = null;
+  try {
+    const r = await fetch('https://edith.xiaohongshu.com/web_api/sns/v2/note', {
+      method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json;charset=UTF-8' }, body: JSON.stringify(body) });
+    res = await r.json();
+  } catch (e) {
+    state.submitting = false;
+    toast('网络错误，请稍后重试');
+    return;
+  }
+  if (!res.success) {
+    state.submitting = false;
+    if (res.code === -100) { location.replace('/login?redirectReason=401'); return; }
+    if (SIM.api !== 'captcha') toast(res.msg || '发布失败');
+    return;
+  }
+  toast(state.schedule ? '定时发布设置成功' : '发布成功');
+  if (SIM.success_redirect === 'none') return;
+  const url = SIM.success_redirect === 'bare' ? '/publish/success' : '/publish/success?source=&bind_status=not_bind&__debugger__=&proxy=';
+  setTimeout(() => location.href = url, SIM.success_delay_ms);
+}
+</script>
+</body>
+</html>

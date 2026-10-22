@@ -309,12 +309,13 @@ async def upload_image(client: httpx.AsyncClient, path: Path, csrf: str, *, acco
     mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
     files = {"file_up": (path.name, content, mime)}
     form = {"biz": "dyn", "category": "daily", "csrf": csrf}
+    what = f"上传图片「{path.name}」"
     data = await request_json(client, "POST", UPLOAD_BFS_URL, data=form, files=files,
-                              what=f"上传图片 {path.name}", risk_hint=HTTP_MODE_RISK_HINT, timeout=120)
-    raise_for_code(data, what=f"上传图片 {path.name}", account=account)
+                              what=what, risk_hint=HTTP_MODE_RISK_HINT, timeout=120)
+    raise_for_code(data, what=what, account=account)
     d = data.get("data") or {}
     if not d.get("image_url"):
-        raise PublishError(f"上传图片 {path.name} 没有返回地址", retryable=True)
+        raise PublishError(f"{what}没有返回地址", retryable=True)
     pic = {"img_src": d["image_url"], "img_width": d.get("image_width", 0),
            "img_height": d.get("image_height", 0), "img_size": len(content) / 1024}
     if "ai_gen_pic" in d:

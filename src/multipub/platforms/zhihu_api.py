@@ -516,7 +516,16 @@ class ZhihuApi:
         data = _json(resp)
         if allow_404 and resp.status_code == 404:
             return None
-        raise_for_response(resp, data, what=what, account=self.account, check_code=check_code)
+        try:
+            raise_for_response(resp, data, what=what, account=self.account, check_code=check_code)
+        except NeedsAction:
+            raise
+        except PublishError as exc:
+            if method != "GET" and resp.status_code == 403 and not self.xsrf:
+                # 登录文件里只有 z_c0（手动放的 / 登录时首页没打开）：mpub login 会用现有登录态补齐，不用重新扫码
+                raise LoginRequired(f"{what}被知乎拒绝（HTTP 403）：登录文件里没有 _xsrf cookie，"
+                                    f"{login_hint(self.account)} 补齐（不用重新扫码）") from exc
+            raise
         if data is None and resp.content:
             raise PublishError(f"{what}返回了非 JSON（HTTP {resp.status_code}）", retryable=True)
         return data

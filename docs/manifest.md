@@ -9,7 +9,7 @@ uv run mpub validate posts\ep12              # 本地校验（不联网、不检
 uv run mpub publish posts\ep12 --dry-run     # 同样的校验，按发布的格式输出
 ```
 
-文件用 UTF-8 保存（带不带 BOM 都行）。可直接参考 [`examples/`](../examples/) 里的三个例子。
+文件用 UTF-8 保存（带不带 BOM 都行）；PowerShell 5.1 重定向写出的 UTF-16、记事本「ANSI」（GBK）也能读，`body_file` 同样。可直接参考 [`examples/`](../examples/) 里的三个例子。
 
 ## 结构
 
@@ -47,8 +47,19 @@ platforms:                  # 要发的平台；每个平台下可以覆盖顶�
 | `account` | 字符串，默认 `default` | 账号名，见「账号」 |
 | `platforms` | 映射或列表 | 目标平台，见「platforms」 |
 
-`schedule` 不加引号且带秒（如 `2026-10-21 20:00:00`）时 YAML 会把它解析成时间对象，也能用；带时区时时区会被丢掉，
-按写的钟点当本地时间处理。
+`schedule` 不加引号且带秒（如 `2026-10-21 20:00:00`）时 YAML 会把它解析成时间对象，也能用；带时区
+（如 `2026-10-21 20:00:00+08:00`）时换算成本机时间。
+
+### YAML 的几个坑
+
+- **`#` 前有空格就是注释**：`tags: #科技 #教程`、`body: 今天去徒步了 #徒步` 里的 `#…` 会被 YAML 整个吞掉。
+  multipub 检查 `title` / `body` / `tags` 时发现这种写法会直接报错（不会悄悄发一条没有话题的内容）。
+  `tags` 不用写 `#`：`tags: [科技, 教程]`；正文或标题里要带 `#话题`，给整个值加引号（`body: "今天去徒步了 #徒步"`）
+  或用 `body: |` 多行写法（块里的 `#` 是普通字符）。
+- **不加引号的数字、时间、yes/no**：`title: 12:30`、`title: 1.10`、`title: no`、`account: 007` 在 YAML 里分别是
+  750、1.1、false、7。multipub 对 `title` `body` `tags` `account` 和各个路径字段（以及 `dynamic` `source` `collection`
+  等文字参数）一律按你写的原文处理，所以不加引号也没问题；其他字段（如 `tid`、`ai_generated`）按 YAML 类型读。
+- **双引号里的反斜杠是转义符**：见下文「路径」。
 
 ## platforms
 
@@ -61,7 +72,7 @@ platforms:
     title: 小红书标题
 ```
 
-- 也可以写成列表：`platforms: [bilibili, douyin]`。
+- 也可以写成列表 `platforms: [bilibili, douyin]`，或一行字符串 `platforms: b站, 抖音`。
 - 平台名不分大小写，支持别名：`bilibili` / `bili` / `b站` / `b`；`douyin` / `dy` / `抖音`；
   `xiaohongshu` / `xhs` / `小红书` / `rednote`；`zhihu` / `zh` / `知乎`。
 - 命令行 `--to bilibili,douyin` 会**替换**清单里的平台列表（包括 `enabled: false` 的、甚至清单里没写的平台——
@@ -199,16 +210,23 @@ Markdown 开头的 YAML front matter 和唯一的一级标题会被丢掉（标�
 
 - 通用：账号名合法；视频文件存在；图文至少 1 张图且文件都存在；长文正文非空；`cover` 存在；`schedule` 晚于现在。
 - 平台：上面各表里的长度、数量、格式、定时窗口、参数取值，以及未知参数提示。
+- 账号：登录文件不存在时给 warning（「账号 X 还没有登录」，并列出这个平台已登录的账号名）。
 - `error` 会阻止发布（退出码 2）；`warning` 只提示。真正发布时 worker 里还会再校验一次（定时窗口可能在等待中过期）。
+- `--dry-run` 另外会读本地发布记录，提前标出真发时会被查重跳过的平台（见「查重」）。
 
-登录是否有效要用 `mpub check <平台>` 单独检查。
+登录是否有效（cookie 有没有过期）要用 `mpub check <平台>` 单独检查。
 
 ## 查重
 
 每次真正发布都会记到 `<数据目录>\history.jsonl`。同一平台、同一账号、同样的内容（`kind`、`title`、正文、
 视频和图片文件的名字/大小/修改时间、平台私有参数）已经是 `published` / `submitted` / `scheduled`，
-或上次结果是 `unknown_outcome`（已点发布但结果未知）时，再发会被跳过（`status: skipped`，消息「同一内容已于 … 发过」）。
-确认确实要再发一次时加 `--force`。只改 `tags`、`cover`、`schedule` 不算新内容。
+或上次结果是 `unknown_outcome`（已点发布但结果未知）时，再发会被跳过
+（`status: skipped`，消息「同一内容已于 …」）。`--dry-run` 也会提前显示哪些平台会被跳过。
+确认确实要再发一次时加 `--force`，并用 `--to` 只写要重发的平台（`--force` 对本次所有目标平台生效）。
+只改 `tags`、`cover`、`schedule` 不算新内容。
+
+点了发布的那一刻会先记一笔「结果待定」，所以即使 mpub 在发布途中被强行结束（关窗口、任务管理器），
+下次也不会原样重发；两个 mpub 同时发同一条内容时，同一平台账号也只会发一次（另一个被跳过或报「正被另一个任务使用」）。
 
 ## 完整示例
 
