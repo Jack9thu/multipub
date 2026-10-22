@@ -109,7 +109,15 @@ platforms:
 
 - 只从压缩包里解出 `biliup` / `biliup.exe` 本身（按文件名匹配，忽略包内路径），先写临时文件再原子替换。
 - `mpub doctor`：报告安装路径、版本、压缩包 sha256；若二进制与安装时记录的 sha256 不一致则报错。
-  使用 `biliup_path` 时会运行一次 `biliup --version`（纯本地；注意不带参数的 biliup 会启动 Web 服务，我们从不这样调用）。
+- **能不能启动**：文件和 sha256 都对不等于能运行。`mpub setup`（刚下载完或已安装）和 `mpub doctor` 都会试运行一次
+  `biliup --version`（纯本地、不联网，最多 30 秒；`biliup_path` 指定的也一样）。注意不带参数的 biliup 会启动 Web 服务，我们从不这样调用。
+  起不来就报 ✘，下载好的文件保留，处理后 `mpub doctor` 确认即可，不用重新下载。
+- **Windows 需要 VC++ 运行库**：`biliup.exe`（v1.3.1）静态导入 `VCRUNTIME140.dll`，压缩包里没带；
+  干净的 Windows 可能没有（没装过「Microsoft Visual C++ 2015-2022 Redistributable」）。缺了进程根本起不来，
+  退出码 `3221225781`（`0xC0000135` STATUS_DLL_NOT_FOUND，有符号写法 `-1073741515`），此时提示
+  「缺少 Microsoft Visual C++ 运行库（VCRUNTIME140.dll），请安装 https://aka.ms/vs/17/release/vc_redist.x64.exe」。
+  `0xC000007B` / `0xC0000138` / `0xC0000139`（运行库损坏、装成 32 位或太旧）提示重新安装同一个包。
+  运行 biliup 时会临时打开 `SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX`（子进程继承），缺 DLL 时不弹系统对话框卡住无人值守任务，直接拿到退出码。
 
 ### 电脑上已经装了 biliup
 
@@ -175,7 +183,8 @@ mpub login bilibili --account main
   mpub login bilibili --account main --interactive
   ```
 
-  它调用适配器的 `run_interactive_login()`：检查 TTY，在账号目录里运行
+  它调用适配器的 `run_interactive_login()`：检查 TTY，试运行 `biliup --version`（起不来时打印原因和处理办法、退出码 1），
+  再在账号目录里运行
   `"<biliup 路径>" -u "<数据目录>\accounts\bilibili\main.json" login`（不在真实终端里时只打印这条命令、退出码 2）。
   选「扫码登录」；终端二维码显示不全时打开同目录的 `qrcode.png`。
 - **绝不从浏览器回写登录文件**：图文的浏览器模式只在内存里把 cookie 转成 `storage_state`
@@ -186,7 +195,8 @@ mpub login bilibili --account main
 
 - `mpub check` **不**跑 `biliup renew`（renew 会重写整个文件，check 应该是只读的）。
 - 上传视频时 biliup 自己会先校验 token，需要时刷新并重写文件，不用我们管。
-- 发图文前先调 nav；如果网页登录态失效但文件里有 token 且装了 biliup，会自动 `biliup -u <文件> renew` 一次再试。
+- 发图文前先调 nav；如果网页登录态失效但文件里有 token 且装了 biliup，会自动 `biliup -u <文件> renew` 一次再试
+  （biliup 起不来时日志里给出 VC++ 运行库提示）。
 
 ## check
 
@@ -205,6 +215,8 @@ mpub login bilibili --account main
 ### 视频
 
 1. 再次 validate；确认登录文件有 `token_info`、找到 biliup（否则 `internal`：先 `mpub setup`）。
+   试运行 `biliup --version`（同一进程里同一文件成功过就不再试）：起不来（如缺 VC++ 运行库）→ `internal`，
+   带上面的安装提示；30 秒没结束 → `timeout`（可重试）。两种都**没有**标记 submit_started、没有启动上传。
    再做一次与 biliup 相同的只读令牌校验（`oauth2/info`）：令牌失效 → 启动 biliup **之前**就返回 `login_required`；
    网络错误 / 风控 / 超时（预检每个网络阶段 10 秒、整体最多 20 秒）只记警告，交给 biliup 自己校验。
    biliup 的期限从 `publish()` 开始时算起，扣掉这些准备时间：剩余不到 60 秒就不启动 biliup，直接返回 `timeout`（尚未投稿）。
@@ -235,6 +247,8 @@ mpub login bilibili --account main
 | 视频已传完（看到 `Upload completed` / `All files uploaded successfully`）后失败或超时 | `failed` / `unknown_outcome` | 先去创作中心确认，不要重发 |
 | 上传阶段失败 / 超时（还没传完） | `failed` / `platform_error` 或 `timeout` | 尚未投稿；因为已标记 submit_started，`retryable` 为 false，不会自动重试，需人确认后再发 |
 | 发布前准备用掉了太多时间，剩余不足 60 秒 | `failed` / `timeout` | 没有启动 biliup、没有标记 submit_started |
+| 试运行 `biliup --version` 失败（缺 VC++ 运行库等） / 超时 | `failed` / `internal` / `timeout` | 没有启动上传、没有标记 submit_started；消息里有处理办法 |
+| 启动上传时 biliup 起不来（退出码 0xC0000135 等，没传完） | `failed` / `internal` | 带 VC++ 运行库提示，尚未投稿；已标记 submit_started，不自动重试 |
 | 输出里是登录错误（`credential validation failed`、`账号未登录` 等）且没传完 | `needs_action` / `login_required` | 重新登录 |
 
 > 取舍：按约定在启动 biliup 前就标记 submit_started，所以「上传阶段就失败」的结果也带 `submit_started: true`，
@@ -354,6 +368,7 @@ mpub login bilibili --account main
 |---|---|---|
 | biliup v1.3.1 命令行参数 | `-u`、`--rust-log`、`upload --title --desc --tid --tid-v2 --tag --cover --dtime --copyright --source --dynamic --no-reprint --is-only-self --up-*-reply --up-close-danmu --extra-fields --line --limit --submit`、`renew`、`login`（对照 v1.3.1 源码 `cli.rs` / `Studio`） | 高 |
 | biliup 发布包文件名与 sha256 | 见上表（实际下载核对） | 高 |
+| biliup 能否启动 | `biliup --version` 输出 `biliup-cli 1.3.1`、退出码 0（Linux 版真实运行）；Windows 版 `biliup.exe` 导入表里有 `VCRUNTIME140.dll`（检查二进制得到）；缺 DLL 时退出码 0xC0000135 是 Windows 加载器的标准行为，未在干净 Windows 上实测 | 高 / 中高 |
 | 投稿成功输出 | target `biliup::uploader::bilibili` 的 tracing 日志 `ResponseData { code: 0, data: Some(Object {"aid": Number(..), "bvid": String("BV..")}) … }`、`APP接口投稿成功` / `Web 接口投稿成功` / `BCUT接口投稿成功`（据源码 `info!("{:?}", ret)` 与 tracing-subscriber 默认格式推断，未实际运行；时间戳取不到时是 `<unknown time>`） | 中 |
 | 上传完成标记 | `Upload completed:`、`All files uploaded successfully, checkpoint removed`（target `biliup_cli::uploader`） | 中高 |
 | 登录错误标记 | `credential validation failed`、`credential refresh failed`、`open cookies file`、`账号未登录` | 中 |

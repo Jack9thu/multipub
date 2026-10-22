@@ -46,6 +46,17 @@ uv 默认装在 `%USERPROFILE%\.local\bin\uv.exe`。想省掉每次的 `uv run`�
 `.\.venv\Scripts\Activate.ps1`（提示「禁止运行脚本」时先运行一次
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`），之后直接用 `mpub ...`。
 
+## B站视频：需要 VC++ 运行库
+
+B站视频用 biliup 上传，Windows 版 `biliup.exe` 依赖 **Microsoft Visual C++ 2015-2022 运行库（x64）**。
+很多电脑已经装过；刚重装的系统可能没有。缺少时 `mpub doctor` / `mpub setup` 的 `bilibili.biliup` 一项会显示 ✘
+并提示「缺少 Microsoft Visual C++ 运行库（VCRUNTIME140.dll）」，发布前也会先检查，不会在没装好的情况下开始投稿。安装：
+
+```powershell
+winget install Microsoft.VCRedist.2015+.x64
+# 或下载安装 https://aka.ms/vs/17/release/vc_redist.x64.exe
+```
+
 ## 中文路径
 
 - 仓库、素材、数据目录都可以在中文路径下，路径里有空格也没问题；命令行里带空格的路径加引号：
@@ -180,5 +191,5 @@ biliup.exe 是没有代码签名的开源程序，有时会被 Windows 安全中
   这样需要显示浏览器窗口（`--headed`、B站动态等你确认规范）时也能正常弹出。
 - 电脑在那个时间要开机、不能睡眠（任务属性 → 条件 →「唤醒计算机运行此任务」可选）。
 - 退出码 `3` 表示需要人处理（登录失效、验证码……），`1` 表示失败；事后看 `ep12-result.json`，
-  或 `uv run mpub history`。抖音如果中途要短信验证码，计划任务里没人能输入，会在 5 分钟后返回 `sms_code_required`。
+  或 `uv run mpub history`。抖音如果中途要短信验证码，计划任务里没人能输入，最多等约 10 分钟（`sms_timeout`，且不超过任务剩余时间）后返回 `sms_code_required`。
 - 用完删除：`Unregister-ScheduledTask -TaskName "multipub-ep12" -Confirm:$false`。

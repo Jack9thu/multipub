@@ -46,8 +46,8 @@ platforms:
 |---|---|---|
 | `page_timeout` | 300 | 选好视频后等待进入发布表单页（秒） |
 | `upload_timeout` | 本次任务超时 − 600（最少 180） | 等待视频/图片上传完成（视频含等待发布表单出现）。任务超时 = `mpub publish --timeout`，没给时为 `timeouts.publish_<kind>`，所以大文件加大 `--timeout` 即可 |
-| `publish_timeout` | 240 | 点击「发布」后等待跳转到作品管理页 |
-| `sms_timeout` | 300 | 等待短信验证码（验证码只能在这段时间内提交） |
+| `publish_timeout` | 240 | 点击「发布」后等待跳转到作品管理页；`--headed` 下出现人机验证时，从验证出现起再等这么久 |
+| `sms_timeout` | 600 | 等待短信验证码（验证码只能在这段时间内提交）。Claude Code 要先注意到 `needs_input` 事件再去问用户，所以默认 10 分钟；实际等待不超过本次任务剩下的时间（再留 60 秒给提交后的发布），`needs_input` 消息里写的就是实际秒数 |
 
 环境变量 `DOUYIN_COOKIE_AUTH_HEADLESS=false` 可让 cookie 校验用有头浏览器（上游提示无头偶尔被误判为失效）。
 
@@ -114,19 +114,41 @@ mpub login douyin --account main --headless
   `https://www.douyin.com/video/<id>`（图文为 `/note/<id>`）。拿不到时 `url` 为空，消息提示去「作品管理」查看。
 - 每次成功后会把刷新后的 cookie 写回账号文件。
 
+### 定时发布
+
+选「定时发布」、在「日期和时间」框里输入时间并回车之后，**点「发布」之前会核实**：「定时发布」处于选中状态
+（看选项上的 `data-checked` / 内部 radio；判断不了时至少要出现「日期和时间」框），且框里的值就是要求的时间（精确到分钟，
+只比较数字，`2026-10-23 08:05`、`2026/10/23 8:05` 都算对）。已经是定时（如页面恢复了草稿）时不再点选项。
+核实不了就截图并返回 `failed` / `validation`（**作品没有发出**）：上游在点击被组件吞掉时会直接立即发布，结果却报成已定时。
+此时可以直接重试；仍失败就去掉 `schedule` 到时间再发，或在网页上手动定时。
+
 ### 短信验证码
 
 发布时如果弹出短信验证：
 
 1. 自动点「获取验证码」，并发出 `needs_input` 事件（`kind = sms_code`，`path = <数据目录>/sau/verify_code.txt`）。
-2. **发布还在等待时**，在 `sms_timeout`（默认 5 分钟）内运行 `mpub verify-code douyin <验证码>`（或直接写入该文件）。
-   验证码只能这样提交：每一轮验证开始都会删掉旧文件并重新发短信，所以先写验证码再重新发布是没用的。
+2. **发布还在等待时**，在 `sms_timeout`（默认 10 分钟，以 `needs_input` 消息里的秒数为准）内运行
+   `mpub verify-code douyin <验证码>`（或直接写入该文件）。也可以用 PowerShell 的 `echo 123456 > 文件`、记事本等写入：
+   文件按 BOM 识别 UTF-8 / UTF-16（Windows PowerShell 5.1 默认写 UTF-16），没有 BOM 时按 UTF-8、再按系统编码（GBK）解码，
+   只取其中的数字（全角数字也行）；读不出验证码时只记一条警告并继续等，改好文件即可。
+   加了 `--headed` 时，**也可以直接在浏览器窗口里输入验证码并点「验证」**：弹窗关闭后 multipub 不再要验证码，继续发布。
+   验证码只能在发布等待期间提交：每一轮验证开始都会删掉旧文件并重新发短信，所以先写验证码再重新发布是没用的
+   （旧文件删不掉时——例如 Windows 上被别的程序占用——会忽略它原来的内容，等内容变化后再读）。
 3. 超时（或提交 3 轮仍未通过）时：
    - 还没点过发布 → `needs_action` / `sms_code_required`，重新发布后按上面的步骤及时提交新验证码；
    - 已经点过发布（短信验证通常就在点击之后弹出）→ `failed` / `unknown_outcome`：作品可能已经创建，
      先去「作品管理」确认；发布记录会拦住不带 `--force` 的重发。
 
 `verify_code.txt` 按数据目录全局共享：不要同时用两个抖音账号发布。
+
+### 哪些验证可以在浏览器窗口里完成（`--headed`）
+
+| 验证 | 能否在窗口里完成 | 说明 |
+|---|---|---|
+| 登录后的短信二次验证 | ✔（只能在窗口里） | 所以抖音登录建议不加 `--headless` |
+| 发布时的短信验证 | ✔ | 在窗口里输入验证码并点「验证」，或用 `mpub verify-code douyin <验证码>`，两种都行；弹窗连续两次轮询（约 4 秒）都不在就当作已完成 |
+| 发布时的人机验证（滑块等） | ✔ | 验证显示期间 multipub 不点「发布」、不把「需要验证」的接口失败当成平台拒绝，从验证出现起最多再等 `publish_timeout`（默认 240 秒）；完成后页面若自己继续提交，multipub 只等结果；没观察到发布请求时按原有规则补点（距上次点击 ≥20 秒，最多 3 次）。没完成就超时 → `unknown_outcome` |
+| 无头模式（默认） | ✘ | 看不到窗口：短信验证只能用 `mpub verify-code`；人机验证出现后照旧很快报错（点发布前 `captcha`，点发布后 `unknown_outcome`），提示加 `--headed` 重发 |
 
 ### 错误映射
 
@@ -138,6 +160,7 @@ mpub login douyin --account main --headless
 | 点发布**之后**出现人机验证或短信验证（超时 / 验证失败） | `failed` / `unknown_outcome`（结果未知：先去后台确认；消息里附验证提示） |
 | 自主声明没能确认设置上（选项文字与页面不一致、点击没生效等），点发布前 | `failed` / `validation`（拒绝发布，作品没有发出） |
 | `sync_toutiao: false` 但同步开关开着且关不掉，点发布前 | `failed` / `validation`（拒绝发布） |
+| 填了 `schedule` 但没能核实「定时发布」已选中、时间已填对，点发布前 | `failed` / `validation`（拒绝发布，作品没有发出） |
 | 点发布后接口明确返回失败 | `failed` / `platform_error`（不可重试；作品应未创建，建议先去后台确认） |
 | 点发布前某一步超时 | `failed` / `timeout`（可重试） |
 | 点发布后超时或页面异常 | `failed` / `unknown_outcome`（**先去后台确认，不要直接重发**） |
@@ -178,6 +201,9 @@ mpub login douyin --account main --headless
 | 同步头条/西瓜开关 | `[class^="info"] > [class^="first-part"] div div.semi-switch`，周围文字含「头条/西瓜」，状态看 `semi-switch-checked` | 低 |
 | 发布表单出现 | 新版 `post/video` 页传完才渲染标题框 `input[placeholder*="填写作品标题"]`（上游 5e28092 实测约 40 秒） | 中高 |
 | 定时 | `[class^='radio']:has-text('定时发布')`、`.semi-input[placeholder="日期和时间"]` | 中 |
+| 定时核实 | 选项的 `data-checked` / `aria-checked` / 内部 radio / 类名含 checked（postsail 记录抖音是 `label.radio-*` + `data-checked`）；输入框 `input_value()` 的数字等于要求的时间（multipub 新增） | 低 |
+| 短信弹窗关闭判定 | 短信输入框（同上偏宽的选择器）连续两轮轮询不可见（multipub 新增，`--headed` 手动验证用） | 中低 |
+| 有头模式的人机验证 | 同「卡住原因判定」的文字 / 选择器；出现时不点「发布」（multipub 新增） | 低 |
 | 发布按钮 / 成功 | 角色 button「发布」（exact）→ URL `creator-micro/content/manage**` | 高 |
 | 短信验证 | `input[placeholder*="验证码"], input[type="tel"], …`、「获取验证码」、`div.uc-ui-verify_sms-verify_button` | 中（be77aae；输入框选择器偏宽） |
 | 图文入口 / 上传 | 文本「发布图文」、`div[class^='container'] input[accept*='image']`、URL `**/content/post/image?**` | 中 |

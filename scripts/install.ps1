@@ -174,6 +174,13 @@ function Invoke-Main {
         Write-Hint '有检查项没通过（见上面的 ✘；「未登录」不算）。处理后可重复运行本脚本。'
     }
 
+    $vcRuntime = Join-Path $env:SystemRoot 'System32\vcruntime140.dll'
+    if (-not (Test-Path $vcRuntime)) {
+        Write-Hint '没有找到 VC++ 运行库（vcruntime140.dll），B站视频上传（biliup.exe）需要它。安装：'
+        Write-Hint '  winget install Microsoft.VCRedist.2015+.x64'
+        Write-Hint '  或下载 https://aka.ms/vs/17/release/vc_redist.x64.exe'
+    }
+
     Write-Step '下一步：逐个平台扫码登录'
     Write-Host '    uv run mpub login bilibili --account main'
     Write-Host '    uv run mpub login douyin --account main'

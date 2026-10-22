@@ -23,11 +23,11 @@
 | `LICENSE` | `LICENSE` | `beeaf19c` | 原样 |
 | `LICENSE-omnipost` | omnipost 的 `LICENSE` | — | 原文 + 说明（移植函数的版权声明，MIT 要求保留） |
 | `conf.py` | （上游 gitignore，`conf.example.py`） | — | multipub 新写的 shim |
-| `runtime.py` | — | — | multipub 新增：钩子、截止时间、防重复点击（`PublishGuard`）、异常类型、收尾工具 |
+| `runtime.py` | — | — | multipub 新增：钩子、截止时间、防重复点击（`PublishGuard`）、有头模式等人机验证（`CaptchaWatch`）、定时核实工具、异常类型、收尾工具 |
 
 ## 改动清单
 
-编号与任务要求一致（a–i），另有若干为 Windows / worker 环境做的小修（w*）。
+编号与任务要求一致（a–i），之后的修复按 j、k… 续编；另有若干为 Windows / worker 环境做的小修（w*）。
 
 ### a. 抖音视频：不再默认「内容由AI生成」声明
 - 文件：`uploader/douyin_uploader/main.py`，`DouYinVideo._upload_video_steps`（原 `upload()` 1051-1053 行）
@@ -82,6 +82,12 @@
     （与开源 xhs 客户端 ReaJason/xhs 一致）。路径未在真实账号上验证；监听不到时只剩间隔与次数两道限制。
   - 发布接口明确返回失败（抖音 `status_code != 0`、小红书 `success: false`），`reject_grace`（15 秒）内没有弹出验证：
     `fail_rejected()` 截图并抛 `PublishRejected`（适配器映射为 `platform_error`，不重试），不再空等到超时。
+  - `PublishGuard.request_sent()`：被平台弹窗拦下（`blocked_by_platform()`）之后又观察到发布请求（页面自己、或用户在窗口里
+    重新提交了），撤销「允许再点一次」，避免补点造成重复发布。新增 `clear_rejection()`：弹出验证时之前的接口失败不算数，
+    但不额外允许再点。
+  - 有头模式（`--headed`）下的人机验证：两个发布循环每轮先问 `runtime.CaptchaWatch.blocking()`——页面停在人机验证
+    （`diagnose()` 的同一套特征）时本轮不点「发布」、清掉之前的接口失败（否则 15 秒后就被判成平台拒绝，用户来不及拖滑块），
+    第一次出现时把发布截止时间重置一次（用户最多有 `publish_timeout` 秒），之后照常超时（`CaptchaRequired`）。无头模式行为不变。
   - 抖音视频/图文的两个发布循环合并为基类 `DouYinBaseUploader._publish_until_success(page, what, success_url)`；
     视频特有行为（`force=True` 点击、每轮移除浮层、`handle_auto_video_cover`、宽松短信判定）通过
     `PUBLISH_CLICK_KWARGS` / `_prepare_publish_attempt` / `_platform_blocked_publish` / `STRICT_SMS_CHECK` 保持上游原样；
@@ -129,14 +135,23 @@
 ### h. 抖音短信验证码
 - 文件：`uploader/douyin_uploader/main.py`
 - 改动：
-  - `_read_verify_code()` 只读文件（`utf-8-sig`），删除 stdin 提示（worker 的 stdin 已关闭）。
+  - `_read_verify_code()` 只读文件，删除 stdin 提示（worker 的 stdin 不是终端）。按 BOM 解码（Windows PowerShell 5.1 的
+    `echo 123456 > 文件` / Out-File 写的是带 BOM 的 UTF-16LE；无 BOM 时试 UTF-16 特征、UTF-8、再按系统编码），
+    只保留数字（全角数字转半角）。读不出验证码（解码失败 / 没有数字）时 `_wait_verify_code()` 告警一次并继续等，
+    不再抛 `UnicodeDecodeError` 中断验证；读到后隔 0.3 秒再读一次，内容一致才用（避免读到写了一半的文件）。
+  - 旧的 `verify_code.txt` 删不掉（Windows 上被占用）时记下旧内容，内容变了才读；提交后删不掉只告警。
   - 短信处理从 `DouYinVideo` 的发布循环抽到基类 `_handle_sms_verification()`，图文发布循环也调用（上游图文流程遇到短信弹窗会空转）。
     图文流程用 `strict=True`：除了输入框，还要求出现验证组件特征（`SMS_DIALOG_MARKERS`），避免误判。
   - 检测到弹窗：先删除残留的 `verify_code.txt`，点「获取验证码」，`hooks.sms_code_required(path)` 通知一次，
     按 `poll_interval` 轮询文件，超过 `sms_timeout` 截图并抛 `SmsCodeTimeout`（适配器映射：点发布前为 `NeedsAction(SMS_CODE_REQUIRED)`；
     点过发布之后为 `unknown_outcome`——短信/人机验证出现在点击之后时作品是否已创建并不确定，发布记录要能拦住重发）。
     每轮开始都会删掉 `verify_code.txt` 再发新短信，所以验证码只能在发布等待期间提交，适配器的提示也这样写。
-    提交验证码后重置发布循环的截止时间，并告诉 `PublishGuard` 上次点击被拦下（允许再点一次「发布」，与上游一致）。
+    处理完后重置发布循环的截止时间。一检测到弹窗就告诉 `PublishGuard` 上次点击被拦下（允许再点一次「发布」，与上游一致；
+    之后若观察到页面自己重新提交就不再补点），等完验证码再清一次接口失败（「需要验证」的回执可能晚到）。
+  - 在窗口里手动验证：等验证码期间短信输入框连续 `SMS_CLOSED_POLLS`（2）轮不可见，就当作用户已在 `--headed` 窗口里
+    完成了验证（或页面已跳走）——`_wait_verify_code()` 返回 None，不填验证码，继续发布循环；拿到验证码时弹窗已关也不再填。
+    上游（以及之前的 multipub）只认验证码文件，用户在窗口里验证后仍会空等到 `sms_timeout`，再报 `unknown_outcome`。
+  - `Hooks.sms_timeout` 默认 600 秒（原 300；适配器另按任务剩余时间封顶，见 `platforms/_sau_bridge.py`）。
   - 每次发布最多处理 `MAX_SMS_ROUNDS`（3）轮短信验证；第 4 次检测到弹窗（验证码错误/过期）截图并抛 `SmsVerifyFailed`
     （映射规则同 `SmsCodeTimeout`），避免反复发短信、无限循环。
   - `_submit_sms_verify_code()` 移到基类，日志里不再打印验证码本身。
@@ -163,11 +178,33 @@
   适配器作为 `item_id` 返回（不拼链接：小红书分享链接需要 xsec_token）。
 - w8 小红书 `apply_declarations()`：AI 声明没选上时记入 `declaration_warnings`，适配器写进结果消息，提醒人工补充。
 - w9 抖音创建接口回执：成功判定增加 HTTP 2xx（与 postsail 的同类监听一致），并把请求进出告知 `PublishGuard`。
+- w10 小红书登录兜底：`_open_xhs_qrcode_panel()` 改为尽力而为（依次试 `img.css-wemwzq`、「扫码登录」文字、「APP扫一扫登录」，
+  返回是否切到扫码面板）；`_save_xhs_qrcode()` 定位不到二维码时（上游直接抛错，`xiaohongshu_cookie_gen` 失败并关掉窗口）
+  改用 `_save_xhs_login_page()` 把整页截图经 `qrcode_callback` 上报（payload 带 `fallback: True`，同 w6），
+  并照常进入登录完成轮询，用户可以在有头窗口里手动登录。
+
+### j. 定时发布核实
+- 文件：两个 uploader 的 `set_schedule_time_douyin()` / `set_schedule_time_xiaohongshu()`；`runtime.py` 新增
+  `ScheduleFailed(DeclarationFailed)`、`toggle_state()`、`input_value()`、`schedule_value_matches()`
+- 改动：设置完、点「发布」之前核实——「定时发布」单选 / 开关处于选中状态（`toggle_state()` 依次看 aria-checked、
+  data-checked、内部原生 radio/checkbox、类名里的 checked/active/selected；判断不了时至少要出现日期时间框），
+  日期时间框的值（只比较数字，精确到分钟）等于要求的时间；否则截图 `<平台>-schedule.png` 并抛 `ScheduleFailed`
+  （适配器按 `DeclarationFailed` 映射为 `validation`：作品没有发出）。已经选中时不再点（小红书上游会把已打开的开关点关；
+  看不出开关状态但日期框已在时同样不点）。抖音单选普通点击没生效时用 `_native_click` 再点一次；输入方式不变（Ctrl+A、输入、回车）。
+  小红书 fill 之后派发 change 并 `blur()` 提交，不按回车（输入框若在 form 里会触发隐式提交）。
+  日期框选择器加了兜底 `input[placeholder*="日期和时间"]`；两处 `asyncio.sleep(1)` 改为 `page.wait_for_timeout(1000)`。
+- 原因：上游点完就算，点击被组件吞掉时会直接立即发布（结果却报成已定时），时间没填进去时会按页面默认时间定时。
+
+### k. 打开页面不等 load 事件（慢网络）
+
+- `runtime.goto_resilient(page, url)`：`wait_until="domcontentloaded"`、60 秒、超时重试一次。
+- 替换了上游默认 `page.goto(url)`（等 load、30 秒）的 5 处：抖音登录首页；小红书登录页、cookie 校验页、视频/图文发布页。
+- 起因：2026-10-22 实机冒烟测试中，`creator.douyin.com` 首页 30 秒内没有触发 load，登录直接失败。
 
 ## 升级上游时
 
 1. 在上游新提交上 diff 上表中的文件；
-2. 逐条重放 a–i、w1–w5（搜索 `# multipub patch:`）；
+2. 逐条重放 a–j、w1–w10（搜索 `# multipub patch:`）；
 3. 特别确认：上游是否又加了默认声明 / 强制开关、是否新增了 `while True` 循环、是否有新的 `print()` 或 stdout 输出、
    是否有新的直接点击最终「发布」按钮的地方（必须改走 `_click_publish()`）；
 4. 跑 `pytest tests/test_douyin_xhs.py`，更新本文件的提交号与 blob。

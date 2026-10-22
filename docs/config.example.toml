@@ -27,8 +27,8 @@ headless = true
 login = 300            # 扫码登录（各平台实际等待扫码的时间比这个短 45~90 秒）
 check = 180            # mpub check
 publish_video = 3600   # 单个平台发一条视频；mpub publish --timeout 可临时覆盖
-publish_note = 900     # 单个平台发一条图文
-publish_article = 900  # 单个平台发一篇文章
+publish_note = 1800    # 单个平台发一条图文（含抖音最长 10 分钟的短信验证码等待）
+publish_article = 1800 # 单个平台发一篇文章
 # 注意：抖音/小红书的「等待上传完成」默认取 publish_<kind> − 600 秒（见下），
 # 只给 --timeout 不会延长它；传大视频请直接调大这里的 publish_video。
 

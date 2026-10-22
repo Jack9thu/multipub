@@ -10,6 +10,7 @@ import base64
 import importlib.util
 import re
 import shutil
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -139,6 +140,8 @@ def login_hint(platform: str, account: str) -> str:
 
 UPLOAD_RESERVE = 600  # 任务总超时里留给上传以外步骤（开页面、填表、发布、短信）的时间
 LOGIN_OVERHEAD = 120  # 登录任务里留给 cookie 校验、抓二维码、轮询开销的时间
+SMS_TIMEOUT = 600.0  # 等短信验证码：Claude Code 要先注意到 needs_input 事件、再去问用户，5 分钟常常不够
+SMS_RESERVE = 60  # 提交验证码之后还要点发布、等跳转、回写 cookie
 
 
 def sau_timeouts(settings: "Settings", platform: str, kind: Kind,
@@ -152,7 +155,7 @@ def sau_timeouts(settings: "Settings", platform: str, kind: Kind,
         "page_timeout": 300.0,
         "upload_timeout": float(max(180, total - UPLOAD_RESERVE)),
         "publish_timeout": 240.0,
-        "sms_timeout": 300.0,
+        "sms_timeout": SMS_TIMEOUT,
     }
     return {k: float(cfg.get(k, v)) for k, v in defaults.items()}
 
@@ -189,13 +192,23 @@ def make_hooks(ctx: "JobContext", kind: Kind, *, sms_message: str = "") -> Any:
     from .._sau.runtime import Hooks
 
     timeouts = sau_timeouts(ctx.settings, ctx.platform, kind, ctx.timeout)
-    sms_note = (f"{sms_message or '需要短信验证码'}（发布正在等待，{int(timeouts['sms_timeout'])} 秒内有效；"
-                "中途退出后重新发布会重新发送短信）")
+    sms_wait = timeouts["sms_timeout"]
+    started = time.monotonic()  # ≈ worker 开始计任务总超时的时刻
 
     def on_sms(path: Path) -> None:
-        ctx.needs_input("sms_code", sms_note, path=path)
+        # 等验证码不能超过任务剩下的时间（再留出提交后的发布时间）：让 SAU 自己的截止时间先到，
+        # 报出 sms_code_required / unknown_outcome，而不是被 worker 的总超时直接打断；提示里的秒数也就是真的
+        wait = sms_wait
+        if ctx.timeout:
+            left = ctx.timeout - (time.monotonic() - started) - SMS_RESERVE
+            wait = min(wait, max(60.0, left))
+        hooks.sms_timeout = wait
+        note = f"{sms_message or '需要短信验证码'}（发布正在等待，{int(wait)} 秒内有效"
+        if not ctx.headless:
+            note += "；也可以直接在弹出的浏览器窗口里输入验证码并点「验证」"
+        ctx.needs_input("sms_code", note + "；中途退出后重新发布会重新发送短信）", path=path)
 
-    return Hooks(
+    hooks = Hooks(
         before_publish_click=ctx.mark_submit_started,
         sms_code_required=on_sms,
         on_evidence=lambda p: ctx.evidence.append(str(p)),
@@ -203,6 +216,7 @@ def make_hooks(ctx: "JobContext", kind: Kind, *, sms_message: str = "") -> Any:
         platform=ctx.platform,
         **timeouts,
     )
+    return hooks
 
 
 class QrRelay:
@@ -228,8 +242,12 @@ class QrRelay:
             self.ctx.log(f"保存二维码图片失败: {exc}", level="warning")
             return
         self.reported += 1
-        note = ("没定位到二维码元素，这是登录页截图，请扫描其中的二维码" if payload.get("fallback")
-                else "二维码过期后会自动刷新，请以最新图片为准")
+        if payload.get("fallback"):
+            note = "没定位到二维码元素，这是登录页截图，请扫描其中的二维码"
+            if not self.ctx.headless:
+                note += "；也可以直接在弹出的浏览器窗口里扫码或登录"
+        else:
+            note = "二维码过期后会自动刷新，请以最新图片为准"
         self.ctx.qrcode(self.dest, note=note)
 
 
@@ -303,7 +321,8 @@ async def translate_errors(ctx: "JobContext") -> AsyncIterator[None]:
     hint = login_hint(ctx.platform, ctx.account)
     check_first = "请先到平台后台确认作品是否已发出，再决定是否重发"
     sms_hint = (f"验证码必须在发布进行中提交：收到短信验证提示后，在 sms_timeout 时限内运行 "
-                f"mpub verify-code {ctx.platform} <验证码>；重新发布会重新发送短信，之前的验证码作废")
+                f"mpub verify-code {ctx.platform} <验证码>（加 --headed 时也可以直接在浏览器窗口里输入）；"
+                "重新发布会重新发送短信，之前的验证码作废")
     captcha_hint = "如需重发，请加 --headed 并在浏览器窗口里手动完成验证"
     try:
         yield

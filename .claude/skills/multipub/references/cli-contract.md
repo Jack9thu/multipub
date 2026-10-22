@@ -137,7 +137,7 @@ mpub publish <post> [--to 平台,平台] [--account <名字>] [--dry-run] [--yes
 | `--yes` / `-y` | 不再询问确认。stdin 不是终端时**必须**加，否则 stderr 提示、退出码 2、没有 JSON |
 | `--headed` | 显示浏览器窗口（默认按 config `browser.headless`，默认无头） |
 | `--gap` | 平台之间等待秒数（默认 config `gap_seconds` = 30） |
-| `--timeout` | 单个平台的总超时秒数（默认 `[timeouts] publish_<kind>`：视频 3600、图文/文章 900） |
+| `--timeout` | 单个平台的总超时秒数（默认 `[timeouts] publish_<kind>`：视频 3600、图文/文章 1800） |
 | `--force` | 忽略查重，强制再发 |
 
 流程：解析清单 → 不支持该类型的平台记为 `skipped` → 校验（有 error 则输出
@@ -232,7 +232,7 @@ mpub verify-code douyin <验证码>
 |---|---|---|
 | `log` | `level`（`info`/`warning`/`debug`）、`message` | 进度。`debug` 是 worker 的非 JSON 输出，可忽略 |
 | `qrcode` | `path`、`note` | 登录二维码图片已生成或刷新（`<数据目录>\qrcode\<平台>-<账号>.png`）。展示给用户扫码；`note` 里有提示（如抖音没定位到二维码时这是整页截图） |
-| `needs_input` | `kind`（目前只有 `sms_code`）、`message`、`path` | 抖音发布需要短信验证码：向用户要验证码，运行 `mpub verify-code douyin <验证码>`（推荐用命令；直接写 `path` 也行，UTF-8/UTF-16 都认）；默认等 600 秒 |
+| `needs_input` | `kind`（目前只有 `sms_code`）、`message`、`path` | 抖音发布需要短信验证码：向用户要验证码，运行 `mpub verify-code douyin <验证码>`（推荐用命令；直接写 `path` 也行，UTF-8/UTF-16 都认）。`message` 里写了实际等待的秒数（默认 600，且不超过任务剩余时间）。`--headed` 时用户也可以直接在浏览器窗口里输入 |
 | `submit_started` | — | 即将/已经点击发布。此后该平台的任何失败都不能自动重试 |
 
 不加 `--json` 时这些事件以中文提示行显示在 stderr。
@@ -271,5 +271,5 @@ mpub verify-code douyin <验证码>
 | login | 300 | config `[timeouts] login` |
 | check | 180 | config `[timeouts] check` |
 | publish 视频 | 3600 / 平台 | `--timeout` 或 config `[timeouts] publish_video` |
-| publish 图文 / 文章 | 900 / 平台 | `--timeout` 或 config `[timeouts] publish_note` / `publish_article` |
+| publish 图文 / 文章 | 1800 / 平台 | `--timeout` 或 config `[timeouts] publish_note` / `publish_article` |
 | 平台之间间隔 | 30 | `--gap` 或 config `gap_seconds` |

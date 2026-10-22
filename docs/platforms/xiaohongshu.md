@@ -43,7 +43,7 @@ platforms:
 | 键 | 默认 | 含义 |
 |---|---|---|
 | `upload_timeout` | 本次任务超时 − 600（最少 180） | 等待视频/图片上传完成（秒）。任务超时 = `mpub publish --timeout`，没给时为 `timeouts.publish_<kind>` |
-| `publish_timeout` | 240 | 点击「发布」后等待跳到成功页 |
+| `publish_timeout` | 240 | 点击「发布」后等待跳到成功页；`--headed` 下出现人机验证时，从验证出现起再等这么久 |
 
 环境变量 `SAU_XHS_CREATOR_BASE_URL` 可切换创作者中心域名（如 `https://creator.rednote.com`）。
 
@@ -74,7 +74,10 @@ mpub login xiaohongshu --account main --headless   # 小红书无头登录可用
 
 1. 已有 cookie 且仍有效时直接返回。
 2. 否则打开 `/login`，切到扫码面板，二维码复制到 `<数据目录>/qrcode/xiaohongshu-<账号>.png` 并上报 `qrcode` 事件；
-   登录结束后删除。
+   登录结束后删除。切换扫码面板依次试：登录框里的切换图标（哈希类名 `img.css-wemwzq`）、「扫码登录」文字。
+   **切不过去或定位不到二维码时不会立刻失败**：改为上报整页截图（事件的 `note` 会说明，面板已经是扫码时扫其中的二维码即可），
+   并照常等待登录完成——有头模式下可以直接在弹出的窗口里扫码，或改用手机号 + 验证码登录。
+   无头模式下截图不会刷新，二维码过期了就去掉 `--headless` 重试。
 3. 登录成功后再用无头浏览器校验一次 cookie，写入 `<数据目录>/accounts/xiaohongshu/<账号>.json`。
 4. 扫码等待时长 = 本次任务超时 − 120 秒（默认约 150 秒；余下时间留给 cookie 校验和抓二维码）。需要更长时间就调大 `timeouts.login`。
 
@@ -86,7 +89,14 @@ mpub login xiaohongshu --account main --headless   # 小红书无头登录可用
 （可选）内容类型声明 → 定时 → 点击「发布」/「定时发布」并等待 URL 变为 `/publish/success?…`。
 图文：`target=image`，上传图片后等标题框出现，其余相同。
 
+- 定时：打开「定时发布」开关（已经打开就不点，上游会把它点关）、把时间填进日期框并让输入框失焦以提交
+  （不按回车：输入框若在表单里，回车可能触发隐式提交），**点发布之前核实**开关已打开（判断不了时至少要出现日期框）、
+  框里的值就是要求的时间（精确到分钟）。核实不了就截图并返回 `failed` / `validation`（**笔记没有发出**）：
+  上游在时间没填进去时可能按页面默认时间定时，结果却报成你要的时间。可以直接重试；仍失败就去掉 `schedule` 到时间再发。
 - 第一次点击最终发布按钮前发出 `submit_started` 事件；之后不再自动重试（runner 层面）。
+- 加 `--headed` 时，页面出现人机验证（滑块等）可以直接在窗口里完成：验证显示期间不点「发布」、不把接口的「需要验证」
+  失败当成平台拒绝，从验证出现起最多再等 `publish_timeout`；没完成就超时（点过发布 → `unknown_outcome`）。
+  无头模式下照旧很快按人机验证报错。
 - 只有发布按钮唯一、可见、可用时才点；按钮还不能点时继续等（不算点击、不发 `submit_started`）。
   `button:has-text("发布")` 是子串匹配，命中多个按钮时改点文字正好是「发布」（定时为「定时发布」）的那个；
   仍不唯一就不点，`publish_timeout` 后返回 `timeout`（可重试，笔记没有发出）。
@@ -108,6 +118,7 @@ mpub login xiaohongshu --account main --headless   # 小红书无头登录可用
 | 点发布前某一步超时（含发布按钮一直不可点 / 不唯一） | `failed` / `timeout`（可重试） |
 | 点发布后超时、页面异常，或停在人机验证 | `failed` / `unknown_outcome`（先去后台确认，不要直接重发；发布记录会拦住不带 `--force` 的重发） |
 | 填了 `repost_source` 但没能确认设置上「来源转载」，点发布前 | `failed` / `validation`（拒绝发布，笔记没有发出） |
+| 填了 `schedule` 但没能核实「定时发布」开关已打开、时间已填对，点发布前 | `failed` / `validation`（拒绝发布，笔记没有发出） |
 | 点发布后接口明确返回失败 | `failed` / `platform_error`（不可重试；笔记应未创建，建议先去后台确认） |
 | 参数问题（SAU 校验） | `failed` / `validation` |
 
@@ -115,7 +126,9 @@ mpub login xiaohongshu --account main --headless   # 小红书无头登录可用
 
 ## 已知风险
 
-- 小红书登录框切换按钮用的是哈希类名 `img.css-wemwzq`，改版后会失效（表现为登录超时）。
+- 小红书登录框切换按钮用的是哈希类名 `img.css-wemwzq`，改版后会失效。以前表现为 `mpub login` 10–30 秒后直接报
+  「登录失败: …Timeout…」（`internal`）并关掉窗口，根本等不到扫码；现在会再试「扫码登录」文字，仍不行就上报整页截图（`qrcode` 事件的 `note` 写着
+  「没定位到二维码元素」）并继续等待——请在弹出的窗口里手动登录，无头模式请去掉 `--headless`。
 - 发布按钮选择器 `button:has-text("发布")` 是子串匹配；命中多个按钮时改用文字完全一致的那个，仍不唯一则不点，超时返回 `timeout`。
 - 话题依赖联想接口，网络慢时会被跳过。
 - 小红书发布页可能恢复上一次没发出去的草稿内容（postsail 为此专门做了检测）；上游没有处理，
@@ -142,7 +155,10 @@ mpub login xiaohongshu --account main --headless   # 小红书无头登录可用
 | 标题 / 正文 | `input[placeholder*="填写标题"]`、`p[data-placeholder*="输入正文描述"]` | 高 |
 | 话题 | `#creator-editor-topic-container .item` | 高（1b36b8b） |
 | 封面 | `div.upload-cover` → 「上传封面」→ `div.upload-wrapper input[type=file]` → `div.d-modal-footer`「确定」 | 中高（3590c52，2026-08） |
-| 定时 | `.custom-switch-card`「定时发布」`.d-switch`、`.d-datepicker-input-filter input.d-text` | 中 |
+| 定时 | `.custom-switch-card`「定时发布」`.d-switch`、`.d-datepicker-input-filter input.d-text`（兜底 `input[placeholder*="日期和时间"]`） | 中 |
+| 定时核实 | 开关的 `aria-checked` / `data-checked` / 内部 checkbox / 类名含 checked、active；日期框 `input_value()` 的数字等于要求的时间；失焦（`blur`）后日期选择器会提交输入（multipub 新增） | 低 |
+| 登录兜底 | 「扫码登录」文字切换、整页截图上报（multipub 新增） | 中 |
+| 有头模式的人机验证 | 同「卡住原因判定」；出现时不点「发布」（multipub 新增） | 低 |
 | 发布 / 成功 | `button:has-text("发布")` / `button:has-text("定时发布")` → URL `**/publish/success?**` | 高 |
 | 来源转载声明 | 「添加内容类型声明」→「来源转载」→ placeholder「请输入媒体名称」→「确认」 | 中（3590c52） |
 | AI 内容声明 | 「添加内容类型声明」→「笔记含AI合成内容」（omnipost / postsail 同一文字） | 低 |

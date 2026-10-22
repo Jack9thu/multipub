@@ -3,10 +3,13 @@
 from datetime import datetime
 
 import asyncio
+import codecs
 import inspect
 import json
+import locale
 import os
 import re
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -17,9 +20,10 @@ from patchright.async_api import async_playwright
 # multipub patch: 包内绝对导入；conf 由 multipub._sau.conf.configure() 预先设置
 from multipub._sau import conf as sau_conf
 from multipub._sau.conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
-from multipub._sau.runtime import (CookieInvalid, Deadline, DeclarationFailed, Hooks, SauError, SmsCodeTimeout,
-                                   SmsVerifyFailed, UploadFailed, close_quietly, fail_rejected, fail_step,
-                                   find_visible_text, publish_button_ready, save_screenshot, save_state_quietly)
+from multipub._sau.runtime import (CaptchaWatch, goto_resilient, CookieInvalid, Deadline, DeclarationFailed, Hooks, SauError,
+                                   ScheduleFailed, SmsCodeTimeout, SmsVerifyFailed, UploadFailed, close_quietly,
+                                   fail_rejected, fail_step, find_visible_text, input_value, publish_button_ready,
+                                   save_screenshot, save_state_quietly, schedule_value_matches, toggle_state)
 from multipub._sau.uploader.base_video import BaseVideoUploader
 from multipub._sau.utils.base_social_media import set_init_script
 from multipub._sau.utils.login_qrcode import build_login_qrcode_path
@@ -42,12 +46,48 @@ def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
 
 
-def _read_verify_code(code_file) -> str:
-    """multipub patch: 只读文件（utf-8-sig 兼容记事本 BOM）；worker 的 stdin 已关闭，不再提示终端输入。"""
+def _read_code_bytes(code_file) -> bytes | None:
+    """multipub patch: 验证码文件的原始内容；不存在、被占用时返回 None。"""
     try:
-        return Path(code_file).read_text(encoding="utf-8-sig").strip()
-    except (FileNotFoundError, OSError):
-        return ""
+        return Path(code_file).read_bytes()
+    except OSError:
+        return None
+
+
+def _decode_code_text(data: bytes) -> str:
+    """multipub patch: 按 BOM 解码。Windows PowerShell 5.1 的 `echo 123456 > 文件` / Out-File 写的是带 BOM 的 UTF-16LE，
+    记事本是 UTF-8（可能带 BOM），cmd 的 echo 是本地代码页（GBK）。"""
+    if data.startswith(codecs.BOM_UTF8):
+        return data[len(codecs.BOM_UTF8):].decode("utf-8")
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16")
+    if len(data) >= 2 and data[1:2] == b"\x00":  # 没有 BOM 的 UTF-16LE
+        return data.decode("utf-16-le")
+    if data[:1] == b"\x00":
+        return data.decode("utf-16-be")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode(locale.getpreferredencoding(False))
+
+
+def _parse_verify_code(data: bytes) -> str:
+    """multipub patch: 只保留数字（全角数字转成半角）。内容解码不了、或有内容却没有数字时抛 ValueError。"""
+    try:
+        text = _decode_code_text(data)
+    except (UnicodeDecodeError, LookupError) as exc:
+        raise ValueError("无法识别文件编码") from exc
+    code = "".join(str(unicodedata.decimal(ch)) for ch in text if ch.isdecimal())
+    if not code and text.strip(" \t\r\n\ufeff\x00"):
+        raise ValueError(f"文件里没有数字（{text.strip()[:20]!r}）")
+    return code
+
+
+def _read_verify_code(code_file) -> str:
+    """multipub patch: 只读文件，不再提示终端输入（worker 的 stdin 不是终端）。
+    文件不存在、被占用或还是空的返回 ""；内容读不出验证码时抛 ValueError（调用方告警后继续等）。"""
+    data = _read_code_bytes(code_file)
+    return _parse_verify_code(data) if data else ""
 
 
 async def _native_click(page, locator) -> bool:
@@ -304,7 +344,7 @@ async def douyin_cookie_gen(
         result = _build_login_result(False, "failed", "抖音登录失败", account_file)
         try:
             page = await context.new_page()
-            await page.goto("https://creator.douyin.com/")
+            await goto_resilient(page, "https://creator.douyin.com/")  # multipub patch: 慢网络
             qrcode_info = await _save_douyin_qrcode(page, account_file, qrcode_callback=qrcode_callback)
             qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
             douyin_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
@@ -375,6 +415,7 @@ class DouYinBaseUploader(BaseVideoUploader):
         self.published_item_id: str | None = None
         self.publish_api_error: str | None = None
         self._response_tasks: set = set()
+        self._captcha = CaptchaWatch(headless=headless, guard=self.publish_guard, logger=douyin_logger)
 
     async def validate_base_args(self):
         # multipub patch: 抛 CookieInvalid，适配器据此提示重新登录
@@ -390,18 +431,70 @@ class DouYinBaseUploader(BaseVideoUploader):
         else:
             self.publish_date = 0
 
-    async def set_schedule_time_douyin(self, page, publish_date):
-        label_element = page.locator("[class^='radio']:has-text('定时发布')")
-        await label_element.click()
-        await asyncio.sleep(1)
-        publish_date_hour = publish_date.strftime("%Y-%m-%d %H:%M")
+    SCHEDULE_LABEL_SELECTOR = "[class^='radio']:has-text('定时发布')"  # 上游选择器
+    SCHEDULE_INPUT_SELECTORS = ('.semi-input[placeholder="日期和时间"]', 'input[placeholder*="日期和时间"]')
 
-        await asyncio.sleep(1)
-        await page.locator('.semi-input[placeholder="日期和时间"]').click()
+    async def set_schedule_time_douyin(self, page, publish_date):
+        """上游：点「定时发布」→ 在「日期和时间」框里输入时间、回车。
+
+        multipub patch: 点击被组件吞掉时上游会直接立即发布（结果却报成已定时）。现在设置完核实：
+        「定时发布」处于选中状态（label 的 data-checked / 内部 radio；判断不了时至少要出现日期时间框），
+        且框里的值就是要求的时间（精确到分钟）；否则截图并抛 ScheduleFailed——还没点「发布」，作品不会发出。
+        """
+        want = publish_date.strftime("%Y-%m-%d %H:%M")
+        douyin_logger.info(_msg("🕒", f"小人准备设置定时发布: {want}"))
+        label = page.locator(self.SCHEDULE_LABEL_SELECTOR).first
+        if not await label.count():
+            label = page.locator("label").filter(has_text="定时发布").first
+        if not await label.count():
+            await self._schedule_failed(page, "页面上找不到「定时发布」选项")
+        if await toggle_state(label) is not True:
+            try:
+                await label.click(timeout=5000)
+            except Exception:
+                await _native_click(page, label)
+            await page.wait_for_timeout(1000)
+            if await toggle_state(label) is False:  # 普通点击被吞掉：派发完整原生事件再试一次
+                await _native_click(page, label)
+                await page.wait_for_timeout(1000)
+        if await toggle_state(label) is False:
+            await self._schedule_failed(page, "点了「定时发布」，但它没有变成选中状态")
+
+        date_input = await self._schedule_input(page)
+        if date_input is None:
+            await self._schedule_failed(page, "没有出现「日期和时间」输入框")
+        await date_input.click()
         await page.keyboard.press("Control+KeyA")
-        await page.keyboard.type(str(publish_date_hour))
+        await page.keyboard.type(want)
         await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
+        await page.wait_for_timeout(1000)
+
+        value = await input_value(date_input)
+        if await toggle_state(label) is False:
+            await self._schedule_failed(page, "「定时发布」又变回了未选中")
+        if not schedule_value_matches(value, publish_date):
+            await self._schedule_failed(page, f"日期和时间框显示「{value or '空'}」，应为「{want}」")
+        douyin_logger.success(_msg("🕒", f"定时发布已设置并核实: {want}"))
+
+    async def _schedule_input(self, page: Page, timeout: float = 8000):
+        """multipub patch: 「日期和时间」输入框（选中「定时发布」后才出现）；没有出现返回 None。"""
+        for selector in self.SCHEDULE_INPUT_SELECTORS:
+            loc = page.locator(selector).first
+            try:
+                await loc.wait_for(state="visible", timeout=timeout)
+                return loc
+            except Exception:
+                timeout = 1000
+        return None
+
+    async def _schedule_failed(self, page: Page, reason: str):
+        """multipub patch: 定时没能核实：截图后拒绝继续（还没点「发布」）。"""
+        shot = await save_screenshot(page, self.hooks, "schedule")
+        douyin_logger.error(_msg("😵", f"定时发布没能设置上：{reason}" + (f"；截图: {shot}" if shot else "")))
+        raise ScheduleFailed(
+            f"定时发布没能设置上（{reason}），拒绝继续发布，作品没有发出。"
+            "可以直接重试；仍失败时去掉 schedule、到时间再发，或在网页上手动定时发布"
+        )
 
     async def fill_title_and_description(self, page: Page, title: str, description: str, tags: list[str] | None = None):
         # 2026-06 抖音发布页 DOM：标题=input[placeholder*=填写作品标题]，描述=div.zone-container[contenteditable]
@@ -722,7 +815,7 @@ class DouYinBaseUploader(BaseVideoUploader):
     async def _publish_until_success(self, page: Page, what: str, success_url: str) -> None:
         """上游视频/图文的发布循环（选择器不变），multipub 改动：
         截止时间；短信验证有截止时间与轮数上限；「发布」只经 _click_publish 点击（PublishGuard 限制重复点击，
-        第一次点击前通知适配器）；接口明确失败且没有后续验证时提前报错。"""
+        第一次点击前通知适配器）；接口明确失败且没有后续验证时提前报错；有头模式下等用户完成人机验证（CaptchaWatch）。"""
         self._watch_publish_response(page)
         deadline = Deadline(self.hooks.publish_timeout, f"等待{what}发布成功")
         while True:
@@ -734,6 +827,10 @@ class DouYinBaseUploader(BaseVideoUploader):
                 # 检测并处理短信验证码弹窗；等验证码的时间不计入发布等待
                 if await self._handle_sms_verification(page, strict=self.STRICT_SMS_CHECK):
                     deadline.reset()
+                # multipub patch: 有头模式下页面停在人机验证：等用户在窗口里完成，期间不点「发布」、不判被拒
+                if await self._captcha.blocking(page, deadline):
+                    await asyncio.sleep(self.hooks.poll_interval)
+                    continue
 
                 # ── 正常发布流程 ──
                 publish_button = page.get_by_role("button", name="发布", exact=True)
@@ -862,6 +959,7 @@ class DouYinBaseUploader(BaseVideoUploader):
 
         与上游的区别：验证码只从 verify_code.txt 读取（不读 stdin），等待有截止时间，
         开始等待时通过 hooks.sms_code_required 通知一次。strict=True 时还要求出现验证组件特征。
+        等待期间弹窗自己关了（用户在 --headed 窗口里完成了验证）就不再要验证码，直接继续发布。
         """
         sms_input = page.locator(self.SMS_INPUT_SELECTOR).first
         if not (await sms_input.count() and await sms_input.is_visible()):
@@ -877,30 +975,78 @@ class DouYinBaseUploader(BaseVideoUploader):
             )
         self._sms_rounds += 1
         douyin_logger.warning(_msg("📱", f"检测到短信验证码弹窗（第 {self._sms_rounds} 次）"))
+        # 短信验证拦下了上一次「发布」：允许再点一次（与上游一致：验证后继续点发布）。
+        # multipub patch: 一检测到弹窗就告知 PublishGuard——之后（等验证码期间、提交验证码后）
+        # 页面若自己重新提交了，就不再补点
+        self.publish_guard.blocked_by_platform()
         code_file = sau_conf.verify_code_file()
         # 清掉上一次残留的验证码，避免提交过期的验证码
+        stale: bytes | None = None
         try:
             code_file.unlink()
         except FileNotFoundError:
             pass
+        except OSError as exc:  # multipub patch: Windows 上文件被占用时删不掉：记下旧内容，内容变了才读
+            stale = _read_code_bytes(code_file)
+            douyin_logger.warning(_msg("😵", f"删不掉旧的验证码文件（{exc.__class__.__name__}），等文件内容变化后再读取"))
         get_code_btn = page.get_by_text("获取验证码").first
         if await get_code_btn.count() and await get_code_btn.is_visible():
             await get_code_btn.click()
             douyin_logger.info(_msg("📤", "已点击「获取验证码」，请查看手机短信"))
-        code = await self._wait_verify_code(page, code_file)
-        await self._submit_sms_verify_code(page, sms_input, code, str(code_file))
-        # 短信验证拦下了上一次「发布」：允许再点一次（与上游一致：验证后继续点发布）
-        self.publish_guard.blocked_by_platform()
+        code = await self._wait_verify_code(page, code_file, sms_input=sms_input, stale=stale)
+        if code is not None and not await self._visible(sms_input):
+            code = None  # 拿到验证码时弹窗已经关了（用户在窗口里先完成了验证）：不再往隐藏的输入框里填
+        # 「需要验证」的接口失败回执可能在检测到弹窗之后才到：不算平台拒绝
+        self.publish_guard.clear_rejection()
+        if code is None:
+            # multipub patch: 用户在浏览器窗口里完成了验证（--headed），不需要验证码
+            where = "" if self.headless else "（已在浏览器窗口里完成验证）"
+            douyin_logger.success(_msg("✅", f"短信验证弹窗已关闭{where}，不需要验证码，继续发布"))
+            try:
+                code_file.unlink()
+            except OSError:
+                pass
+            await page.wait_for_timeout(3000)
+        else:
+            await self._submit_sms_verify_code(page, sms_input, code, str(code_file))
         return True
 
-    async def _wait_verify_code(self, page: Page, code_file: Path) -> str:
+    SMS_CLOSED_POLLS = 2  # 连续这么多轮看不到短信输入框，才算弹窗已关闭
+
+    async def _wait_verify_code(self, page: Page, code_file: Path, sms_input=None,
+                                stale: bytes | None = None) -> str | None:
+        """multipub patch: 等验证码文件（有截止时间）。返回验证码；返回 None 表示短信弹窗已经关闭
+        （用户在 --headed 窗口里输入了验证码，或页面已经跳走），不需要验证码。
+
+        文件按 BOM 解码、只取数字；读不出验证码时告警一次并继续等。读到后隔一小会儿再读一次，
+        内容一致才用（避免读到写了一半的文件）。"""
         self.hooks.call("sms_code_required", code_file)
-        douyin_logger.warning(_msg("⏳", f"等待短信验证码：写入 {code_file}，或运行 mpub verify-code douyin <验证码>"))
+        hint = f"等待短信验证码：运行 mpub verify-code douyin <验证码>（或写入 {code_file}）"
+        if not self.headless:
+            hint += "，也可以直接在浏览器窗口里输入验证码并点「验证」"
+        douyin_logger.warning(_msg("⏳", hint))
         deadline = Deadline(self.hooks.sms_timeout, "等待短信验证码")
+        warned = ""
+        closed_polls = 0
         while True:
-            code = _read_verify_code(code_file)
+            data = _read_code_bytes(code_file)
+            code = ""
+            if data and data != stale:
+                try:
+                    code = _parse_verify_code(data)
+                except ValueError as exc:
+                    if str(exc) != warned:
+                        warned = str(exc)
+                        douyin_logger.warning(_msg("😵", f"验证码文件里读不出验证码：{exc}；继续等待，"
+                                                        "可重新运行 mpub verify-code douyin <验证码>"))
             if code:
-                return code
+                await asyncio.sleep(min(0.3, self.hooks.poll_interval))
+                if _read_code_bytes(code_file) == data:
+                    return code
+            elif sms_input is not None:
+                closed_polls = 0 if await self._visible(sms_input) else closed_polls + 1
+                if closed_polls >= self.SMS_CLOSED_POLLS:
+                    return None
             if deadline.expired:
                 shot = await save_screenshot(page, self.hooks, "sms-timeout")
                 raise SmsCodeTimeout(
@@ -908,6 +1054,13 @@ class DouYinBaseUploader(BaseVideoUploader):
                     step=deadline.step, after_submit=self._publish_clicked, screenshot=shot,
                 )
             await asyncio.sleep(self.hooks.poll_interval)
+
+    @staticmethod
+    async def _visible(locator) -> bool:
+        try:
+            return bool(await locator.count() and await locator.is_visible())
+        except Exception:  # 页面跳转中 locator 可能失效
+            return False
 
     async def _submit_sms_verify_code(self, page: Page, sms_input, code: str, code_file: str) -> bool:
         douyin_logger.info(_msg("✍️", "已获取验证码，准备填入"))
@@ -933,9 +1086,12 @@ class DouYinBaseUploader(BaseVideoUploader):
                 douyin_logger.warning(_msg("⚠️", "未找到验证按钮，尝试按Enter"))
                 await page.keyboard.press("Enter")
 
-        if os.path.exists(code_file):
-            os.remove(code_file)
-            douyin_logger.info(_msg("🧹", "验证码文件已清理"))
+        try:  # multipub patch: Windows 上文件被占用时删不掉：不影响已经提交的验证码（下一轮按旧内容忽略它）
+            if os.path.exists(code_file):
+                os.remove(code_file)
+                douyin_logger.info(_msg("🧹", "验证码文件已清理"))
+        except OSError as exc:
+            douyin_logger.warning(_msg("😵", f"验证码文件删不掉（{exc.__class__.__name__}），不影响本次验证"))
 
         await page.wait_for_timeout(3000)
         douyin_logger.info(_msg("🔄", "验证码处理完成，继续发布流程"))

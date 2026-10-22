@@ -37,6 +37,8 @@
 |---|---|
 | `tid` 必填 | B站视频在 `platforms.bilibili.tid` 写分区 id（231 计算机技术、21 日常、160 生活、95 数码、201 科学科普、138 搞笑、36 知识） |
 | 标题超长 | 在 `platforms.<平台>.title` 单独写短标题：抖音视频 ≤30、小红书 ≤20、抖音图文 ≤20、B站动态 ≤20、B站视频 ≤80、知乎文章 ≤100 |
+| 「定时没有设置成功」（validation） | 抖音/小红书在点发布前核实定时开关和时间，对不上就拒绝发布，作品没有发出。加 `--headed` 观察页面；平台改版时去掉 `schedule` 先立即发布 |
+| B站视频「缺少 Microsoft Visual C++ 运行库」 | 安装 `winget install Microsoft.VCRedist.2015+.x64` 或 https://aka.ms/vs/17/release/vc_redist.x64.exe ，再 `mpub doctor` |
 | 定时报错 | 本地时间 `"YYYY-MM-DD HH:MM"` 加引号。B站视频 2 小时~15 天；B站动态 5 分钟~7 天；抖音、小红书 2 小时以上；知乎不支持（去掉 `schedule` 或 `--to` 排除知乎） |
 | 图片格式不支持 | B站动态 jpg/png/gif；抖音/小红书 jpg/png/webp/bmp（不支持 GIF）；知乎 jpg/png/gif/webp/bmp |
 | 路径找不到 | 相对路径按 post.yaml 所在目录；Windows 路径在 YAML 里用单引号或正斜杠；知乎正文图片相对 `body_file` 所在目录 |

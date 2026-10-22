@@ -112,12 +112,23 @@ class FakeLocator:
         if not self.page.visible.get(self.key):
             raise RuntimeError(f"找不到元素 {self.key}")
         self.page.clicks.append(self.key)
+        self.page.focused = self.key
         hook = self.page.on_click.get(self.key)
         if hook is not None:
             hook(self.page)
 
     async def fill(self, value: str, **_: Any) -> None:
-        self.page.filled[self.key] = value
+        if self.key not in self.page.readonly:
+            self.page.filled[self.key] = value
+
+    async def input_value(self, **_: Any) -> str:
+        return self.page.filled.get(self.key, self.page.attrs.get((self.key, "value"), ""))
+
+    async def press(self, key: str, **_: Any) -> None:
+        self.page.keyboard.pressed.append(key)
+
+    async def screenshot(self, path: str, **_: Any) -> None:
+        Path(path).write_bytes(b"\x89PNG fake")
 
     async def set_input_files(self, files: Any, **_: Any) -> None:
         self.page.uploads.append(self.key)
@@ -131,6 +142,7 @@ class FakeLocator:
         return self.page.attrs.get((self.key, name))
 
     async def evaluate(self, *args: Any) -> Any:
+        self.page.evaluated.append(self.key)
         return self.page.attrs.get((self.key, "evaluate"))
 
     async def element_handle(self) -> "FakeLocator":
@@ -157,11 +169,17 @@ class FakeResponse:
 
 
 class FakeKeyboard:
-    def __init__(self) -> None:
+    def __init__(self, page: "FakePage") -> None:
+        self.page = page
         self.pressed: list[str] = []
 
     async def press(self, key: str) -> None:
         self.pressed.append(key)
+
+    async def type(self, text: str, **_: Any) -> None:  # 输入到最后点过的元素（Ctrl+A 后整体替换）
+        key = self.page.focused
+        if key is not None and key not in self.page.readonly:
+            self.page.filled[key] = text
 
 
 class FakePage:
@@ -180,7 +198,10 @@ class FakePage:
         self.disabled: set[str] = set()
         self.attrs: dict[tuple[str, str], Any] = {}  # (选择器, 属性) → 值
         self.shown_texts: set[str] = set()  # find_visible_text 能看到的文字（输入区以外）
-        self.keyboard = FakeKeyboard()
+        self.readonly: set[str] = set()  # 输入被组件吞掉的输入框
+        self.focused: str | None = None
+        self.evaluated: list[str] = []
+        self.keyboard = FakeKeyboard(self)
         self.url = "https://creator.example/publish"
 
     def get_by_text(self, text: str, exact: bool = False) -> FakeLocator:
@@ -213,6 +234,9 @@ class FakePage:
 
     async def wait_for_load_state(self, *args: Any, **kwargs: Any) -> None:
         return None
+
+    async def goto(self, url: str, **_: Any) -> None:
+        self.url = url
 
     async def wait_for_url(self, url: str, timeout: float | None = None) -> None:
         if self.succeeded:
@@ -965,6 +989,476 @@ def test_login_qrcode_without_opencv(monkeypatch, tmp_path: Path, capsys):
     assert out.out == "" and "小红书APP" in out.err
 
 
+# ------------------------------------------------------------------ 短信验证码文件 / 窗口里手动验证
+
+@pytest.mark.parametrize("data", [
+    "123456\r\n".encode("utf-16"),  # Windows PowerShell 5.1：echo 123456 > 文件（UTF-16LE + BOM）
+    b"\xfe\xff" + "123456".encode("utf-16-be"),
+    "123456\r\n".encode("utf-16-le"),  # 没有 BOM 的 UTF-16LE
+    "﻿123456\n".encode("utf-8"),  # 记事本
+    "验证码：１２３ ４５６".encode("gbk"),  # cmd 的本地代码页、全角数字、夹杂文字
+    "验证码：123456".encode("utf-8"),
+])
+def test_verify_code_file_encodings(sau, tmp_path: Path, data: bytes, monkeypatch):
+    _, dy, _ = sau
+    import locale
+
+    monkeypatch.setattr(locale, "getpreferredencoding", lambda *a: "gbk")  # 中文 Windows
+    path = tmp_path / "verify_code.txt"
+    path.write_bytes(data)
+    assert dy._read_verify_code(path) == "123456"
+
+
+def test_verify_code_file_unreadable(sau, tmp_path: Path, monkeypatch):
+    _, dy, _ = sau
+    import locale
+
+    monkeypatch.setattr(locale, "getpreferredencoding", lambda *a: "utf-8")
+    path = tmp_path / "verify_code.txt"
+    assert dy._read_verify_code(path) == ""  # 还没写
+    path.write_bytes(b"")
+    assert dy._read_verify_code(path) == ""
+    path.write_bytes("\r\n".encode("utf-16"))  # 只有 BOM 和换行（写了一半）
+    assert dy._read_verify_code(path) == ""
+    for bad in (b"\xff\x00\xc3", "abc".encode("utf-8")):
+        path.write_bytes(bad)
+        with pytest.raises(ValueError):
+            dy._read_verify_code(path)
+
+
+async def test_sms_wait_survives_bad_code_file(sau, tmp_path: Path, monkeypatch):
+    """写错编码 / 写错内容不再中断发布：告警一次，继续等到读出验证码。"""
+    import asyncio
+
+    _, dy, _ = sau
+    from multipub._sau.runtime import Hooks
+
+    warnings: list[str] = []
+    monkeypatch.setattr(dy.douyin_logger, "warning", lambda m, *a, **k: warnings.append(str(m)))
+    code_file = tmp_path / "verify_code.txt"
+    hooks = Hooks(sms_timeout=5, poll_interval=0.01, evidence_dir=tmp_path, platform="douyin")
+    v = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json", hooks=hooks)
+    code_file.write_text("abc", encoding="utf-8")
+
+    async def fix_later() -> None:
+        await asyncio.sleep(0.2)
+        code_file.write_bytes("654321\r\n".encode("utf-16"))
+
+    task = asyncio.ensure_future(fix_later())
+    assert await v._wait_verify_code(FakePage(), code_file) == "654321"
+    await task
+    assert sum("读不出验证码" in w for w in warnings) == 1  # 同样的内容只告警一次
+
+
+async def test_sms_stale_file_that_cannot_be_deleted(sau, tmp_path: Path, monkeypatch):
+    conf, dy, _ = sau
+    from multipub._sau.runtime import Hooks
+
+    code_file = conf.verify_code_file()
+    code_file.write_text("000000", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def locked(self: Path, *a: Any, **k: Any) -> None:
+        if self == code_file:
+            raise PermissionError("文件被占用")
+        real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", locked)
+
+    def user_writes(path: Path) -> None:
+        path.write_text("246810", encoding="utf-8")
+
+    hooks = Hooks(sms_code_required=user_writes, sms_timeout=2, poll_interval=0.01)
+    v = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json", hooks=hooks)
+    page = FakePage({v.SMS_INPUT_SELECTOR: True, "text=验证": True})
+    assert await v._handle_sms_verification(page) is True
+    assert page.filled[v.SMS_INPUT_SELECTOR] == "246810"  # 不是残留的 000000
+
+    # 旧内容一直没变：不提交过期验证码，按超时处理
+    code_file.write_text("000000", encoding="utf-8")
+    v = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json",
+                       hooks=Hooks(sms_timeout=0.2, poll_interval=0.01, evidence_dir=tmp_path))
+    from multipub._sau.runtime import SmsCodeTimeout
+
+    with pytest.raises(SmsCodeTimeout):
+        await v._handle_sms_verification(FakePage({v.SMS_INPUT_SELECTOR: True}))
+
+
+async def test_sms_completed_in_headed_window(sau, tmp_path: Path):
+    """--headed：用户直接在窗口里输入验证码，弹窗关闭后继续发布，不再空等 sms_timeout。"""
+    conf, dy, _ = sau
+    sms_input = dy.DouYinBaseUploader.SMS_INPUT_SELECTOR
+    asked: list[Path] = []
+
+    def user_types_in_window(path: Path) -> None:
+        asked.append(path)
+        page.visible[sms_input] = False
+        page.visible["text=获取验证码"] = False
+
+    video = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json", headless=False,
+                           hooks=_fast_hooks(tmp_path, publish_timeout=10, sms_timeout=30,
+                                             sms_code_required=user_types_in_window))
+    page = FakePage({DY_PUBLISH: True})
+    publish_clicks = [0]
+
+    def on_publish(p: FakePage) -> None:
+        publish_clicks[0] += 1
+        if publish_clicks[0] == 1:
+            p.visible.update({sms_input: True, "text=获取验证码": True})
+        else:
+            p.succeeded = True
+
+    page.on_click[DY_PUBLISH] = on_publish
+    await video._publish_until_success(page, "视频", "**/manage**")
+    assert publish_clicks[0] == 2 and asked == [conf.verify_code_file()]
+    assert sms_input not in page.filled and video._sms_rounds == 1  # 没有往输入框里填任何东西
+
+    # 验证完成后页面自己重新提交了：不再补点（避免重复发布）
+    video = dy.DouYinVideo("t", "a.mp4", [], 0, "x.json", headless=False,
+                           hooks=_fast_hooks(tmp_path, publish_timeout=10, sms_timeout=30))
+
+    def resubmits(path: Path) -> None:
+        page.visible[sms_input] = False
+        req = FakeRequest(DY_CREATE)
+        page.emit("request", req)
+        page.emit("response", FakeResponse(req, {"status_code": 0, "item_id": "7400000000000000002"}))
+        page.succeeded = True
+
+    video.hooks.sms_code_required = resubmits
+    page = FakePage({DY_PUBLISH: True})
+    page.on_click[DY_PUBLISH] = lambda p: p.visible.update({sms_input: True})
+    await video._publish_until_success(page, "视频", "**/manage**")
+    assert page.clicks.count(DY_PUBLISH) == 1 and video.published_item_id == "7400000000000000002"
+
+
+def test_publish_guard_no_reclick_after_page_resubmits():
+    from multipub._sau.runtime import PublishGuard
+
+    g = PublishGuard(reclick_gap=0)
+    g.clicked()
+    g.request_sent()
+    g.request_done(False, "需要验证")
+    g.blocked_by_platform()  # 弹出短信验证：允许再点一次
+    assert g.may_click() and g.rejection is None
+    g.request_sent()  # 验证后页面（或用户）自己又提交了
+    g.request_done(None)
+    assert not g.may_click()
+    g.request_done(False, "需要验证")
+    g.clear_rejection()  # 弹出人机验证：之前的失败不算数，但也不额外允许再点
+    assert g.rejection_settled(0) is None and not g.may_click()
+
+
+# ------------------------------------------------------------------ 有头模式下的人机验证
+
+CAPTCHA = "text=请完成安全验证"
+
+
+def _captcha_after_click(page: FakePage) -> None:
+    req = FakeRequest(DY_CREATE)
+    page.emit("request", req)
+    page.emit("response", FakeResponse(req, {"status_code": 2190008, "status_msg": "需要完成验证"}))
+    page.visible[CAPTCHA] = True
+
+
+async def test_douyin_headed_captcha_waits_for_user(sau, tmp_path: Path):
+    import asyncio
+
+    _, dy, _ = sau
+    from multipub._sau.runtime import CaptchaRequired
+
+    note = dy.DouYinNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", headless=False,
+                         hooks=_fast_hooks(tmp_path, publish_timeout=10, reclick_gap=0.05))
+    page = FakePage({DY_PUBLISH: True})
+    page.on_click[DY_PUBLISH] = _captcha_after_click
+
+    async def user_solves() -> None:
+        await asyncio.sleep(0.6)  # 远超 reject_grace（0）：以前这里早就报「平台拒绝」了
+        page.visible[CAPTCHA] = False
+        page.succeeded = True
+
+    task = asyncio.ensure_future(user_solves())
+    await note._publish_until_success(page, "图文", "**/manage**")
+    await task
+    assert page.clicks.count(DY_PUBLISH) == 1  # 验证显示期间不点「发布」
+
+    # 无头模式：用户看不到窗口，照旧很快按人机验证报错（已点击发布 → unknown_outcome）
+    note = dy.DouYinNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", headless=True,
+                         hooks=_fast_hooks(tmp_path, publish_timeout=10))
+    page = FakePage({DY_PUBLISH: True})
+    page.on_click[DY_PUBLISH] = _captcha_after_click
+    with pytest.raises(CaptchaRequired) as info:
+        await note._publish_until_success(page, "图文", "**/manage**")
+    assert info.value.after_submit
+
+    # 有头模式下用户一直没完成：最多再等一个 publish_timeout，然后按人机验证报错
+    note = dy.DouYinNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", headless=False,
+                         hooks=_fast_hooks(tmp_path, publish_timeout=0.4, reclick_gap=0.01))
+    page = FakePage({DY_PUBLISH: True})
+    page.on_click[DY_PUBLISH] = _captcha_after_click
+    with pytest.raises(CaptchaRequired) as info:
+        await note._publish_until_success(page, "图文", "**/manage**")
+    assert info.value.after_submit and page.clicks.count(DY_PUBLISH) == 1
+
+
+async def test_xhs_headed_captcha_waits_for_user(sau, tmp_path: Path):
+    import asyncio
+
+    _, _, xhs = sau
+    note = xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", headless=False,
+                               hooks=_fast_hooks(tmp_path, publish_timeout=10, platform="xiaohongshu"))
+    page = FakePage({XHS_PUBLISH: True})
+
+    def captcha(p: FakePage) -> None:
+        req = FakeRequest(XHS_CREATE)
+        p.emit("request", req)
+        p.emit("response", FakeResponse(req, {"success": False, "code": -1, "msg": "请完成验证"}))
+        p.visible[".red-captcha"] = True
+
+    page.on_click[XHS_PUBLISH] = captcha
+
+    async def user_solves() -> None:
+        await asyncio.sleep(0.5)
+        page.visible[".red-captcha"] = False
+        page.succeeded = True
+
+    task = asyncio.ensure_future(user_solves())
+    await note._publish_until_success(page, "图文")
+    await task
+    assert page.clicks.count(XHS_PUBLISH) == 1
+
+
+# ------------------------------------------------------------------ 定时发布核实
+
+def _when() -> datetime:
+    return datetime(2026, 10, 23, 8, 5)
+
+
+DY_SCHEDULE = "[class^='radio']:has-text('定时发布')"
+DY_DATE = '.semi-input[placeholder="日期和时间"]'
+
+
+def _douyin_schedule_page(*, state: bool | None = False, click_works: bool = True, date_input: bool = True,
+                          typing_works: bool = True) -> FakePage:
+    page = FakePage({DY_SCHEDULE: True, DY_DATE: date_input})
+    page.attrs[(DY_SCHEDULE, "evaluate")] = state
+    page.attrs[(DY_DATE, "value")] = "2026-10-22 18:00"  # 页面默认时间
+    if click_works:
+        page.on_click[DY_SCHEDULE] = lambda p: p.attrs.__setitem__((DY_SCHEDULE, "evaluate"), True)
+    if not typing_works:
+        page.readonly.add(DY_DATE)
+    return page
+
+
+async def test_douyin_schedule_is_verified(sau, tmp_path: Path):
+    _, dy, _ = sau
+    from multipub._sau.runtime import ScheduleFailed
+
+    def note() -> Any:
+        return dy.DouYinNote(["1.jpg"], "正文", [], _when(), "x.json", title="标题",
+                             publish_strategy="scheduled", hooks=_fast_hooks(tmp_path))
+
+    page = _douyin_schedule_page()
+    await note().set_schedule_time_douyin(page, _when())
+    assert page.clicks[0] == DY_SCHEDULE and page.filled[DY_DATE] == "2026-10-23 08:05"
+    assert "Enter" in page.keyboard.pressed
+
+    page = _douyin_schedule_page(state=True)  # 已经是定时（如恢复的草稿）：不再点
+    await note().set_schedule_time_douyin(page, _when())
+    assert DY_SCHEDULE not in page.clicks
+
+    # 看不出选中状态：日期框出现且值正确就算设置上了
+    page = _douyin_schedule_page(state=None, click_works=False)
+    await note().set_schedule_time_douyin(page, _when())
+
+    bad_pages = {
+        "没有变成选中状态": _douyin_schedule_page(click_works=False),  # 点击被吞掉：以前会直接立即发布
+        "日期和时间」输入框": _douyin_schedule_page(state=None, click_works=False, date_input=False),
+        "应为「2026-10-23 08:05」": _douyin_schedule_page(typing_works=False),
+    }
+    for reason, page in bad_pages.items():
+        n = note()
+        with pytest.raises(ScheduleFailed) as info:
+            await n.set_schedule_time_douyin(page, _when())
+        assert reason in str(info.value) and "作品没有发出" in str(info.value)
+        assert not n._publish_clicked and n.publish_guard.clicks == 0
+    assert (tmp_path / "douyin-schedule.png").is_file()
+
+
+XHS_SWITCH = ".d-switch"
+XHS_DATE = ".d-datepicker-input-filter input.d-text"
+
+
+def _xhs_schedule_page(*, state: bool | None = False, click_works: bool = True, date_input: bool = True,
+                       fill_works: bool = True) -> FakePage:
+    page = FakePage({XHS_SWITCH: True})
+    page.attrs[(XHS_SWITCH, "evaluate")] = state
+    page.attrs[(XHS_DATE, "value")] = "2026-10-22 18:00"
+    if state:
+        page.visible[XHS_DATE] = date_input
+
+    def toggle(p: FakePage) -> None:
+        on = not p.attrs.get((XHS_SWITCH, "evaluate"))
+        if p.attrs[(XHS_SWITCH, "evaluate")] is not None:
+            p.attrs[(XHS_SWITCH, "evaluate")] = on
+        p.visible[XHS_DATE] = date_input and (on or p.attrs[(XHS_SWITCH, "evaluate")] is None)
+
+    if click_works:
+        page.on_click[XHS_SWITCH] = toggle
+    if not fill_works:
+        page.readonly.add(XHS_DATE)
+    return page
+
+
+async def test_xhs_schedule_is_verified(sau, tmp_path: Path):
+    _, _, xhs = sau
+    from multipub._sau.runtime import ScheduleFailed
+
+    def note() -> Any:
+        return xhs.XiaoHongShuNote(["1.jpg"], "正文", [], _when(), "x.json", title="标题",
+                                   publish_strategy="scheduled", hooks=_fast_hooks(tmp_path, platform="xiaohongshu"))
+
+    page = _xhs_schedule_page()
+    await note().set_schedule_time_xiaohongshu(page, _when())
+    assert page.clicks == [XHS_SWITCH] and page.filled[XHS_DATE] == "2026-10-23 08:05"
+    assert XHS_DATE in page.evaluated  # 失焦提交输入
+    assert "Enter" not in page.keyboard.pressed  # 不按回车（可能触发表单隐式提交）
+
+    page = _xhs_schedule_page(state=True)  # 开关已经打开：再点会把它关掉
+    await note().set_schedule_time_xiaohongshu(page, _when())
+    assert XHS_SWITCH not in page.clicks
+
+    page = _xhs_schedule_page(state=None)  # 看不出开关状态，日期框还没出现：照上游点一下
+    await note().set_schedule_time_xiaohongshu(page, _when())
+    assert page.clicks == [XHS_SWITCH]
+    page = _xhs_schedule_page(state=None)
+    page.visible[XHS_DATE] = True  # 看不出开关状态，但日期框已经在了：不点
+    await note().set_schedule_time_xiaohongshu(page, _when())
+    assert XHS_SWITCH not in page.clicks
+
+    for reason, page in {"没有打开": _xhs_schedule_page(click_works=False),
+                         "应为「2026-10-23 08:05」": _xhs_schedule_page(fill_works=False)}.items():
+        n = note()
+        with pytest.raises(ScheduleFailed) as info:
+            await n.set_schedule_time_xiaohongshu(page, _when())
+        assert reason in str(info.value) and "笔记没有发出" in str(info.value) and not n._publish_clicked
+    assert (tmp_path / "xiaohongshu-schedule.png").is_file()
+
+
+def test_schedule_value_matches():
+    from multipub._sau.runtime import schedule_value_matches
+
+    when = _when()
+    for ok in ("2026-10-23 08:05", "2026/10/23 8:05", "2026年10月23日 08:05", " 2026-10-23 08:05:00 "):
+        assert schedule_value_matches(ok, when), ok
+    for bad in ("", None, "2026-10-23 08:06", "2026-10-22 08:05", "08:05"):
+        assert not schedule_value_matches(bad, when), bad
+
+
+# ------------------------------------------------------------------ 小红书登录兜底
+
+XHS_LOGIN_BOX = "div[class*='login-box']"
+
+
+async def test_xhs_qrcode_fallback_screenshot(sau, tmp_path: Path):
+    _, _, xhs = sau
+    reported: list[dict[str, Any]] = []
+    page = FakePage({XHS_LOGIN_BOX: True})  # 登录框在，但切换按钮（哈希类名）和二维码都找不到
+    info = await xhs._save_xhs_qrcode(page, str(tmp_path / "acct.json"), qrcode_callback=reported.append)
+    assert info["fallback"] and Path(info["image_path"]).is_file() and reported == [info]
+    assert page.clicks == []  # 试过的切换方式都不存在
+
+    # 「扫码登录」文字可点：切到扫码面板
+    page = FakePage({XHS_LOGIN_BOX: True, "text=扫码登录": True})
+    page.on_click["text=扫码登录"] = lambda p: p.visible.__setitem__("div:has-text('扫一扫')", True)
+    assert await xhs._open_xhs_qrcode_panel(page) is True and page.clicks == ["text=扫码登录"]
+
+
+class _FakeContext:
+    def __init__(self, page: FakePage):
+        self.page, self.closed = page, False
+
+    async def add_init_script(self, **_: Any) -> None:
+        return None
+
+    async def new_page(self) -> FakePage:
+        return self.page
+
+    async def storage_state(self, path: str) -> None:
+        Path(path).write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeBrowser(_FakeContext):
+    async def new_context(self, **_: Any) -> _FakeContext:
+        return self.context
+
+
+def _fake_playwright(page: FakePage) -> tuple[Any, _FakeBrowser]:
+    browser = _FakeBrowser(page)
+    browser.context = _FakeContext(page)
+
+    class Chromium:
+        async def launch(self, **_: Any) -> _FakeBrowser:
+            return browser
+
+    class Manager:
+        chromium = Chromium()
+
+        async def __aenter__(self) -> "Manager":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None:
+            return None
+
+    return Manager, browser
+
+
+async def test_xhs_login_without_qrcode_still_waits_for_manual_login(sau, tmp_path: Path, monkeypatch):
+    """二维码定位不到时不再立刻失败关窗口：上报登录页截图，继续等用户在窗口里登录。"""
+    _, _, xhs = sau
+    page = FakePage({XHS_LOGIN_BOX: True})
+    manager, browser = _fake_playwright(page)
+    monkeypatch.setattr(xhs, "async_playwright", manager)
+
+    async def valid(path: str) -> bool:
+        return True
+
+    monkeypatch.setattr(xhs, "cookie_auth", valid)
+    reported: list[dict[str, Any]] = []
+    polls = [0]
+    real_check = xhs._is_xhs_login_completed
+
+    async def check(p: FakePage) -> bool:
+        polls[0] += 1
+        if polls[0] == 3:  # 用户在窗口里登录成功：离开登录页
+            p.url = "https://creator.xiaohongshu.com/new/home"
+            p.visible[XHS_LOGIN_BOX] = False
+        return await real_check(p)
+
+    monkeypatch.setattr(xhs, "_is_xhs_login_completed", check)
+    acct = tmp_path / "acct.json"
+    result = await xhs.xiaohongshu_cookie_gen(str(acct), qrcode_callback=reported.append,
+                                              poll_interval=0, max_checks=10, headless=False)
+    assert result["success"] and acct.is_file(), result
+    assert polls[0] == 3 and reported and reported[0]["fallback"]  # 一直轮询到用户登录成功
+    assert not Path(reported[0]["image_path"]).exists()  # 登录结束后清理截图
+    assert browser.closed and browser.context.closed
+
+
+def test_qrcode_relay_fallback_note(settings, tmp_path: Path):
+    shot = tmp_path / "page.png"
+    shot.write_bytes(b"\x89PNG page")
+    for headless, window_hint in ((True, False), (False, True)):
+        ctx, events = make_ctx(settings, "xiaohongshu", tmp_path, action="login")
+        ctx.headless = headless
+        callback, _ = bridge.qrcode_callback(ctx)
+        callback({"image_path": str(shot), "fallback": True})
+        note = events[-1]["note"]
+        assert "登录页截图" in note and ("浏览器窗口里扫码或登录" in note) is window_hint
+
+
 # ------------------------------------------------------------------ validate()
 
 def _future(hours: float = 3) -> datetime:
@@ -1230,6 +1724,7 @@ async def test_publish_prechecks_before_browser(settings, media: Path, tmp_path:
     ("UploadFailed", False, ("failed", ErrorCode.PLATFORM_ERROR, True)),
     ("PublishRejected", True, ("failed", ErrorCode.PLATFORM_ERROR, False)),
     ("DeclarationFailed", False, ("failed", ErrorCode.VALIDATION, False)),
+    ("ScheduleFailed", False, ("failed", ErrorCode.VALIDATION, False)),  # 定时没设上：发布前拒绝
     ("SmsVerifyFailed", False, ("needs_action", ErrorCode.SMS_CODE_REQUIRED, False)),
     ("SmsVerifyFailed", True, ("failed", ErrorCode.UNKNOWN_OUTCOME, False)),
 ])
@@ -1294,7 +1789,30 @@ def test_sau_timeouts_follow_job_timeout(settings, tmp_path: Path):
     assert hooks.upload_timeout == 6600
     hooks.sms_code_required(tmp_path / "verify_code.txt")
     need = [e for e in events if e["event"] == "needs_input"][-1]
-    assert need["kind"] == "sms_code" and "300 秒内有效" in need["message"]
+    assert need["kind"] == "sms_code" and "600 秒内有效" in need["message"]
+    assert hooks.sms_timeout == 600 and "浏览器窗口" not in need["message"]  # 无头：窗口里输入不了
+
+
+def test_sms_timeout_default_and_job_budget(settings, tmp_path: Path):
+    """默认等 600 秒（Claude Code 要先看到 needs_input 再去问用户）；但不超过任务剩下的时间。"""
+    from multipub._sau.runtime import Hooks
+
+    assert Hooks().sms_timeout == 600
+    assert bridge.sau_timeouts(settings, "douyin", Kind.NOTE)["sms_timeout"] == 600
+    settings.raw.setdefault("platforms", {})["douyin"] = {"sms_timeout": 120}  # config.toml 可调
+    assert bridge.sau_timeouts(settings, "douyin", Kind.NOTE)["sms_timeout"] == 120
+    del settings.raw["platforms"]["douyin"]
+
+    ctx, events = make_ctx(settings, "douyin", tmp_path)
+    ctx.timeout, ctx.headless = 400, False  # 任务只剩约 400 秒：再留 60 秒给提交后的发布
+    hooks = bridge.make_hooks(ctx, Kind.NOTE, sms_message="抖音要求短信验证")
+    hooks.sms_code_required(tmp_path / "verify_code.txt")
+    need = [e for e in events if e["event"] == "needs_input"][-1]
+    assert 330 <= hooks.sms_timeout <= 340 and f"{int(hooks.sms_timeout)} 秒内有效" in need["message"]
+    assert "浏览器窗口里输入验证码" in need["message"]  # --headed：也可以直接在窗口里输入
+    ctx.timeout = 30  # 几乎没时间了也至少给 60 秒
+    hooks.sms_code_required(tmp_path / "verify_code.txt")
+    assert hooks.sms_timeout == 60
 
 
 async def test_error_translation_validation_and_passthrough(settings, tmp_path: Path):
@@ -1438,3 +1956,30 @@ def test_worker_json_channel_with_douyin_validation_failure(home: Path, media: P
                    run_dir=settings.runs_dir / "t", post=post, timeout=60)
     assert r.status is Status.FAILED and r.error_code == "validation" and not r.submit_started
     json.dumps(r.to_dict())
+
+
+async def test_goto_resilient_retries_once_on_timeout():
+    from multipub._sau.runtime import goto_resilient
+
+    class PWTimeout(Exception):
+        pass
+
+    PWTimeout.__name__ = "TimeoutError"
+
+    class Page:
+        def __init__(self, fails):
+            self.fails, self.calls = fails, []
+
+        async def goto(self, url, **kw):
+            self.calls.append(kw)
+            if len(self.calls) <= self.fails:
+                raise PWTimeout("Timeout 60000ms exceeded")
+
+    ok = Page(fails=1)
+    await goto_resilient(ok, "https://example.com")
+    assert len(ok.calls) == 2 and all(c["wait_until"] == "domcontentloaded" for c in ok.calls)
+
+    bad = Page(fails=5)
+    with pytest.raises(PWTimeout):
+        await goto_resilient(bad, "https://example.com")
+    assert len(bad.calls) == 2

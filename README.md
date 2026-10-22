@@ -72,7 +72,7 @@ multipub 的知乎（接口发布）和 B站（biliup 投稿 + 动态）是自�
 
 ## Windows 快速开始
 
-需要 Windows 10/11、[Git](https://git-scm.com/download/win)。推荐在 [Windows Terminal](https://aka.ms/terminal) 的 PowerShell 里操作。
+需要 Windows 10/11、[Git](https://git-scm.com/download/win)；发 B站视频还需要 [VC++ 2015-2022 运行库（x64）](https://aka.ms/vs/17/release/vc_redist.x64.exe)（多数电脑已有，`mpub doctor` 会检查）。推荐在 [Windows Terminal](https://aka.ms/terminal) 的 PowerShell 里操作。
 更多细节（中文路径、国内镜像、用本机 Chrome、杀毒软件、计划任务）见 [docs/windows.md](docs/windows.md)。
 
 1. 安装 [uv](https://docs.astral.sh/uv/)（会顺便管理 Python，不需要单独装 Python）：

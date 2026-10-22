@@ -25,8 +25,9 @@ DEFAULT_TIMEOUTS: dict[str, int] = {
     "login": 300,
     "check": 180,
     "publish_video": 3600,
-    "publish_note": 900,
-    "publish_article": 900,
+    # 图文/文章：上传 + 抖音最长 10 分钟的短信验证码等待
+    "publish_note": 1800,
+    "publish_article": 1800,
 }
 
 

@@ -5,6 +5,8 @@
 - ``Hooks``：适配器注入的回调（即将点击「发布」、需要短信验证码、保存证据）与各阶段超时；
 - ``Deadline``：每个等待循环都带截止时间；
 - ``PublishGuard``：限制最终「发布」按钮的重复点击（上游每 3.5 秒点一次，可能重复发布）；
+- ``CaptchaWatch``：有头模式下页面出现人机验证时，等用户在窗口里完成，不点发布、不判被拒；
+- ``toggle_state()`` / ``input_value()`` / ``schedule_value_matches()``：核实定时发布的开关和时间确实设上了；
 - ``fail_step()`` / ``fail_rejected()``：超时或被拒后截图、判断卡在哪（登录页 / 人机验证 / 普通超时），
   再抛出对应异常；
 - ``save_state_quietly()`` / ``close_quietly()``：收尾步骤出错不改变发布结果；
@@ -15,8 +17,10 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NoReturn
 
@@ -73,9 +77,13 @@ class PublishRejected(SauError):
 
 
 class DeclarationFailed(SauError):
-    """调用方明确要求的设置（抖音自主声明、小红书来源转载、关闭头条同步）没能设置上，拒绝继续发布。
+    """调用方明确要求的设置（抖音自主声明、小红书来源转载、关闭头条同步、定时发布）没能设置上，拒绝继续发布。
 
     消息里已写明处理办法，适配器原样转成 validation 错误。"""
+
+
+class ScheduleFailed(DeclarationFailed):
+    """定时发布的开关/时间没能核实设置上（点击被吞掉会变成立即发布），在点击「发布」之前拒绝继续。"""
 
 
 # ---------------------------------------------------------------- hooks
@@ -92,7 +100,7 @@ class Hooks:
     page_timeout: float = 300  # 选好文件后等待进入发布表单页
     upload_timeout: float = 3000  # 等待视频/图片上传完成
     publish_timeout: float = 240  # 点击「发布」后等待成功跳转
-    sms_timeout: float = 300  # 等待用户提供短信验证码
+    sms_timeout: float = 600  # 等待用户提供短信验证码（Claude Code 要先看到 needs_input 再去问用户）
     poll_interval: float = 2.0  # 轮询间隔：验证码文件、抖音等发布表单出现
     reclick_gap: float = 20  # 上次点击「发布」没有任何反应时，至少隔这么久才再点
     max_publish_clicks: int = 3  # 最终「发布」按钮最多点几次（含被平台弹窗拦下的那次）
@@ -184,12 +192,18 @@ class PublishGuard:
         """平台弹窗拦下了上一次点击（短信验证 / 先设封面）：允许再点一次，之前的接口失败不算数。"""
         if self.clicks:
             self.unblocked = True
+        self.clear_rejection()
+
+    def clear_rejection(self) -> None:
+        """页面弹出了验证：之前的接口失败多半就是「需要验证」，不算数（不额外允许再点）。"""
         self.rejection = None
         self._rejected_at = None
 
     def request_sent(self) -> None:
         self.inflight += 1
         self.requests_since_click += 1
+        # 被拦下之后页面自己（或用户在窗口里）又提交了一次：不再替它补点
+        self.unblocked = False
 
     def request_done(self, ok: bool | None, message: str = "") -> None:
         """ok=True 成功回执；False 平台明确失败；None 结果不明（请求失败、响应解析不了）。"""
@@ -257,6 +271,65 @@ async def find_visible_text(page: Any, texts: list[str], *, exact: bool = False,
     return found if isinstance(found, str) else ""
 
 
+_TOGGLE_STATE_JS = """el => {
+    const nodes = [el, ...el.querySelectorAll('*')];
+    for (const attr of ['aria-checked', 'data-checked']) {
+        for (const n of nodes) {
+            const v = (n.getAttribute(attr) || '').toLowerCase();
+            if (v === 'true' || v === 'false') return v === 'true';
+        }
+    }
+    const box = el.matches('input[type=radio], input[type=checkbox]') ? el
+        : el.querySelector('input[type=radio], input[type=checkbox]');
+    if (box) return !!box.checked;
+    for (const n of nodes) {
+        for (const c of n.classList) {
+            const parts = c.toLowerCase().split(/[-_]+/);
+            if (parts.some(p => p === 'checked' || p === 'active' || p === 'selected')) return true;
+        }
+    }
+    return null;
+}"""
+
+
+async def toggle_state(locator: Any) -> bool | None:
+    """单选项 / 开关是否处于选中状态：True / False；页面结构判断不了时返回 None。
+
+    依次看 aria-checked、data-checked（抖音 label.radio-*）、内部原生 radio/checkbox、
+    类名里的 checked / active / selected 片段（只能证明「选中」，证明不了「没选中」）。
+    """
+    try:
+        if not await locator.count():
+            return None
+        state = await locator.evaluate(_TOGGLE_STATE_JS)
+    except Exception:  # noqa: BLE001 - 页面跳转中 locator 可能失效
+        return None
+    return state if isinstance(state, bool) else None
+
+
+async def input_value(locator: Any) -> str:
+    """输入框当前的值；选择器命中的是外层容器时读里面的 input；读不到返回 ""。"""
+    for read in (lambda: locator.input_value(timeout=3000),
+                 lambda: locator.locator("input").first.input_value(timeout=3000),
+                 lambda: locator.get_attribute("value")):
+        try:
+            value = await read()
+        except Exception:  # noqa: BLE001 - 不是 input 元素 / 页面跳转中
+            continue
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def schedule_value_matches(value: Any, when: datetime) -> bool:
+    """日期时间输入框显示的值是否就是 when（精确到分钟）。
+
+    只比较其中的数字（年 月 日 时 分），兼容「2026-10-23 08:05」「2026/10/23 8:05」「2026年10月23日 08:05」等写法。
+    """
+    nums = [int(n) for n in re.findall(r"\d+", str(value or ""))]
+    return nums[:5] == [when.year, when.month, when.day, when.hour, when.minute]
+
+
 # ---------------------------------------------------------------- evidence
 
 async def save_screenshot(page: Any, hooks: Hooks, name: str) -> str | None:
@@ -300,6 +373,42 @@ async def diagnose(page: Any) -> str:
     if await _any_visible(page, texts=LOGIN_TEXTS):
         return "login"
     return ""
+
+
+class CaptchaWatch:
+    """有头模式（--headed）下页面停在人机验证时，等用户在浏览器窗口里完成。
+
+    上游的发布循环照常点「发布」；发布接口明确失败后 15 秒（``reject_grace``）就判为被拒，
+    用户根本来不及拖滑块。这里：验证显示期间不点「发布」、之前的接口失败不算数；
+    第一次看到验证时把发布截止时间重置一次（用户最多有 ``publish_timeout`` 秒），之后照常超时。
+    无头模式下用户看不到窗口，行为不变（超时或被拒后按人机验证报错）。
+    """
+
+    def __init__(self, *, headless: bool, guard: PublishGuard, logger: Any = None):
+        self.headless = bool(headless)
+        self.guard = guard
+        self.log = logger or sau_logger
+        self.showing = False
+        self.extended = False
+
+    async def blocking(self, page: Any, deadline: Deadline) -> bool:
+        """页面正显示人机验证（且是有头模式）时返回 True：调用方本轮不点「发布」，稍后再看。"""
+        if self.headless or page is None:
+            return False
+        if await diagnose(page) != "captcha":
+            if self.showing:
+                self.showing = False
+                self.log.info("人机验证已消失，继续等待发布结果")
+            return False
+        self.guard.clear_rejection()
+        if not self.showing:
+            self.showing = True
+            if not self.extended:
+                self.extended = True
+                deadline.reset()
+            self.log.warning(f"页面出现人机验证：请在浏览器窗口里完成，最多等 {int(deadline.remaining())} 秒"
+                             "（验证期间不会点「发布」）")
+        return True
 
 
 async def fail_step(page: Any, hooks: Hooks, deadline: Deadline, *, after_submit: bool,
@@ -355,3 +464,19 @@ async def close_quietly(*targets: Any) -> None:
             await target.close()
         except Exception as exc:  # noqa: BLE001
             sau_logger.warning(f"关闭浏览器出错（忽略）: {exc!r}")
+
+
+async def goto_resilient(page: Any, url: str, *, timeout_ms: int = 60_000, attempts: int = 2) -> None:
+    """multipub patch: 打开页面只等 DOM 就绪（不等统计脚本等资源的 load 事件），慢网络下超时重试一次。
+
+    上游多处 page.goto(url) 用默认的 load + 30 秒，国内外慢网络下抖音/小红书首页经常等不到 load。
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            return
+        except Exception as exc:  # noqa: BLE001 - patchright TimeoutError 不是内置 TimeoutError
+            if attempt >= attempts or "Timeout" not in type(exc).__name__ + str(exc):
+                raise
+            sau_logger.warning(f"打开 {url} 超时，重试一次")
+

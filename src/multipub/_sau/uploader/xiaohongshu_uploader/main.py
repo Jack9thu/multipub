@@ -17,9 +17,10 @@ from patchright.async_api import async_playwright
 # multipub patch: 包内绝对导入；conf 由 multipub._sau.conf.configure() 预先设置
 from multipub._sau import conf as sau_conf
 from multipub._sau.conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
-from multipub._sau.runtime import (CookieInvalid, Deadline, DeclarationFailed, Hooks, SauError, close_quietly,
-                                   fail_rejected, fail_step, find_visible_text, publish_button_ready,
-                                   save_screenshot, save_state_quietly)
+from multipub._sau.runtime import (CaptchaWatch, goto_resilient, CookieInvalid, Deadline, DeclarationFailed, Hooks, SauError,
+                                   ScheduleFailed, close_quietly, fail_rejected, fail_step, find_visible_text,
+                                   input_value, publish_button_ready, save_screenshot, save_state_quietly,
+                                   schedule_value_matches, toggle_state)
 from multipub._sau.uploader.base_video import BaseVideoUploader
 from multipub._sau.utils.base_social_media import set_init_script
 from multipub._sau.utils.login_qrcode import build_login_qrcode_path
@@ -104,18 +105,38 @@ def _build_login_result(
     }
 
 
-async def _open_xhs_qrcode_panel(page: Page) -> None:
+async def _open_xhs_qrcode_panel(page: Page) -> bool:
+    """切到扫码登录面板，返回是否切到了。
+
+    multipub patch: 尽力而为——上游只认哈希类名的切换图标（img.css-wemwzq），找不到就抛错、登录直接失败并关掉窗口。
+    现在依次试切换图标、「扫码登录」文字；都不行返回 False，由调用方上报整页截图并照常等待登录。
+    """
     login_box = page.locator(XHS_LOGIN_BOX_SELECTOR).first
-    await login_box.wait_for(state="visible", timeout=30000)
+    try:
+        await login_box.wait_for(state="visible", timeout=30000)
+    except Exception:
+        xiaohongshu_logger.warning(_msg("😵", "没等到小红书登录框，可能是页面改版"))
+        return False
 
     scan_text = login_box.locator("div:has-text('扫一扫')").first
     if await scan_text.count():
-        return
+        return True
 
-    switch_img = login_box.locator(XHS_LOGIN_SWITCH_SELECTOR).first
-    await switch_img.wait_for(state="visible", timeout=10000)
-    await switch_img.click()
-    await login_box.locator("div:has-text('扫一扫')").first.wait_for(state="visible", timeout=10000)
+    switches = (
+        (login_box.locator(XHS_LOGIN_SWITCH_SELECTOR).first, 10000),
+        (page.get_by_text("扫码登录", exact=True).first, 3000),
+        (page.get_by_text("APP扫一扫登录").first, 3000),
+    )
+    for switch, wait_ms in switches:
+        try:
+            await switch.wait_for(state="visible", timeout=wait_ms)
+            await switch.click(timeout=5000)
+            await scan_text.wait_for(state="visible", timeout=10000)
+            return True
+        except Exception:
+            continue
+    xiaohongshu_logger.warning(_msg("😵", "没能切到扫码登录面板（切换按钮可能改版了）"))
+    return False
 
 
 async def _find_xhs_qrcode_locator(page: Page):
@@ -138,21 +159,48 @@ async def _extract_xhs_qrcode_src(page: Page) -> str:
     return qrcode_src
 
 
+async def _save_xhs_login_page(
+    page: Page,
+    account_file: str,
+    previous_qrcode_path: Path | None = None,
+    qrcode_callback=None,
+) -> dict:
+    """multipub patch: 定位不到二维码时，把登录页截图当作二维码图片上报（payload 带 fallback: True）。"""
+    fallback_path = build_login_qrcode_path(account_file, suffix="xhs_login_page")
+    try:
+        fallback_path.parent.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(path=str(fallback_path))
+    except Exception as exc:
+        xiaohongshu_logger.warning(_msg("😵", f"登录页截图失败: {exc!r}"))
+        return {"image_path": "", "image_data_url": ""}
+    if previous_qrcode_path and previous_qrcode_path != fallback_path:
+        remove_qrcode_file(previous_qrcode_path)
+    qrcode_info = {"image_path": str(fallback_path), "image_data_url": "", "fallback": True}
+    await _emit_qrcode_callback(qrcode_callback, qrcode_info)
+    return qrcode_info
+
+
 async def _save_xhs_qrcode(
     page: Page,
     account_file: str,
     previous_qrcode_path: Path | None = None,
     qrcode_callback=None,
 ) -> dict:
-    qrcode_src = await _extract_xhs_qrcode_src(page)
+    # multipub patch: 定位不到二维码不再是致命错误：上报登录页截图，调用方照常等待登录完成
+    # （有头模式下可以直接在窗口里扫码，或改用手机号登录）
     qrcode_path = build_login_qrcode_path(account_file, suffix="xhs_login_qrcode")
-    qrcode_img = await _find_xhs_qrcode_locator(page)
-
-    if qrcode_src.startswith("data:image/"):
-        save_data_url_image(qrcode_src, qrcode_path)
-    else:
-        qrcode_path.parent.mkdir(parents=True, exist_ok=True)
-        await qrcode_img.screenshot(path=str(qrcode_path))
+    try:
+        qrcode_src = await _extract_xhs_qrcode_src(page)
+        qrcode_img = await _find_xhs_qrcode_locator(page)
+        if qrcode_src.startswith("data:image/"):
+            save_data_url_image(qrcode_src, qrcode_path)
+        else:
+            qrcode_path.parent.mkdir(parents=True, exist_ok=True)
+            await qrcode_img.screenshot(path=str(qrcode_path))
+    except Exception as exc:
+        xiaohongshu_logger.warning(_msg("😵", f"没定位到二维码（{str(exc)[:60]}）——上报登录页截图；"
+                                             "也可以直接在弹出的浏览器里扫码或登录，小人继续等登录完成"))
+        return await _save_xhs_login_page(page, account_file, previous_qrcode_path, qrcode_callback)
 
     if previous_qrcode_path and previous_qrcode_path != qrcode_path:
         if remove_qrcode_file(previous_qrcode_path):
@@ -198,11 +246,9 @@ async def cookie_auth(account_file):
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
             page = await context.new_page()
-            await page.goto(
-                _build_xhs_creator_url(
-                    "/publish/publish?from=homepage&target=video"
-                )
-            )
+            await goto_resilient(page, _build_xhs_creator_url(  # multipub patch: 慢网络
+                "/publish/publish?from=homepage&target=video"
+            ))
             await page.wait_for_timeout(3000)
 
             if page.url.startswith(_build_xhs_creator_url("/login")):
@@ -277,9 +323,10 @@ async def xiaohongshu_cookie_gen(
         result = _build_login_result(False, "failed", "小红书登录失败", account_file)
         try:
             page = await context.new_page()
-            await page.goto(_build_xhs_creator_url("/login"))
+            await goto_resilient(page, _build_xhs_creator_url("/login"))  # multipub patch: 慢网络
             qrcode_info = await _save_xhs_qrcode(page, account_file, qrcode_callback=qrcode_callback)
-            qrcode_path = Path(qrcode_info["image_path"])
+            # multipub patch: 兜底截图也可能失败（image_path 为空）：仍然等用户在窗口里登录
+            qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
             xiaohongshu_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
 
             for _ in range(max_checks):
@@ -351,6 +398,7 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         self.publish_api_error: str | None = None
         self.declaration_warnings: list[str] = []  # 没能自动完成的声明，适配器写进结果消息
         self._response_tasks: set = set()
+        self._captcha = CaptchaWatch(headless=headless, guard=self.publish_guard, logger=xiaohongshu_logger)
 
     def _before_publish_click(self) -> None:
         """multipub patch: 第一次点击最终「发布」之前通知适配器（对应 ctx.mark_submit_started）。"""
@@ -463,7 +511,8 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
 
     async def _publish_until_success(self, page: Page, what: str) -> None:
         """上游的发布循环（multipub patch: 带截止时间；视频/图文共用；
-        发布按钮只经 _click_publish 点击：PublishGuard 限制重复点击，第一次点击前通知适配器）。"""
+        发布按钮只经 _click_publish 点击：PublishGuard 限制重复点击，第一次点击前通知适配器；
+        有头模式下等用户完成人机验证：CaptchaWatch）。"""
         self._watch_publish_response(page)
         deadline = Deadline(self.hooks.publish_timeout, f"等待{what}发布成功")
         while True:
@@ -471,6 +520,10 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                 await fail_step(page, self.hooks, deadline, after_submit=self._publish_clicked,
                                 detail=self._publish_detail())
             try:
+                # multipub patch: 有头模式下页面停在人机验证：等用户在窗口里完成，期间不点「发布」、不判被拒
+                if await self._captcha.blocking(page, deadline):
+                    await asyncio.sleep(self.hooks.poll_interval)
+                    continue
                 publish_button = await self._publish_button(page)
                 if await publish_button.count():
                     await self._click_publish(publish_button)
@@ -508,14 +561,67 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         else:
             self.publish_date = 0
 
+    SCHEDULE_SWITCH_SELECTOR = ".d-switch"  # 在含「定时发布」的 .custom-switch-card 里（上游选择器）
+    SCHEDULE_INPUT_SELECTORS = (".d-datepicker-input-filter input.d-text", 'input[placeholder*="日期和时间"]')
+
     async def set_schedule_time_xiaohongshu(self, page: Page, publish_date: datetime):
+        """上游：点「定时发布」开关 → 往日期框里 fill 时间。
+
+        multipub patch: 上游不管开关原来的状态（已经打开时会把它点关），也不核实结果；开关没打开时
+        发布按钮不叫「定时发布」会一直等到超时，时间没填进去则会按页面默认时间定时。现在：开关已打开就不点；
+        填完时间后让输入框失焦以提交（不按回车：输入框若在 form 里，回车会触发隐式提交），再核实开关已打开、
+        框里的值就是要求的时间（精确到分钟）；否则截图并抛 ScheduleFailed——还没点「发布」，笔记不会发出。
+        """
+        want = publish_date.strftime("%Y-%m-%d %H:%M")
         xiaohongshu_logger.info(_msg("🕒", f"小人准备设置定时发布时间: {publish_date.strftime(self.date_format)}"))
-        await page.locator('.custom-switch-card').filter(has_text="定时发布").locator('.d-switch').click()
-        await asyncio.sleep(1)
-        publish_date_hour = publish_date.strftime("%Y-%m-%d %H:%M")
-        time_input = page.locator('.d-datepicker-input-filter input.d-text')
-        await time_input.fill(str(publish_date_hour))
-        await asyncio.sleep(1)
+        switch = page.locator('.custom-switch-card').filter(has_text="定时发布").locator(self.SCHEDULE_SWITCH_SELECTOR).first
+        if not await switch.count():
+            await self._schedule_failed(page, "页面上找不到「定时发布」开关")
+        state = await toggle_state(switch)
+        if state is None and await self._schedule_input(page, timeout=1000) is not None:
+            state = True  # 看不出开关状态，但日期框已经在了：当作已打开，不再点（再点会把它关掉）
+        if state is not True:
+            await switch.click()
+            await page.wait_for_timeout(1000)
+        if await toggle_state(switch) is False:
+            await self._schedule_failed(page, "点了「定时发布」开关，但它没有打开")
+
+        time_input = await self._schedule_input(page)
+        if time_input is None:
+            await self._schedule_failed(page, "没有出现定时发布的日期时间输入框")
+        await time_input.fill(want)
+        try:
+            await time_input.evaluate("el => { el.dispatchEvent(new Event('change', {bubbles: true})); el.blur(); }")
+        except Exception:
+            pass
+        await page.wait_for_timeout(1000)
+
+        value = await input_value(time_input)
+        if await toggle_state(switch) is False:
+            await self._schedule_failed(page, "「定时发布」开关又关上了")
+        if not schedule_value_matches(value, publish_date):
+            await self._schedule_failed(page, f"日期时间框显示「{value or '空'}」，应为「{want}」")
+        xiaohongshu_logger.success(_msg("🕒", f"定时发布已设置并核实: {want}"))
+
+    async def _schedule_input(self, page: Page, timeout: float = 8000):
+        """multipub patch: 定时发布的日期时间输入框（打开开关后才出现）；没有出现返回 None。"""
+        for selector in self.SCHEDULE_INPUT_SELECTORS:
+            loc = page.locator(selector).first
+            try:
+                await loc.wait_for(state="visible", timeout=timeout)
+                return loc
+            except Exception:
+                timeout = min(timeout, 1000)
+        return None
+
+    async def _schedule_failed(self, page: Page, reason: str):
+        """multipub patch: 定时没能核实：截图后拒绝继续（还没点「发布」）。"""
+        shot = await save_screenshot(page, self.hooks, "schedule")
+        xiaohongshu_logger.error(_msg("😵", f"定时发布没能设置上：{reason}" + (f"；截图: {shot}" if shot else "")))
+        raise ScheduleFailed(
+            f"定时发布没能设置上（{reason}），拒绝继续发布，笔记没有发出。"
+            "可以直接重试；仍失败时去掉 schedule、到时间再发，或在网页上手动定时发布"
+        )
 
     async def set_location(self, page: Page, location: str = "青岛市"):
         if not location:
@@ -913,7 +1019,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         publish_url = _build_xhs_creator_url(
             "/publish/publish?from=homepage&target=video"
         )
-        await page.goto(publish_url)
+        await goto_resilient(page, publish_url)  # multipub patch: 慢网络
         await page.wait_for_url(publish_url)
         await page.locator("div[class^='upload-content'] input[class='upload-input']").set_input_files(self.file_path)
 
@@ -1065,7 +1171,7 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         publish_url = _build_xhs_creator_url(
             "/publish/publish?from=homepage&target=image"
         )
-        await page.goto(publish_url)
+        await goto_resilient(page, publish_url)  # multipub patch: 慢网络
         await page.wait_for_url(publish_url)
 
         upload_input = page.locator('input[type="file"][accept*="image"]').first

@@ -67,6 +67,36 @@ def settings(home: Path):
     return s
 
 
+REAL_PROBE = bb.probe_binary
+
+
+@pytest.fixture(autouse=True)
+def biliup_starts(monkeypatch):
+    """测试里的「biliup」都是假文件，跑不了 `--version`：默认当作能启动。
+    要测真实试运行的用例用 monkeypatch.setattr(bb, "probe_binary", REAL_PROBE) 换回来。"""
+    bb._PROBE_OK.clear()
+    monkeypatch.setattr(bb, "probe_binary", lambda path, timeout=bb.PROBE_TIMEOUT: bb.Probe(True, "v1.3.1", 0))
+    yield
+    bb._PROBE_OK.clear()
+
+
+DLL_NOT_FOUND = 3221225781  # 0xC0000135，Windows 上 Python 拿到的是无符号值
+
+
+def fake_subprocess_run(monkeypatch, returncode: int, stdout: bytes = b"", stderr: bytes = b""
+                        ) -> list[tuple[list[str], dict[str, Any]]]:
+    """让 probe_binary 里的 subprocess.run 返回给定退出码（模拟 Windows 的加载器错误）。"""
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def run(args, **kw):
+        calls.append((list(args), kw))
+        return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+    monkeypatch.setattr(bb, "probe_binary", REAL_PROBE)
+    monkeypatch.setattr(bb.subprocess, "run", run)
+    return calls
+
+
 def make_ctx(settings, action: str = "publish", account: str = "main") -> tuple[JobContext, list[dict]]:
     events: list[dict] = []
     ctx = JobContext(settings=settings, platform="bilibili", account=account, action=action,
@@ -353,6 +383,155 @@ def test_install_network_error_and_biliup_path(settings, monkeypatch):
     settings.biliup_path = str(custom)
     assert bb.install(settings)["ok"]
     assert bb.find_biliup(settings) == custom
+
+
+# ------------------------------------------------------------------ biliup 能否启动（VC++ 运行库）
+
+def test_startup_failure_hint():
+    for rc in (DLL_NOT_FOUND, -1073741515):  # 无符号 / 有符号两种写法
+        hint = bb.startup_failure_hint(rc)
+        assert hint and "VCRUNTIME140.dll" in hint and "https://aka.ms/vs/17/release/vc_redist.x64.exe" in hint
+    for rc in (0xC000007B, 0xC0000139):
+        hint = bb.startup_failure_hint(rc)
+        assert hint and "vc_redist.x64.exe" in hint and f"0x{rc:08X}" in hint
+    for rc in (None, 0, 1, 2, 101, -9, 0xC0000005):  # 普通失败、被信号杀、崩溃：不是「起不来」
+        assert bb.startup_failure_hint(rc) is None
+
+
+def test_probe_binary_real_subprocess(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(bb, "probe_binary", REAL_PROBE)
+    # 用 Python 解释器当「biliup」：`python --version` 输出 Python 3.x.y、退出码 0
+    probe = bb.probe_binary(Path(sys.executable))
+    assert probe.ok and probe.version and probe.version.startswith("v3.") and probe.returncode == 0
+    # 不是可执行文件：OSError，不抛出
+    junk = tmp_path / "biliup.exe"
+    junk.write_bytes(b"FAKE-EXE")
+    junk.chmod(0o755)
+    probe = bb.probe_binary(junk)
+    assert not probe.ok and "无法运行 biliup" in probe.detail and not probe.timed_out
+    probe = bb.probe_binary(tmp_path / "不存在.exe")
+    assert not probe.ok and "无法运行 biliup" in probe.detail
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="用 sh 脚本模拟")
+def test_probe_binary_nonzero_exit_script(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(bb, "probe_binary", REAL_PROBE)
+    script = tmp_path / "biliup"
+    script.write_text("#!/bin/sh\necho \"args: $*\"\necho 'error: unexpected argument' >&2\nexit 2\n")
+    script.chmod(0o755)
+    probe = bb.probe_binary(script)
+    assert not probe.ok and probe.returncode == 2
+    assert "退出码 2" in probe.detail and "args: --version" in probe.detail and "unexpected argument" in probe.detail
+
+
+def test_probe_binary_dll_not_found_and_timeout(tmp_path: Path, monkeypatch):
+    exe = tmp_path / "biliup.exe"
+    exe.write_bytes(b"x")
+    calls = fake_subprocess_run(monkeypatch, DLL_NOT_FOUND)
+    probe = bb.probe_binary(exe)
+    assert not probe.ok and probe.returncode == DLL_NOT_FOUND and not probe.timed_out
+    assert "VCRUNTIME140.dll" in probe.detail and "vc_redist.x64.exe" in probe.detail
+    # 只会带 --version 运行（不带参数的 biliup 会启动 Web 服务）；stdin 关掉，不等输入
+    args, kw = calls[0]
+    assert args == [str(exe), "--version"] and kw["stdin"] is subprocess.DEVNULL and kw["timeout"] > 0
+
+    def hang(args, **kw):
+        raise subprocess.TimeoutExpired(args, kw["timeout"])
+
+    monkeypatch.setattr(bb.subprocess, "run", hang)
+    probe = bb.probe_binary(exe, timeout=5)
+    assert not probe.ok and probe.timed_out and "5 秒" in probe.detail
+
+
+def test_probe_cached_only_caches_success(tmp_path: Path, monkeypatch):
+    exe = tmp_path / "biliup.exe"
+    exe.write_bytes(b"x")
+    results = [bb.Probe(False, detail="坏"), bb.Probe(True, "v1.3.1", 0)]
+    seen: list[Path] = []
+
+    def probe(path, timeout=bb.PROBE_TIMEOUT):
+        seen.append(path)
+        return results[min(len(seen), len(results)) - 1]
+
+    monkeypatch.setattr(bb, "probe_binary", probe)
+    assert not bb.probe_cached(exe).ok  # 失败不缓存
+    assert bb.probe_cached(exe).ok and bb.probe_cached(exe).ok
+    assert len(seen) == 2
+    exe.write_bytes(b"xy")  # 文件换了：重新试
+    assert bb.probe_cached(exe).ok and len(seen) == 3
+
+
+def test_quiet_error_mode_windows(monkeypatch):
+    """Windows 上启动 biliup 期间关掉系统的「找不到 DLL」弹框（子进程继承错误模式），结束后恢复。"""
+    log: list[tuple[str, int]] = []
+
+    class K32:
+        mode = 0x8000
+
+        def GetErrorMode(self):
+            return self.mode
+
+        def SetErrorMode(self, mode):
+            log.append(("set", mode))
+            old, self.mode = self.mode, mode
+            return old
+
+    k32 = K32()
+    monkeypatch.setattr(bb, "_kernel32", lambda: k32)
+    monkeypatch.setattr(bb.sys, "platform", "win32")
+    with bb.quiet_error_mode():
+        assert k32.mode == 0x8000 | bb.SEM_FAILCRITICALERRORS | bb.SEM_NOGPFAULTERRORBOX
+    assert k32.mode == 0x8000 and len(log) == 2
+    with pytest.raises(RuntimeError), bb.quiet_error_mode():  # 出异常也恢复
+        raise RuntimeError
+    assert k32.mode == 0x8000
+    monkeypatch.setattr(bb.sys, "platform", "linux")
+    with bb.quiet_error_mode():
+        pass
+    assert len(log) == 4  # 其他系统什么都不做
+
+
+def test_install_and_doctor_report_missing_vcruntime(settings, monkeypatch):
+    """Windows 版 biliup.exe 依赖 VCRUNTIME140.dll：文件和 sha256 都对也可能起不来，doctor / setup 要报出来。"""
+    monkeypatch.setattr(bb, "normalize_platform", lambda s=None, m=None: ("windows", "x86_64"))
+    settings.biliup_version = "v9.9.9"
+    payload = _zip_bytes({"biliupR-v9.9.9-x86_64-windows/biliup.exe": b"FAKE-EXE"})
+    calls = fake_subprocess_run(monkeypatch, DLL_NOT_FOUND)
+    item = bb.install(settings, transport=_serve(payload, []), log=lambda m: None)
+    assert not item["ok"]
+    assert "VCRUNTIME140.dll" in item["detail"] and "https://aka.ms/vs/17/release/vc_redist.x64.exe" in item["detail"]
+    exe = settings.tools_dir / "biliup" / "v9.9.9" / "biliup.exe"
+    assert exe.is_file() and "不用重新下载" in item["detail"]  # 文件保留
+    doctor = bb.doctor_items(settings)[0]
+    assert not doctor["ok"] and "VCRUNTIME140.dll" in doctor["detail"] and str(exe) in doctor["detail"]
+    assert all(args == [str(exe), "--version"] for args, _ in calls) and len(calls) == 2
+    # 装好运行库之后：doctor 通过，setup 不重新下载
+    fake_subprocess_run(monkeypatch, 0, stdout=b"biliup-cli 9.9.9\n")
+
+    def boom(request):
+        raise AssertionError("不应联网")
+
+    assert bb.doctor_items(settings)[0]["ok"]
+    assert bb.install(settings, transport=httpx.MockTransport(boom))["ok"]
+    # biliup_path 指向的也一样
+    custom = settings.home / "biliup.exe"
+    custom.write_bytes(b"x")
+    settings.biliup_path = str(custom)
+    assert "v9.9.9" in bb.doctor_items(settings)[0]["detail"]
+    fake_subprocess_run(monkeypatch, -1073741515)
+    doctor = bb.doctor_items(settings)[0]
+    assert not doctor["ok"] and "VCRUNTIME140.dll" in doctor["detail"] and "biliup_path" in doctor["detail"]
+    item = bb.install(settings)
+    assert not item["ok"] and "VCRUNTIME140.dll" in item["detail"] and "重新下载" not in item["detail"]
+
+
+async def test_renew_reports_startup_failure(tmp_path: Path, monkeypatch):
+    async def run(args, *, cwd, timeout, on_line=None, heartbeat=30):
+        return DLL_NOT_FOUND, []
+
+    monkeypatch.setattr(bb, "run_streaming", run)
+    ok, tail = await bb.renew(tmp_path / "biliup.exe", tmp_path / "main.json", cwd=tmp_path)
+    assert not ok and "VCRUNTIME140.dll" in tail
 
 
 # ------------------------------------------------------------------ biliup 参数与输出
@@ -675,6 +854,65 @@ async def test_publish_video_through_worker(video_env, media: Path, monkeypatch)
     assert result.status is Status.FAILED and result.error_code == "platform_error"
     assert result.submit_started and not result.retryable
     assert "尚未投稿" in result.message and "--force" not in result.message
+
+
+async def test_publish_video_preflight_blocks_before_submit(video_env, media: Path, monkeypatch, fake_bili):
+    """biliup 起不来（缺 VC++ 运行库）：标记 submit_started 之前就报错，不启动上传、不算已投稿。"""
+    calls: list[Any] = []
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, calls))
+    probes = fake_subprocess_run(monkeypatch, DLL_NOT_FOUND)
+    ctx, events = make_ctx(video_env)
+    with pytest.raises(PublishError) as info:
+        await BilibiliAdapter(ctx).publish(video_post(media))
+    exc = info.value
+    assert exc.code is ErrorCode.INTERNAL and not exc.retryable
+    assert "VCRUNTIME140.dll" in str(exc) and "vc_redist.x64.exe" in str(exc) and "尚未投稿" in str(exc)
+    assert not ctx.submit_started and not calls and "submit_started" not in [e["event"] for e in events]
+    assert probes[0][0] == [video_env.biliup_path, "--version"]
+    assert not fake_bili.by_path("/x/passport-login/oauth2/info")  # 也没去做令牌预检
+
+    # --version 卡住（杀毒软件扫描等）：timeout、可重试、没开始投稿
+    def hang(args, **kw):
+        raise subprocess.TimeoutExpired(args, kw["timeout"])
+
+    monkeypatch.setattr(bb.subprocess, "run", hang)
+    ctx2, _ = make_ctx(video_env)
+    with pytest.raises(PublishError) as info:
+        await BilibiliAdapter(ctx2).publish(video_post(media))
+    assert info.value.code is ErrorCode.TIMEOUT and info.value.retryable and not ctx2.submit_started and not calls
+
+    # 能启动：同一进程里第二次发布不再试运行
+    ok_probes = fake_subprocess_run(monkeypatch, 0, stdout=b"biliup-cli 1.3.1\n")
+    for _ in range(2):
+        ctx3, _ = make_ctx(video_env)
+        assert (await BilibiliAdapter(ctx3).publish(video_post(media))).status is Status.SUBMITTED
+    assert len(calls) == 2 and len(ok_probes) == 1
+
+
+async def test_publish_video_preflight_through_worker(video_env, media: Path, monkeypatch):
+    from multipub.worker import run_job
+
+    calls: list[Any] = []
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, calls))
+    fake_subprocess_run(monkeypatch, DLL_NOT_FOUND)
+    job = {"action": "publish", "platform": "bilibili", "account": "main", "home": str(video_env.home),
+           "headless": True, "run_dir": str(video_env.runs_dir / "w"), "post": video_post(media).to_dict()}
+    result = await run_job(job, emit=lambda e: None)
+    assert result.status is Status.FAILED and result.error_code == "internal"
+    assert not result.submit_started and not calls
+    assert "VCRUNTIME140.dll" in result.message and "https://aka.ms/vs/17/release/vc_redist.x64.exe" in result.message
+
+
+@pytest.mark.parametrize("rc", [DLL_NOT_FOUND, -1073741515])
+async def test_publish_video_startup_failure_exit_code(video_env, media: Path, monkeypatch, rc):
+    """试运行通过但真正上传时 biliup 起不来（退出码 0xC0000135、没有输出）：给出运行库提示和「尚未投稿」。"""
+    monkeypatch.setattr(bb, "run_streaming", fake_run([], rc, []))
+    ctx, _ = make_ctx(video_env)
+    with pytest.raises(PublishError) as info:
+        await BilibiliAdapter(ctx).publish(video_post(media))
+    exc = info.value
+    assert exc.code is ErrorCode.INTERNAL and "VCRUNTIME140.dll" in str(exc) and "尚未投稿" in str(exc)
+    assert ctx.submit_started  # 已经启动过 biliup，按约定不自动重试
 
 
 async def test_publish_video_requires_login_and_biliup(settings, media: Path):
@@ -1103,6 +1341,18 @@ def test_interactive_login_requires_tty(settings, monkeypatch, capsys):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
     assert BilibiliAdapter.run_interactive_login(settings, "main") == 2
     assert "login" in capsys.readouterr().err
+
+
+def test_interactive_login_reports_missing_vcruntime(settings, monkeypatch, capsys):
+    fake = settings.home / "biliup-fake.exe"
+    fake.write_bytes(b"")
+    settings.biliup_path = str(fake)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    calls = fake_subprocess_run(monkeypatch, DLL_NOT_FOUND)
+    assert BilibiliAdapter.run_interactive_login(settings, "main") == 1
+    assert "VCRUNTIME140.dll" in capsys.readouterr().err
+    assert [args for args, _ in calls] == [[str(fake), "--version"]]  # 没有启动 login
 
 
 # ------------------------------------------------------------------ 浏览器模式的纯逻辑部分

@@ -125,9 +125,9 @@ uv run mpub publish posts/<名字> --yes --json
   - 抖音扫码后可能要求短信二次验证，只能在弹出的浏览器窗口里完成，所以抖音登录不要加 `--headless`。
   - 结束后 JSON `{"ok", "result"}`，`result.status: ok` 即成功；然后重发该平台。
 - **`sms_code_required`**（抖音）：发布中途等短信验证码超时或验证码错误。`submit_started: false` 时可以重新发布，
-  这次一看到 `needs_input` 就向用户要验证码；`true` 时先去抖音后台确认。
+  这次一看到 `needs_input` 就向用户要验证码（或加 `--headed`，让用户直接在弹出的窗口里输入）；`true` 时先去抖音后台确认。
 - **`captcha`**：平台弹了人机验证。把 `message`（以及 `url`，如果有）转告用户。`submit_started: false` 时，加 `--headed` 重发，
-  请用户在弹出的窗口里手动完成验证；否则先去后台确认。
+  请用户在弹出的窗口里手动完成验证（点发布之后出现的验证，multipub 也会在窗口里等用户完成）；否则先去后台确认。
 - **`risk_control`**：被风控。把 `message` 和 `url`（验证页地址）转告用户。知乎：验证要在带着 multipub 登录态的浏览器里完成，
   所以运行 `uv run mpub login zhihu --account <账号>`（会弹窗并直接打开验证页，完成后自动保存），然后再发；
   在用户自己的浏览器里打开那个地址不一定有效。B站：HTTP 模式（`mode: http`）被拦就去掉它改用默认浏览器模式；
@@ -139,7 +139,8 @@ uv run mpub publish posts/<名字> --yes --json
   不要替用户选，也不要为了绕开弹窗改用定时或 HTTP 模式。
 - **`unknown_outcome`**：已点发布但没拿到确定结果。**不要重试**，请用户去平台后台确认；确认没发出、用户要求再发时才用 `--force`。
 - **`timeout`** / **`platform_error`** / **`internal`** / **`validation`**：看 `message`。`submit_started: false` 且 `retryable: true` 可以在用户同意后重发；
-  缺 biliup → `uv run mpub setup`；「正被另一个任务使用」→ 等前一个任务结束；`validation` → 改清单后重新 validate。
+  缺 biliup → `uv run mpub setup`；缺 VC++ 运行库 → 请用户安装（见 doctor 提示）；「正被另一个任务使用」→ 等前一个任务结束；
+  `validation` → 改清单后重新 validate。定时/声明没能在页面上设置成功也是 `validation`，此时作品没有发出，可以安全重发。
 
 ## 其他常用
 
