@@ -80,6 +80,7 @@ platforms:
 | `github_mirror`（全局） | 空 | 下载 biliup 时拼在 GitHub URL 前，例如 `https://ghfast.top/` |
 | `[timeouts] publish_video` | 3600 | 单次视频发布总超时（`--timeout` 优先）。biliup 的期限 = worker 的总超时（此值 − 30 秒）− 发布前准备已用的时间 − 30 秒，到点被杀掉并给出明确结果 |
 | `confirm_dynamic_rules` | `false` | `true`：阅读过 [《动态发布规范》](https://t.bilibili.com/h5/dynamic/specification) 后，允许 multipub 在浏览器模式里代为确认该弹窗（对所有账号生效） |
+| `publish_wait` | `60` | 图文浏览器模式：点「发布」后等发布接口结果的秒数（至少 10）。到点没结果 → `unknown_outcome` |
 
 ## biliup 的安装与校验（`mpub setup` / `mpub doctor`）
 
@@ -119,14 +120,32 @@ platforms:
   `0xC000007B` / `0xC0000138` / `0xC0000139`（运行库损坏、装成 32 位或太旧）提示重新安装同一个包。
   运行 biliup 时会临时打开 `SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX`（子进程继承），缺 DLL 时不弹系统对话框卡住无人值守任务，直接拿到退出码。
 
-### 电脑上已经装了 biliup
+### biliup 从哪来：你来选
 
-- multipub **不会自动使用** PATH 里的 biliup，也不会动它：`mpub setup` 照常把固定版本下载到
-  `<数据目录>\tools\biliup\<版本>\`，两份互不影响。`mpub doctor` 发现 PATH 里有 biliup 时会提示。
-- 想用已有的那份：config.toml 里 `[platforms.bilibili] biliup_path = 'D:\tools\biliup\biliup.exe'`，
-  之后 `mpub setup` 不再下载。上传参数是按 v1.3.1 核对的（已用真实二进制验证），版本差太多可能不认某些参数。
+三种方式，选一次就记住（记在 `<数据目录>\tools\biliup\selected.json`，不改你的 config.toml）：
+
+| 方式 | 命令 | 说明 |
+|---|---|---|
+| 直接给路径 | `mpub biliup use "D:\tools\biliup\biliup.exe"` | 也可以给所在目录；检查不兼容会拒绝（`--force` 强行使用） |
+| 让软件在本机找 | `mpub biliup find` 列出候选 → `mpub biliup use <编号>`；或 `mpub biliup use --auto` | `--auto` 每次自动挑兼容的：优先 v1.3.1，其次最新 |
+| 下载固定版本 | `mpub biliup use --download` → `mpub setup` | v1.3.1，内置 sha256 校验 |
+
+- `mpub biliup status`：现在用哪一个、来源、版本、能不能用。`mpub doctor` 的 `bilibili.biliup` 一项也会显示。
+- **自动查找的位置**：PATH（`biliup` / `biliupR`）、social-auto-upload 的工具目录
+  `%USERPROFILE%\.social-auto-upload\tools\biliup\<系统-架构>\`、「下载」文件夹（及其中 `biliup*` 开头的解压目录）、
+  当前目录、multipub 下载过的各个版本。
+- **兼容性**不只看版本号：运行 `biliup --version`、`biliup --help`、`biliup upload --help`（纯本地、不联网），
+  确认 `-u`、`--title --desc --tid --tag --copyright` 都在。清单里用到的可选参数（定时 `--dtime`、`--line`、
+  `--submit` 等）在发布前再核对一次，缺了就在**上传之前**报错（尚未投稿），不会传一半才失败。
+  不认识全局 `--rust-log` 的旧版本会自动去掉这个参数。
+- **`mpub setup` 没选过来源时**：在终端里运行会列出本机找到的 biliup 并问你选哪种；非交互运行（脚本、Claude Code）
+  不会擅自下载，`--json` 里 `bilibili.biliup` 一项带 `needs_choice: true` 和 `candidates`，用
+  `mpub setup --biliup auto|download|<路径>` 回答。已经下载过固定版本的，不选也照常用它。
+- config.toml 的 `[platforms.bilibili] biliup_path` 仍然有效，而且优先级最高。
+- 输出解析（BV 号、上传完成、投稿成功）是按 v1.3.1 核对的；其他版本会在启动 biliup 前就标记「已提交」，保守处理。
 - 以前用 biliup 登录得到的 `cookies.json` 可以直接复用（格式相同）：复制成
   `<数据目录>\accounts\bilibili\<账号>.json`，再 `mpub check bilibili --account <账号>` 确认有效。
+  `mpub biliup find` 发现 biliup 旁边有 `cookies.json` 时会提示（不会自动复制登录信息）。
 
 ## validate() 检查的限制
 
@@ -148,7 +167,7 @@ platforms:
 | 视频定时 | 晚于现在 ≥2 小时、≤15 天；不足 2.5 小时给 warning（上传耗时会吃掉余量） | error / warning |
 | 动态标题 | ≤20 字 | error |
 | 动态正文 | 正文 + 追加的 `#标签#` ≤1000 字（超过时网页会弹「转为专栏」） | error |
-| 动态图片 | ≤9 张（至少 1 张由通用检查保证）；jpg/jpeg/png/gif；单张 ≤20MB | error |
+| 动态图片 | ≤9 张（至少 1 张由通用检查保证）；jpg/jpeg/png/gif；单张小于 20MB、GIF 小于 8MB（与发布框的本地校验一致；发布框还要求宽高 ≥10 像素，这一条在传图时由页面报错） | error |
 | 动态定时 | 晚于现在 ≥5 分钟、≤7 天（发布器日期控件的范围）；不足 10 分钟给 warning | error / warning |
 | `mode` / `pic_mode` | `browser`/`http`；0/1 | error |
 | `confirm_rules` / `tags_in_text` | 必须是 true/false | error |
@@ -175,6 +194,8 @@ mpub login bilibili --account main
 - 结果写成 biliup 的 `cookies.json` 格式：`<数据目录>/accounts/bilibili/<账号>.json`
   （`cookie_info` / `sso` / `token_info` / `platform: "BiliTV"`），UTF-8 **无 BOM**（biliup 的 serde_json 不认 BOM）、
   原子替换、POSIX 下权限 600。视频（biliup `-u`）和图文（内存里转成浏览器 cookie）共用这一份。
+  自己复制 / 编辑进来的文件开头带 BOM 时（PowerShell 5 `Set-Content -Encoding UTF8` 等），每次读取登录文件时会原样去掉 BOM
+  并记一条警告——否则 `check` 显示已登录，biliup 上传却报看不懂的 `expected value at line 1 column 1`（真实 biliup v1.3.1 实测）。
 - 已有有效登录（nav 已登录 **且** biliup 令牌校验通过）时 `login` 直接返回「无需重新扫码」；要换号先删除该文件。
   只要其中一项不通过就重新扫码，避免「发布说要登录、登录说已登录」的死循环。
 - **备选：biliup 交互式登录**。需要真实终端（Windows Terminal 等）：
@@ -223,7 +244,11 @@ mpub login bilibili --account main
 2. 拼命令：`biliup --rust-log info -u <登录文件> upload --title=… --desc=… --tid=… --tag=… --copyright=… [...] -- <视频>`。
    全局参数写在子命令前；字符串参数都用 `--opt=value` 形式，避免以 `-` 开头的标题被当成参数；`--` 之后才是视频路径。
    设置 `NO_COLOR=1`，输出里残留的 ANSI 码也会被剥掉。
-3. **启动 biliup 前调用 `mark_submit_started()`**（上传和投稿是一条命令）。之后的任何失败都不会自动重试。
+3. **标记 submit_started**：上传和投稿是一条命令，但 biliup 只在视频全部传完之后才发投稿请求。
+   试运行得到的版本是输出格式核对过的 v1.3.1 时，**读到 biliup 自己的 `Upload completed:` / `All files uploaded successfully`
+   日志（或投稿模块的日志）那一刻**才调用 `mark_submit_started()`——此时投稿请求还没发出。
+   所以上传途中 Ctrl+C / 被杀 / 超时 / 出错都记为「尚未触发发布」，查重不会拦住下一次；传完之后再中断才是「结果未知」。
+   `biliup_path` 指向其他版本时输出格式没核对过，保守起见在启动 biliup 前就标记。之后的任何失败都不会自动重试。
 4. 逐行读取 stdout+stderr：全部写入 worker 日志；`user:`、`Upload completed`、`投稿成功`、错误行低频转发；
    60 秒没有输出时发一条「上传中……已用时 N 分钟」。到期（见上面 config.toml 的 `publish_video`）杀进程，
    这样总是由适配器给出精确的结果，而不是被 worker 的总超时打断成笼统的「超时，结果未知」。
@@ -234,6 +259,9 @@ mpub login bilibili --account main
      只有完全没有投稿响应时，才看投稿模块自己的 `APP接口投稿成功` / `Web 接口投稿成功` / `BCUT接口投稿成功`（整条消息完全匹配）。
    - 上传完成：biliup 自己的日志消息以 `Upload completed:` / `All files uploaded successfully` 开头。
    - 登录错误：只看错误报告和 WARN/ERROR 日志。
+   - 失败原因：biliup 出错时打印 error-stack 报告（`Error: …`、各层 `├─▶ …`，后面跟十几行 `at …` / backtrace）。
+     结果消息只取报告标题和各层原因（如 `error sending request → tcp connect error → Network is unreachable`），
+     不再把输出末尾的 backtrace 当成原因。
    - biliup 会回显视频文件名 / 路径（`pre_upload: {"name":…}`、`Upload completed: <文件>`、`file <路径>`），
      这些标记都按行首的级别、target 和固定前缀锚定；匹配登录错误和投稿响应前还会把视频 / 封面 / 登录文件路径和标题抹掉。
      所以文件名叫「第一次投稿成功.mp4」也不会被误判成已投稿。
@@ -245,15 +273,15 @@ mpub login bilibili --account main
 | biliup 退出码 0 但没解析到结果 | `submitted` | 无链接，提示去创作中心确认 |
 | 投稿接口返回服务端错误码 -500/-502/-503/-504 | `failed` / `unknown_outcome` | 稿件可能已建好，先去创作中心确认 |
 | 视频已传完（看到 `Upload completed` / `All files uploaded successfully`）后失败或超时 | `failed` / `unknown_outcome` | 先去创作中心确认，不要重发 |
-| 上传阶段失败 / 超时（还没传完） | `failed` / `platform_error` 或 `timeout` | 尚未投稿；因为已标记 submit_started，`retryable` 为 false，不会自动重试，需人确认后再发 |
+| 上传阶段失败 / 超时 / 被中断（还没传完） | `failed` / `platform_error` 或 `timeout` | 尚未投稿，没有标记 submit_started（v1.3.1），查重不拦，处理后直接重发 |
 | 发布前准备用掉了太多时间，剩余不足 60 秒 | `failed` / `timeout` | 没有启动 biliup、没有标记 submit_started |
 | 试运行 `biliup --version` 失败（缺 VC++ 运行库等） / 超时 | `failed` / `internal` / `timeout` | 没有启动上传、没有标记 submit_started；消息里有处理办法 |
-| 启动上传时 biliup 起不来（退出码 0xC0000135 等，没传完） | `failed` / `internal` | 带 VC++ 运行库提示，尚未投稿；已标记 submit_started，不自动重试 |
+| 启动上传时 biliup 起不来（退出码 0xC0000135 等，没传完） | `failed` / `internal` | 带 VC++ 运行库提示，尚未投稿 |
 | 输出里是登录错误（`credential validation failed`、`账号未登录` 等）且没传完 | `needs_action` / `login_required` | 重新登录 |
 
-> 取舍：按约定在启动 biliup 前就标记 submit_started，所以「上传阶段就失败」的结果也带 `submit_started: true`，
-> 不会被自动重试。错误消息里会写明「尚未投稿」；查重只拦截 `published` / `submitted` / `scheduled` 和
-> `unknown_outcome`，所以确认后直接重发即可（消息里提到的 `--force` 不是必需的）。
+> 取舍：看到「上传完成」才标记依赖 biliup 的日志格式，所以只对核对过的 v1.3.1 这样做；其他版本仍在启动前标记
+> （「上传阶段就失败」也带 `submit_started: true`，错误消息里写明「尚未投稿」，查重只拦截 `published` / `submitted` /
+> `scheduled` 和 `unknown_outcome`，确认后直接重发即可）。
 
 ### 图文（动态）
 
@@ -262,12 +290,16 @@ mpub login bilibili --account main
 
 **浏览器模式（默认）**：patchright 打开 `https://t.bilibili.com/`（`--headed` 可看到窗口）：
 
-1. 等 `.bili-dyn-publishing`；被重定向到 passport 或看到登录按钮 → `login_required`。
+1. 打开页面的响应是 HTTP 412（整页风控）→ 立即 `needs_action`（`risk_control`）。等 `.bili-dyn-publishing`（最多 30 秒），
+   期间被重定向到 passport → 立即 `login_required`；页头的登录按钮持续 8 秒且没有发布框 → `login_required`；
+   出现风控页文字 → `risk_control`。都不用干等 30 秒。
    接着检查《动态发布规范》的同意状态（见下文），无头且未同意时在这一步就停下。
 2. 标题填 `input.bili-dyn-publishing__title__input` 并回读校验；正文点击 `.bili-dyn-publishing__input [contenteditable]`
    后逐行 `insert_text`（行间按 Enter），回读首行校验。
-3. 点图片工具 `.bili-dyn-publishing__tools__item.pic`，点 `.bili-pics-uploader__add` 触发文件选择框
-   （上传控件是脚本动态创建的 `<input type=file>`，不在 DOM 里），`set_files`。
+3. 点图片工具 `.bili-dyn-publishing__tools__item.pic`。线上发布框在图片面板出现且还没有图片时会**自己立刻弹出**文件选择框
+   （PicsUploader 的 `visibleState` 监听），所以整个选图阶段都先挂上 `filechooser` 监听再操作：用这个自动弹出的选择框
+   `set_files`；没有自动弹出（3 秒内）再点 `.bili-pics-uploader__add`。上传控件是脚本动态创建的 `<input type=file multiple>`，
+   不在 DOM 里；单选时一张一张选。不接管的话，有头模式（`--headed`）下会冒出系统的「打开」对话框，人可能在里面再选一遍图。
    以监听到的 `upload_bfs` 成功响应数为准等待全部传完（60 秒 + 每张 30 秒）；出现 `.bili-pics-uploader-item-error` 立即失败。
 4. 定时 / AI 声明 / 图片排版：发布器的日期时间选择器、级联菜单是自绘组件，没有稳定的 DOM 可点，
    改为在页面主 world 里找到发布器的 Vue 2 组件（元素上的 `__vue__`）直接设置
@@ -277,7 +309,7 @@ mpub login bilibili --account main
    没有标记 submit_started，什么都没发）；可改用 `mode: http`，或在 `platforms.bilibili` 下设 `ai_generated: false`。
    图片排版设不上只告警（写进结果消息）。点击前再次确认定时仍晚于现在 5.5 分钟（否则发布器会弹「直接发布？」）。
 5. 等「发布」按钮 `.bili-dyn-publishing__action.launcher` 可用，**调用 `mark_submit_started()` 后点击**。
-6. 监听 `/x/dynamic/feed/create/submit_check` 与 `/x/dynamic/feed/create/dyn` 的响应（60 秒）：
+6. 监听 `/x/dynamic/feed/create/submit_check` 与 `/x/dynamic/feed/create/dyn` 的响应（`publish_wait`，默认 60 秒）：
    create/dyn `code 0` → `data.dyn_id_str`；submit_check 非 0 → 明确失败（发布请求未发出；-101 → `login_required`）。
    等待期间：
    - 极验验证码（`.geetest_panel` / `.geetest_box` / geetest iframe）：无头时，发布请求还没发出 → `needs_action`（`captcha`）；
@@ -338,9 +370,10 @@ mpub login bilibili --account main
 | `code 4126021` | `failed` / `platform_error` | 账号没绑定手机，不能发动态 |
 | `code -101` / `-111` | `needs_action` / `login_required` | 重新登录 |
 | 412 / `-352` | `needs_action` / `risk_control` | 浏览器模式里出现时，请先到动态页确认再用 `--headed` 重试 |
-| 发布请求网络错误 / 非 JSON / 服务端错误码 -500/-502/-503/-504 / 60 秒无结果 / 成功但没有 id | `failed` / `unknown_outcome` | 先到动态页确认，不要直接重发 |
+| 发布请求网络错误 / 非 JSON / 服务端错误码 -500/-502/-503/-504 / `publish_wait` 秒内无结果 / 成功但没有 id | `failed` / `unknown_outcome` | 先到动态页确认，不要直接重发 |
 | 传图失败、submit_check 不通过 | `failed` / `platform_error` | 发布请求没有发出 |
 | 浏览器模式未同意《动态发布规范》（无头） | `needs_action` / `consent_required` | 发布前就停下，什么都没发；见「动态发布规范」 |
+| 浏览器模式打开动态页就是 412 风控页 | `needs_action` / `risk_control` | 什么都没发；稍后再试 |
 | 浏览器模式要求 AI 声明但设不上 / 定时设不上 | `failed` / `validation`、`platform_error` | 点发布之前就停下，什么都没发 |
 | 浏览器模式出现验证码（无头） | `needs_action` / `captcha`；发布请求已发出时 `failed` / `unknown_outcome` | 前者没发出，加 `--headed` 重发；后者先到动态页确认 |
 | 定时 / AI 声明 / 排版与实际提交的不一致 | 按实际提交的报 `published` / `scheduled` | 消息里有「注意：…」 |
@@ -379,7 +412,7 @@ mpub login bilibili --account main
 | buvid | `GET /x/frontend/finger/spi` → `data.b_3` / `b_4` | 高 |
 | 视频创作声明 | `--extra-fields '{"creation_statement":{"id":1}}'`（来自 OmniPost，B站侧字段名未确认） | 低 |
 | 动态发布框 | `.bili-dyn-publishing`、`input.bili-dyn-publishing__title__input`、`.bili-dyn-publishing__input [contenteditable]` | 中 |
-| 图片上传 | `.bili-dyn-publishing__tools__item.pic`、`.bili-pics-uploader__add` + 文件选择框、`.bili-pics-uploader-item-error(__msg)` | 中 |
+| 图片上传 | `.bili-dyn-publishing__tools__item.pic`、`.bili-pics-uploader__add` + 文件选择框、`.bili-pics-uploader-item-error(__msg)`；点图片工具后发布框自己弹出选择框（线上脚本 PicsUploader 的 `visibleState` 监听，`multiple`） | 中 |
 | 发布按钮 | `.bili-dyn-publishing__action.launcher`（禁用时带 `disabled` 类） | 中 |
 | 定时 / AI 声明 / 排版 | 主 world 里改 Vue 组件状态：`tools.timingSetting{visible,active,data.datetime}`、`creationOption{list,value}`、`picModeOption.value` | 中低 |
 | 发布结果 | 监听 `/x/dynamic/feed/create/dyn` 响应 `data.dyn_id_str`；`/create/submit_check` 预检查 | 中高 |

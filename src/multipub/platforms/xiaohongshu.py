@@ -43,6 +43,10 @@ class XiaohongshuAdapter(PlatformAdapter):
                 c.warn("title", "未填标题，将使用正文前 20 字作为标题")
         # SAU 会静默截断到 20 字，这里直接报错
         c.length("title", post.title, TITLE_MAX, what="小红书标题")
+        utf16 = len(post.title.encode("utf-16-le")) // 2
+        if len(post.title) <= TITLE_MAX < utf16:
+            c.warn("title", f"标题里有 emoji 等字符，按网页的算法是 {utf16} 个字（emoji 算 2 个）；"
+                            "标题框若因此截断标题，会拒绝发布（笔记不会发出），建议缩短")
         c.length("body", post.body, BODY_MAX, what="小红书正文")
         tags_text = "".join(f"#{t} " for t in post.tags)
         if len(post.body) <= BODY_MAX < len(post.body) + len(tags_text):

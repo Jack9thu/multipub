@@ -291,6 +291,23 @@ def test_markdown_missing_image_and_zhimg_passthrough():
     assert zm.collect_image_urls("![a](x.png) ![b](x.png) ![c](https://e.com/y.gif)") == ["x.png", "https://e.com/y.gif"]
 
 
+def test_obsidian_embeds_and_unparsed_image_syntax():
+    """Markdown 认不出来、会原样当文字发出去的图片写法：Obsidian ![[图.png]]、路径带空格的 ![](a b.png)。"""
+    md = ("前 ![[山顶 全景.png|300]] 后\n\n![说明](图片/我的 图.png \"标题\") 和 ![[另一篇笔记]] ![x](a b.txt)\n\n"
+          "`![[代码.png]]`\n\n```\n![[块.png]]\n```\n\n**![[粗体里.jpg]]** ![ok](<c d.png>) ![[sub/图.webp#x]]")
+    assert zm.collect_image_refs(md) == [("山顶 全景.png", "embed"), ("图片/我的 图.png", "loose"),
+                                         ("粗体里.jpg", "embed"), ("c%20d.png", "md"), ("sub/图.webp", "embed")]
+    assert zm.unrecognized_images(md) == ["![[另一篇笔记]]", "![x](a b.txt)"]
+    images = {ref: zimg(str(i)) for i, ref in enumerate(zm.collect_image_urls(md))}
+    html = zm.render_article(md, images)
+    assert html.count('<img src="https://picx.zhimg.com/') == 5
+    assert '<p>前 <img src="https://picx.zhimg.com/v2-0.jpg" data-caption=""' in html
+    assert 'data-caption="说明"' in html and "<b><img " in html
+    assert "<code>![[代码.png]]</code>" in html and "<pre lang=\"\">![[块.png]]</pre>" in html
+    assert "![[另一篇笔记]]" in html  # 认不出来的原样保留（validate 会报错拦下）
+    assert zm.render_article("a & b ![[x.png]] <c>", {"x.png": zimg("x")}).startswith("<p>a &amp; b <img ")
+
+
 def test_html_helpers():
     assert zm.with_ext("https://picx.zhimg.com/v2-abc", "png") == "https://picx.zhimg.com/v2-abc.png"
     assert zm.with_ext("https://picx.zhimg.com/v2-abc.jpg", "png") == "https://picx.zhimg.com/v2-abc.jpg"
@@ -965,6 +982,86 @@ async def test_login_with_pending_verify_checks_api_first(env, settings, monkeyp
     assert calls[-1] == (None, "") and not verify.exists()
 
 
+async def test_login_without_xsrf_refreshes_cookies_without_scan(env, settings, monkeypatch):
+    """只有 z_c0 的登录文件：/me 正常但写接口会被拒。login 不能说「已登录」了事，要带着现有登录态打开首页补齐。"""
+    ctx, _, fake = env
+    ctx.action = "login"
+    account = settings.account_file("zhihu", "main")
+    account.write_text(json.dumps({"z_c0": Z_C0, "d_c0": "d"}), encoding="utf-8")  # 手写的 {name: value}
+    calls: list[tuple[Any, str, dict]] = []
+
+    async def fake_browser(self, state, verify_url, **kw):
+        calls.append((state, verify_url, kw))
+        return storage_state()
+
+    monkeypatch.setattr(ZhihuAdapter, "_browser_login", fake_browser)
+    result = await ZhihuAdapter(ctx).login()
+    assert result.status is Status.OK and "没拿到 _xsrf" not in result.message, result
+    state, url, kw = calls[0]
+    assert url == za.WWW_HOME and kw == {"refresh": True}
+    # 手写的 cookie 也转成了浏览器能用的 storage_state
+    z = next(c for c in state["cookies"] if c["name"] == "z_c0")
+    assert z == {"name": "z_c0", "value": Z_C0, "domain": ".zhihu.com", "path": "/", "expires": -1,
+                 "httpOnly": False, "secure": False, "sameSite": "Lax"}
+
+    # 浏览器那边也没拿到 _xsrf：登录结果里说清楚，下次再运行一次 login 补齐
+    async def no_xsrf_browser(self, state, verify_url, **kw):
+        return storage_state(with_xsrf=False)
+
+    monkeypatch.setattr(ZhihuAdapter, "_browser_login", no_xsrf_browser)
+    account.write_text(json.dumps(storage_state(with_xsrf=False)), encoding="utf-8")
+    result = await ZhihuAdapter(ctx).login()
+    assert result.status is Status.OK and "没拿到 _xsrf" in result.message and "不用重新扫码" in result.message
+
+
+async def test_check_warns_without_xsrf(settings, fake):
+    write_state(settings.account_file("zhihu", "main"), storage_state(with_xsrf=False))
+    ctx, _ = make_ctx(settings, action="check")
+    result = await ZhihuAdapter(ctx).check()
+    assert result.status is Status.OK and "没有 _xsrf" in result.message and "mpub login zhihu" in result.message
+
+
+def test_browser_state_formats(settings):
+    adapter = ZhihuAdapter(make_ctx(settings, action="login")[0])
+    account = settings.account_file("zhihu", "main")
+    account.parent.mkdir(parents=True, exist_ok=True)
+    assert adapter._browser_state() is None
+    state = storage_state()
+    write_state(account, state)
+    assert adapter._browser_state() == state  # patchright 自己的格式原样用
+    exported = [{"domain": ".zhihu.com", "expirationDate": 1900000000.5, "hostOnly": False, "httpOnly": True,
+                 "name": "z_c0", "path": "/", "sameSite": "no_restriction", "secure": True, "value": Z_C0}]
+    write_state(account, exported)  # 浏览器插件导出的列表
+    converted = adapter._browser_state()
+    assert converted["cookies"] == [{"name": "z_c0", "value": Z_C0, "domain": ".zhihu.com", "path": "/",
+                                     "expires": 1900000000.5, "httpOnly": False, "secure": True, "sameSite": "Lax"}]
+    write_state(account, {"cookies": exported})  # 外层是 storage_state、里面是插件格式
+    assert adapter._browser_state()["cookies"][0]["sameSite"] == "Lax"
+    account.write_text("{坏的", encoding="utf-8")
+    assert adapter._browser_state() is None
+
+
+async def test_write_rejected_without_xsrf_asks_for_login(settings, fake):
+    """登录文件里没有 _xsrf 时写接口 403：提示用 mpub login 补齐（login_required），而不是笼统的平台错误。"""
+    fake.overrides[("POST", "zhuanlan.zhihu.com", "/api/articles/drafts")] = httpx.Response(
+        403, json={"error": {"code": 10002, "message": "请求参数异常"}})
+    async with za.make_client(za.normalize_cookies({"z_c0": Z_C0}), transport=httpx.MockTransport(fake)) as client:
+        api = za.ZhihuApi(client, account="main", write_interval=0)
+        with pytest.raises(LoginRequired, match="没有 _xsrf.*mpub login zhihu --account main"):
+            await api.create_article_draft("t")
+    async with za.make_client(za.normalize_cookies({"z_c0": Z_C0, "_xsrf": XSRF}),
+                              transport=httpx.MockTransport(fake)) as client:
+        api = za.ZhihuApi(client, account="main", write_interval=0)
+        with pytest.raises(PublishError) as info:  # 有 _xsrf 还被 403：照常是平台拒绝
+            await api.create_article_draft("t")
+        assert not isinstance(info.value, NeedsAction) and "请求参数异常" in str(info.value)
+    fake.overrides[("POST", "zhuanlan.zhihu.com", "/api/articles/drafts")] = httpx.Response(
+        403, json={"error": {"code": 40352, "redirect": RISK_REDIRECT}})
+    async with za.make_client(za.normalize_cookies({"z_c0": Z_C0}), transport=httpx.MockTransport(fake)) as client:
+        with pytest.raises(za.RiskControl):  # 风控照旧是风控
+            await za.ZhihuApi(client, account="main", write_interval=0).create_article_draft("t")
+
+
 def test_login_wait_follows_job_timeout(settings):
     ctx, _ = make_ctx(settings, action="login")
     adapter = ZhihuAdapter(ctx)
@@ -1022,8 +1119,12 @@ async def test_browser_logged_in_rules(settings):
     unhuman = "https://www.zhihu.com" + RISK_REDIRECT
     assert not await adapter._browser_logged_in(_FakeContext(z), _FakePage(unhuman), "Z")
     assert await adapter._browser_logged_in(_FakeContext(z), _FakePage("https://www.zhihu.com/"), "Z")
-    with pytest.raises(PublishError, match="关闭"):
-        await adapter._browser_logged_in(_FakeContext(z), _FakePage("x", closed=True), None)
+    # 扫完码马上关掉窗口：cookie 还在上下文里，算登录成功
+    assert await adapter._browser_logged_in(_FakeContext(z), _FakePage("x", closed=True), None)
+    with pytest.raises(PublishError, match="关闭"):  # 还没扫码就关了
+        await adapter._browser_logged_in(_FakeContext([]), _FakePage("x", closed=True), None)
+    with pytest.raises(PublishError, match="关闭"):  # 验证没完成就关了
+        await adapter._browser_logged_in(_FakeContext(z), _FakePage("x", closed=True), "Z")
 
 
 HEADLESS_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1076,6 +1177,8 @@ class _LoginContext:
 
     async def cookies(self, url: str) -> list[dict[str, str]]:
         self.polls += 1
+        if za.WWW_HOME in self.page.gotos:  # 打开首页后才有 _xsrf
+            return [{"name": "z_c0", "value": "NEW"}, {"name": "_xsrf", "value": XSRF}]
         return [{"name": "z_c0", "value": "NEW"}] if self.polls >= 3 else []
 
     async def storage_state(self) -> dict[str, Any]:
@@ -1109,7 +1212,7 @@ async def test_browser_login_flow_with_fake_browser(settings, fake, monkeypatch)
     result = await ZhihuAdapter(ctx).login()  # 还没有登录文件：开干净的浏览器
 
     assert result.status is Status.OK and "登录成功：测试用户" in result.message
-    assert opened == [(True, None)] and browser.polls == 3
+    assert opened == [(True, None)] and browser.polls == 4  # 3 次等扫码 + 打开首页后确认有 _xsrf
     assert browser.page.gotos == [za.SIGNIN_URL, za.WWW_HOME]  # 登录后再开一次首页补 cookie
     assert "response" in browser.page.handlers  # 拦截二维码接口
     qr = [e for e in events if e["event"] == "qrcode"]
@@ -1257,6 +1360,13 @@ def test_validate_article_rules(media: Path):
     assert any("以 statement 为准" in w for w in warns) and any("只存草稿时" in w for w in warns)
 
 
+    (media / "content" / "article.md").write_text(
+        "![[图.png]]\n\n![[另一篇笔记]]\n\n![[没有.png]]\n\n![说明](pics/图 .png)", encoding="utf-8")
+    embeds = issues_of(load_manifest(media / "post.yaml").for_platform("zhihu"))["error"]
+    assert any("找不到正文里引用的图片: 没有.png" in e for e in embeds)  # ![[图.png]] 在 pics/ 里按文件名找到了
+    assert any("![[另一篇笔记]] 不是图片，会原样当成文字发出去" in e for e in embeds)
+    assert any("pics/图 .png" in e for e in embeds) and len(embeds) == 3
+
     gone = article_post(media)
     gone.images = [media / "images" / "nope.jpg"]
     assert any(e.startswith("images: 文件不存在") for e in issues_of(gone)["error"])  # common_issues 不查文章的图
@@ -1304,6 +1414,40 @@ def test_pure_helpers(tmp_path: Path):
     assert found == (d / "图 片" / "一.png").resolve()
     assert zh.resolve_local_image((d / "图 片" / "一.png").as_uri(), []) == found
     assert zh.resolve_local_image("missing.png", [d]) is None
+    assert zh.display_ref("%E5%9B%BE%20%E7%89%87/%E4%B8%80.png") == "图 片/一.png"
+    assert zh.display_ref("https://x.com/%E5%9B%BE.png") == "https://x.com/%E5%9B%BE.png"
+
+
+def test_resolve_obsidian_embeds(tmp_path: Path):
+    vault = tmp_path / "库"
+    note_dir = vault / "笔记" / "旅行"
+    note_dir.mkdir(parents=True)
+    (vault / ".obsidian").mkdir()
+    (vault / "附件").mkdir()
+    (vault / ".trash").mkdir()
+    (vault / ".trash" / "旧.png").write_bytes(b"x")
+    (vault / "附件" / "Pasted image 1.png").write_bytes(b"x")
+    (vault / "附件" / "深" / "更深").mkdir(parents=True)
+    (vault / "附件" / "深" / "更深" / "里面.PNG").write_bytes(b"x")
+    (tmp_path / "库外.png").write_bytes(b"x")  # 库外面的同名图不能被挑中
+    dirs = [note_dir]
+    # 标准 Markdown 不按文件名找；Obsidian 嵌入在整个库里找（库根目录 = 有 .obsidian 的那层）
+    assert zh.resolve_local_image("Pasted image 1.png", dirs) is None
+    assert zh.resolve_local_image("Pasted image 1.png", dirs, search=True) == (vault / "附件" / "Pasted image 1.png")
+    assert zh.resolve_local_image("附件/Pasted image 1.png", dirs, search=True) == (vault / "附件" / "Pasted image 1.png")
+    assert zh.resolve_local_image("里面.png", dirs, search=True) == (vault / "附件" / "深" / "更深" / "里面.PNG")
+    assert zh.resolve_local_image("更深/里面.png", dirs, search=True) is not None
+    assert zh.resolve_local_image("别处/里面.png", dirs, search=True) is None  # 目录部分也要对上
+    assert zh.resolve_local_image("旧.png", dirs, search=True) is None  # 隐藏目录（回收站、.obsidian）不找
+    assert zh.resolve_local_image("库外.png", dirs, search=True) is None
+    # 认不出库根目录：只在素材目录和它的上一层里找
+    plain = tmp_path / "普通" / "文章"
+    (plain / "图").mkdir(parents=True)
+    (plain / "图" / "a.png").write_bytes(b"x")
+    (tmp_path / "普通" / "b.png").write_bytes(b"x")
+    assert zh.resolve_local_image("a.png", [plain], search=True) == plain / "图" / "a.png"
+    assert zh.resolve_local_image("b.png", [plain], search=True) == tmp_path / "普通" / "b.png"
+    assert zh.resolve_local_image("库外.png", [plain], search=True) is None
 
 
 def test_adapter_module_import_is_cheap():

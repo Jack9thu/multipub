@@ -134,23 +134,41 @@ def load_settings(home: Path | str | None = None) -> Settings:
         except tomllib.TOMLDecodeError as exc:
             raise ConfigError(f"{cfg} 格式错误：{exc}（Windows 路径请用单引号，如 'D:\\tools\\biliup.exe'）") from exc
 
-    browser_raw = raw.get("browser", {}) or {}
+    def section(value: Any, name: str) -> dict[str, Any]:
+        if value in (None, ""):
+            return {}
+        if not isinstance(value, dict):
+            raise ConfigError(f"{cfg} 里的 [{name}] 应该是一个表（[{name}] 下面写 key = value）")
+        return value
+
+    def number(value: Any, name: str) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            raise ConfigError(f"{cfg} 里的 {name} 应该是秒数（整数），收到: {value!r}") from None
+
+    def flag(value: Any) -> bool:
+        if isinstance(value, str):  # headless = "false" 之类的写法
+            return value.strip().lower() not in ("false", "0", "no", "off", "")
+        return bool(value)
+
+    browser_raw = section(raw.get("browser"), "browser")
     browser = BrowserSettings(
         channel=str(browser_raw.get("channel", "chromium")),
         executable_path=str(browser_raw.get("executable_path", "")),
-        headless=bool(browser_raw.get("headless", True)),
+        headless=flag(browser_raw.get("headless", True)),
     )
     timeouts = dict(DEFAULT_TIMEOUTS)
-    timeouts.update({k: int(v) for k, v in (raw.get("timeouts", {}) or {}).items()})
+    timeouts.update({k: number(v, f"[timeouts] {k}") for k, v in section(raw.get("timeouts"), "timeouts").items()})
 
-    bili = (raw.get("platforms", {}) or {}).get("bilibili", {}) or {}
+    bili = section(section(raw.get("platforms"), "platforms").get("bilibili"), "platforms.bilibili")
     return Settings(
         home=home_path,
         browser=browser,
         biliup_version=str(bili.get("biliup_version", "v1.3.1")),
         biliup_path=str(bili.get("biliup_path", "")),
         github_mirror=str(raw.get("github_mirror", "")),
-        gap_seconds=int(raw.get("gap_seconds", 30)),
+        gap_seconds=number(raw.get("gap_seconds", 30), "gap_seconds"),
         timeouts=timeouts,
         raw=raw,
     )

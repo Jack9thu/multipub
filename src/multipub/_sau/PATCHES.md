@@ -201,10 +201,109 @@
 - 替换了上游默认 `page.goto(url)`（等 load、30 秒）的 5 处：抖音登录首页；小红书登录页、cookie 校验页、视频/图文发布页。
 - 起因：2026-10-22 实机冒烟测试中，`creator.douyin.com` 首页 30 秒内没有触发 load，登录直接失败。
 
+### dy. 抖音：本地仿真测试发现的问题（`tests/sim/douyin`，真实 CLI + 真 Chromium + 仿真页面）
+
+文件：`uploader/douyin_uploader/main.py`（dy9 另改 `runtime.py`）。「仿真」一栏是能复现该问题的场景（`tests/sim/test_sim_douyin.py`）。
+
+- dy1 登录二维码：`_extract_douyin_qrcode()` 在 60 秒内轮询全部候选选择器，页面已跳到登录后页面时立即放弃
+  （`DouyinLoginPageLeft`），`_save_douyin_qrcode()` 此时不再上报截图。上游先等 networkidle 15 秒、「扫码登录」60 秒、
+  再逐个选择器各等 10 秒：二维码失效刷新后用户马上扫码，上游要白等一百多秒、再把登录后页面的截图当二维码上报，
+  还可能超出登录任务总时限（仿真 `login_with_qr_refresh`：上游扫码后 82 秒才结束）。
+- dy2 二维码 `src` 不是 data URL 时截取二维码元素（上游 `save_data_url_image` 直接抛错、登录失败）。
+- dy3 登录轮询里 `count()`、点击「二维码失效」刷新都包进 try（扫码后页面跳转中 locator 会报错，上游把这当成登录失败）。
+- dy4 简介编辑框点击被新手引导（shepherd）等浮层挡住时，清浮层后再点（上游只在设封面、点发布前才清，
+  引导一出现就卡 30 秒后报 internal；仿真 `note_guide_and_sticky_topic_dropdown`、`slow_v1_upload_…`）。
+- dy5 `_handle_entry_verification()`：进入上传页、发布表单出现后先处理短信身份验证弹窗（发 `needs_input`、等
+  `mpub verify-code`）。上游只在发布循环里处理，弹窗遮罩先挡住「发布图文」/ 简介编辑框，30 秒后报一个与验证无关的超时
+  （仿真 `note_identity_verification_on_entry`：上游没有发出 `needs_input`）。
+- dy6 `_classify_failure()`：流程里的普通异常（多为点击超时）先看页面停在哪——人机验证 / 登录页 / 短信验证弹窗时抛
+  `CaptchaRequired` / `LoginPageDetected` / `SmsCodeTimeout`（适配器给出 captcha / login_required / sms_code_required），
+  而不是 internal（仿真 `captcha_before_click`）。
+- dy7 `_clear_blocking_overlays()`、`_prepare_publish_attempt()` 移到基类：图文流程填完话题后同样清掉残留的话题下拉 / 引导层。
+- dy8 `_click_publish()`：非 force 点击先 `trial=True` 做可点性检查，被挡住时本轮不点、不记账、不标记已提交。
+- dy9 创建接口已返回成功回执（`status_code == 0` + 作品 ID）但页面一直不跳转：`Hooks.receipt_grace`（10 秒）后按成功处理
+  （上游等到 `publish_timeout` 报 unknown_outcome，查重随后拦住重发；仿真 `success_receipt_without_redirect`）。
+- dy10 回执读取失败时记日志；创建接口返回非 2xx 时记下 HTTP 状态（`publish_http_note`），写进最后的超时报错
+  （仿真 `gateway_error_after_click`）。
+- dy11 `_wait_on_upload_page()`：等上传入口 / 「发布图文」时，页面被踢回登录页立即抛 `LoginPageDetected`
+  （cookie 校验刚通过、打开上传页却掉线；上游干等 60 秒后报 Playwright 超时，适配器只能给 internal；
+  仿真 `session_expires_after_cookie_check`）。
+- dy12 `_verify_title()`：填完标题读回，和要填的不一致时重填一次，仍不一致抛 `DeclarationFailed`（validation，没有点发布）。
+  网页 maxlength 按 UTF-16 计数，30 个字符里有 emoji 的标题会被静默截掉末尾，上游照样发出（仿真 `emoji_title_truncated_by_page`）。
+  `_check_description()`：读回简介，正文行或话题没有完整出现时只告警并记入 `notes`（编辑器会把话题、表情转换成别的节点）。
+- dy13 `_publish_button_covered()`：点「发布」前在按钮中心做命中测试，中心点上是别的弹窗 / 遮罩层（类名含 modal/mask/overlay、
+  role=dialog、`#captcha_container`，且不包含按钮本身）时本轮不点，先尝试关掉通知弹窗或按 Esc。视频流程的 force 点击会落在
+  遮罩上、什么也没发出，上游却记作已点击，最后报 unknown_outcome；现在一直被挡就按「发布前超时」返回 timeout
+  （仿真 `publish_button_masked`、`cover_modal_stuck_…`）。
+- dy14 封面弹窗关不掉（封面一直「检测中」、「完成」一直禁用）：等「完成」解禁从 15 秒放宽到 30 秒；一直禁用时不再白点 4 轮
+  （约 35 秒），直接 `_dismiss_cover_modal()` 点「取消」放弃自定义封面（与弹窗打不开时一样交给推荐封面），记入 `notes`。
+- dy15 `_dismiss_notice_modals()`：关掉 `.semi-modal` 里只有「我知道了 / 知道了 / 我已知晓」的通知弹窗（平台公告等，
+  遮罩挡住表单和「发布」；不点「同意」之类有含义的按钮）。在 `_clear_blocking_overlays()` 和 dy13 里调用
+  （仿真 `notice_modal_dismissed`：上游 30 秒后报 internal）。
+- dy16 `notes`：与清单不一致、需要用户知道的地方（自定义封面没设上、合集没找到 / 可能没选上、背景音乐没加上、简介可能不完整），
+  适配器附在成功结果的消息后。合集选完后核对页面上显示了合集名（上游点完就当成功）。
+- dy17 登录：扫码后卡在短信二次验证直到超时，结果带 `saw_2fa: True`、消息改为「扫码后抖音要求短信二次验证，但一直没有完成」
+  （上游和扫码超时一样报「等待扫码超时」；适配器目前仍按 status=timeout 生成提示，见 CORE 建议）。
+
+### xs. 小红书：本地仿真测试发现的问题（`tests/sim/xhs`，真实 CLI + 真 Chromium + 仿真页面）
+
+文件：`uploader/xiaohongshu_uploader/main.py`（xs19 另改适配器侧 `platforms/_sau_bridge.py`）。「仿真」一栏是能复现该问题的场景
+（`tests/sim/test_sim_xhs.py`）。
+
+- xs1 成功页判定改为正则 `/publish/success(?:[/?#]|$)`：上游的 glob `**/publish/success?**` 要求 success 后面带 `?…`，
+  成功页不带查询串时一直等到超时、报 unknown_outcome（仿真 `video_success_bare_url`）。
+- xs2 视频上传失败：预览区先认「上传失败 / 上传出错 / 上传异常」（失败页上也有「重新上传」，上游把它当上传成功关键字，
+  接着去点「发布」只弹提示，最后报结果未知）；`_retry_video_upload()` 清空再设上传框重传，最多 2 次，仍失败截图并抛
+  `UploadFailed`（platform_error，没有点发布、可重试）（仿真 `video_upload_retry`、`video_upload_keeps_failing`）。
+- xs3 `_raise_if_login_page()`：上传等待、发布循环里页面被踢回 `/login` 立即抛 `LoginPageDetected`
+  （上游等到上传 / 发布截止时间，视频默认约 50 分钟）（仿真 `session_drop_video`）。
+- xs4 `_wait_upload_input()`：等上传框渲染出来（最多 `page_timeout`，期间跳登录页立即报错），不再直接 `set_input_files`
+  （30 秒后报 internal）；图文页两种上传框选择器一起等（上游先 `count()` 图片上传框，SPA 没渲染完时为 0 会错选兜底选择器）。
+- xs5 `_wait_uploads_settled()`：图文的标题框在图片传完之前就出来了；点「发布」前等页面上不再显示「上传中 / 正在上传」，
+  有图片显示「上传失败」时截图并抛 `UploadFailed`（没有点发布）。上游上传中点「发布」只会弹提示，PublishGuard 补点几次后报
+  unknown_outcome（查重随后拦住重发）；有图传失败时页面要么一直不让发（同样报 unknown_outcome），要么少一张图照样发出去
+  （仿真 `note_slow_images_toast`、`note_image_failed_block`、`note_image_failed_drop`）。
+- xs6 创建笔记接口已返回成功回执但页面一直不跳成功页：`Hooks.receipt_grace`（与 dy9 共用）后按成功处理，不再点击
+  （仿真 `video_receipt_no_redirect`）。
+- xs7 `_desc_editor()`：发布页恢复了上次的草稿时正文没有 `data-placeholder`，上游在 click 上等 30 秒后报 internal；
+  退回到可编辑区本身（随后 Ctrl+A 清空重写）（仿真 `video_draft`）。
+- xs8 `_matching_topic_item()`：话题候选里挑名字与标签相同（忽略 `#`、`[话题]`、大小写）的一项，没有时退而求其次取名字包含标签的，
+  约 3 秒内都没有就跳过该标签。上游无条件点第一个候选：下拉框先显示热门话题、联想结果稍后才刷新时会挂上不相干的话题
+  （仿真 `video_topics_instant`）。
+- xs9 `_js_click_by_text()`：原生 click 本来就会冒泡，上游再连点元素和 3 层祖先，同一个选项的处理函数被触发好几次
+  （「来源转载」弹出好几层媒体名称框、开关被点回去）；现在每点一层等 100 毫秒，元素已被移除或隐藏就停（仿真 `video_repost`）。
+- xs10「来源转载」选项：patchright 里「锚定正则 filter + `.last`」解析不到元素（上游实际总走 JS 兜底），改为数出个数后 `nth(n-1)`。
+- xs11 扫码面板：以「二维码图片可见」判断已在扫码面板（上游看 `div:has-text('扫一扫')` 的数量，扫码面板只是隐藏在 DOM 里时也有，
+  于是不点切换、上报一张没有二维码的截图）；扫码面板标题已可见、图片还没加载时等图片而不去点切换图标（它在两个面板间来回切）；
+  各个切换入口（`img.css-wemwzq`、「扫码登录」、「APP扫一扫登录」）在 `XHS_QR_SWITCH_WAIT`（10 秒）内轮流看、哪个先出现点哪个，
+  30% 时间后再试登录框右上角的图标（`_XHS_CORNER_SWITCH_JS`，哈希类名改版后切换图标通常还在那里）。上游只等哈希类名的图标
+  10 秒（仿真 `qr_switch`、`qr_switch_renamed`、`qr_unreachable`）。
+- xs12 `_refresh_xhs_qrcode()`：登录轮询里二维码显示「已过期 / 已失效 / 点击刷新」时点一下刷新；二维码图片变了就重新保存并上报
+  （上游只上报一次，无头登录时用户拿到的是过期的二维码）（仿真 `qr_expires`）。
+- xs13 `_click_publish()`：先 `trial=True` 做可点性检查（同 dy8）。按钮被弹窗 / 遮罩挡住时 click 会超时、根本没点下去，
+  上游这也记一次点击并标记已提交，最后报 unknown_outcome；现在本轮不点、按一次 Escape，一直被挡就按「发布前超时」报 timeout。
+- xs14 `set_thumbnail()`：等封面弹窗（`div.d-modal`）出现；「上传封面」页签 3 秒内没出现就直接在弹窗里找图片上传框
+  （postsail 的页面版本没有页签，上游在这里等 10 秒后失败）；点「确定」后弹窗一直不关（图片不合要求等）也算失败（上游照样报
+  「封面已经设置完成」）。失败时截图、`_close_modal()` 依次试 Escape、弹窗里的「取消」、关闭图标把弹窗关掉，并在结果消息里注明
+  自定义封面没设上（记入 `declaration_warnings`）。上游失败后只按一次 Escape：弹窗不响应 Escape 时一直挡着「发布」，
+  点击被遮罩拦下却记作已点击，最后报 unknown_outcome、查重拦住重发（仿真 `video_cover_direct`、`cover_no_upload_entry`、`cover_modal_stuck`）。
+- xs15 `fill_title()`：填完读回。标题框按 UTF-16 计数（emoji 算 2 个）时 20 个字里有 emoji 的标题末尾会被静默截掉，上游照样发出；
+  现在重填一次仍被截断（读回值是要填的前缀）就截图并抛 `DeclarationFailed`（validation，没有点发布）；其他不一致只告警、写进结果消息；
+  读不回来不核对。适配器 `validate()` 对这种标题先给 warning。
+- xs16 `fill_desc()`：逐行输入，含 `#` 或 `@` 的行在回车前先按 Escape。编辑器的话题 / @ 候选框开着时回车会选中第一个候选：
+  正文里自己写的 `#徒步` 会被换成先弹出来的热门话题、换行也被吞掉（仿真 `video_topics_instant`）。
+- xs17 `_classify_failure()`（同 dy6）：`upload()` 里的普通异常（多为填表时 30 秒的 Playwright 超时）先看页面停在哪——登录页 /
+  人机验证时抛 `LoginPageDetected` / `CaptchaRequired`（适配器给 login_required / captcha，点过发布则为 unknown_outcome），
+  而不是 internal（仿真 `session_drop_note`、`captcha_on_load`）。
+- xs18 创建笔记接口返回 HTTP 4xx/5xx 时记下 `publish_http_note`，写进最后的超时报错（仿真 `gateway_500`）。
+- xs19 `_sau_bridge.QrRelay`：无头登录上报的是整页截图（没定位到二维码）时，提示里加「截图里没有二维码时去掉 --headless 重新登录」
+  （截图可能停在手机号登录面板，无头模式下没有窗口可用）。
+- 两处新加的轮询（xs8、xs11）都用 `Deadline` 计时（`test_vendored_source_invariants` 要求每个 `while True` 都有截止时间）。
+
 ## 升级上游时
 
 1. 在上游新提交上 diff 上表中的文件；
-2. 逐条重放 a–j、w1–w10（搜索 `# multipub patch:`）；
+2. 逐条重放 a–k、w1–w10、dy1–dy17、xs1–xs19（搜索 `# multipub patch:`）；
 3. 特别确认：上游是否又加了默认声明 / 强制开关、是否新增了 `while True` 循环、是否有新的 `print()` 或 stdout 输出、
    是否有新的直接点击最终「发布」按钮的地方（必须改走 `_click_publish()`）；
 4. 跑 `pytest tests/test_douyin_xhs.py`，更新本文件的提交号与 blob。

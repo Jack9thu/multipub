@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -17,8 +18,9 @@ from patchright.async_api import async_playwright
 # multipub patch: 包内绝对导入；conf 由 multipub._sau.conf.configure() 预先设置
 from multipub._sau import conf as sau_conf
 from multipub._sau.conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
-from multipub._sau.runtime import (CaptchaWatch, goto_resilient, CookieInvalid, Deadline, DeclarationFailed, Hooks, SauError,
-                                   ScheduleFailed, close_quietly, fail_rejected, fail_step, find_visible_text,
+from multipub._sau.runtime import (CaptchaRequired, CaptchaWatch, goto_resilient, CookieInvalid, Deadline, DeclarationFailed,
+                                   Hooks, SauError, diagnose, LoginPageDetected, ScheduleFailed, UploadFailed, close_quietly, fail_rejected,
+                                   fail_step, find_visible_text,
                                    input_value, publish_button_ready, save_screenshot, save_state_quietly,
                                    schedule_value_matches, toggle_state)
 from multipub._sau.uploader.base_video import BaseVideoUploader
@@ -33,7 +35,37 @@ from multipub._sau.utils.log import xiaohongshu_logger
 XHS_DEFAULT_CREATOR_BASE_URL = "https://creator.xiaohongshu.com"
 XHS_CREATOR_BASE_URL_ENV = "SAU_XHS_CREATOR_BASE_URL"
 XHS_PUBLISH_SUCCESS_URL_PATTERN = "**/publish/success?**"
+# multipub patch: 成功页地址带不带查询串都认（上游的 glob 要求 success 后面有 ?…）
+XHS_PUBLISH_SUCCESS_URL_RE = re.compile(r"/publish/success(?:[/?#]|$)")
+# multipub patch: 视频预览区出现这些字 = 上传失败（失败时也有「重新上传」，上游把它当成功关键字）
+XHS_UPLOAD_FAILED_TEXTS = ("上传失败", "上传出错", "上传异常")
+XHS_UPLOAD_SUCCESS_TEXTS = ('上传成功', '分辨率', '重新上传', '编辑封面', '已上传', '已选择', '100%')
+XHS_VIDEO_INPUT_SELECTOR = "div[class^='upload-content'] input[class='upload-input']"
+XHS_IMAGE_INPUT_SELECTOR = 'input[type="file"][accept*="image"], ' + XHS_VIDEO_INPUT_SELECTOR
+# 正文编辑器：空的时候第一段带 data-placeholder；页面恢复了草稿时没有，退回到可编辑区本身
+XHS_DESC_SELECTOR = 'p[data-placeholder*="输入正文描述"]'
+XHS_EDITOR_FALLBACK_SELECTOR = '.tiptap[contenteditable="true"], .ProseMirror[contenteditable="true"], div[contenteditable="true"]'
+# 页面上的上传状态：可见元素的直接文字含「上传中 / 正在上传」（「上传中心」之类的菜单名除外）= 还在传；
+# 含「上传失败」等 = 有素材传失败了。返回 {busy, failed}（各为第一处文字，没有为空串）
+_UPLOAD_STATE_JS = """(failedTexts) => {
+    const out = {busy: '', failed: ''};
+    for (const el of document.querySelectorAll('body *')) {
+        if (el.closest('[contenteditable="true"], input, textarea')) continue;
+        const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
+        if (!own || own.includes('上传中心')) continue;
+        const busy = /上传中|正在上传/.test(own), failed = failedTexts.some(t => own.includes(t));
+        if (!busy && !failed) continue;
+        const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+        if (!(r.width && r.height && st.visibility !== 'hidden' && st.display !== 'none')) continue;
+        if (failed && !out.failed) out.failed = own.slice(0, 40);
+        else if (busy && !out.busy) out.busy = own.slice(0, 40);
+    }
+    return out;
+}"""
+# multipub patch: 弹窗（封面弹窗等；上游等它关闭用的就是这个选择器，postsail 是 div.d-modal.cover-modal）
+XHS_MODAL_SELECTOR = "div.d-modal"
 XHS_LOGIN_BOX_SELECTOR = "div[class*='login-box']"
+XHS_QR_SWITCH_WAIT = 10.0  # multipub patch: 切扫码面板：等各个切换入口出现的总时长（秒）；30% 时间后试登录框右上角的图标
 XHS_LOGIN_SWITCH_SELECTOR = "img.css-wemwzq"
 XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
@@ -63,15 +95,25 @@ async def _js_click_by_text(page: Page, text: str) -> bool:
 
     小红书很多可点项文字在 <span class="d-text"> 里，pointer-events 常被禁用，
     Playwright 常规 click 会超时。用原生 click 冒泡触发 Vue 事件更可靠。
+
+    multipub patch: 上游无条件连点元素和 3 层祖先——原生 click 本来就会冒泡，同一个选项的处理函数会被触发好几次
+    （「来源转载」会弹出好几层媒体名称框，开关类会被点回去）。现在每点一层等一下，元素已被移除或隐藏
+    （下拉框/弹窗已收起）就停。
     """
     return await page.evaluate(
-        """(t) => {
+        """async (t) => {
             const nodes = [...document.querySelectorAll('*')].filter(
                 e => e.children.length === 0 && (e.textContent || '').trim() === t
             );
             if (!nodes.length) return false;
-            let el = nodes[nodes.length - 1];
-            for (let i = 0; i < 4 && el; i++) { try { el.click(); } catch (e) {} el = el.parentElement; }
+            const leaf = nodes[nodes.length - 1];
+            let el = leaf;
+            for (let i = 0; i < 4 && el; i++) {
+                try { el.click(); } catch (e) {}
+                await new Promise(r => setTimeout(r, 100));
+                if (!leaf.isConnected || !leaf.getClientRects().length) break;
+                el = el.parentElement;
+            }
             return true;
         }""",
         text,
@@ -118,36 +160,128 @@ async def _open_xhs_qrcode_panel(page: Page) -> bool:
         xiaohongshu_logger.warning(_msg("😵", "没等到小红书登录框，可能是页面改版"))
         return False
 
-    scan_text = login_box.locator("div:has-text('扫一扫')").first
-    if await scan_text.count():
+    # multipub patch: 以「二维码图片可见」判断是否已在扫码面板。上游看 div:has-text('扫一扫') 的数量：
+    # 扫码面板只是隐藏在 DOM 里（默认显示手机号登录）时也有数量，于是不点切换、上报一张没有二维码的截图
+    if await _xhs_qrcode_visible(page):
         return True
 
+    # multipub patch: 各个切换入口轮流看（上游只等哈希类名的图标 10 秒）；哪个先出现点哪个，点完二维码出来就算切到了。
+    # 最后的兜底是登录框右上角的图片（切换图标的位置，哈希类名改版后也还在那里）
     switches = (
-        (login_box.locator(XHS_LOGIN_SWITCH_SELECTOR).first, 10000),
-        (page.get_by_text("扫码登录", exact=True).first, 3000),
-        (page.get_by_text("APP扫一扫登录").first, 3000),
+        login_box.locator(XHS_LOGIN_SWITCH_SELECTOR).first,
+        page.get_by_text("扫码登录", exact=True).first,
+        page.get_by_text("APP扫一扫登录").first,
     )
-    for switch, wait_ms in switches:
-        try:
-            await switch.wait_for(state="visible", timeout=wait_ms)
-            await switch.click(timeout=5000)
-            await scan_text.wait_for(state="visible", timeout=10000)
+    # 扫码面板的标题已经可见、只是二维码图片还没加载出来：等图片，别去点切换（切换图标在两个面板间来回切）
+    try:
+        panel_title = page.locator(".login-box-container").get_by_text("APP扫一扫登录").filter(visible=True)
+        if await panel_title.count():
+            await _xhs_qrcode_img(page).wait_for(state="visible", timeout=5000)
             return True
-        except Exception:
-            continue
+    except Exception:
+        pass
+
+    tried: set[int] = set()
+    deadline = Deadline(XHS_QR_SWITCH_WAIT, "切到扫码登录面板")
+    corner_tried = False
+    while True:
+        for i, switch in enumerate(switches):
+            if i in tried:
+                continue
+            try:
+                if not (await switch.count() and await switch.is_visible()):
+                    continue
+                tried.add(i)
+                await switch.click(timeout=5000)
+                await _xhs_qrcode_img(page).wait_for(state="visible", timeout=5000)
+                return True
+            except Exception:
+                continue
+        if await _xhs_qrcode_visible(page):
+            return True
+        elapsed = deadline.seconds - deadline.remaining()
+        if not corner_tried and (elapsed >= deadline.seconds * 0.3 or len(tried) == len(switches)):
+            corner_tried = True
+            try:
+                if await page.evaluate(_XHS_CORNER_SWITCH_JS, XHS_LOGIN_BOX_SELECTOR):
+                    await _xhs_qrcode_img(page).wait_for(state="visible", timeout=5000)
+                    xiaohongshu_logger.info(_msg("🧭", "用登录框右上角的图标切到了扫码登录"))
+                    return True
+            except Exception:
+                pass
+        if deadline.expired or (corner_tried and len(tried) == len(switches)):
+            break
+        await asyncio.sleep(0.5)
     xiaohongshu_logger.warning(_msg("😵", "没能切到扫码登录面板（切换按钮可能改版了）"))
     return False
+
+
+# multipub patch: 点登录框右上角的图片（扫码 / 手机号登录的切换图标通常在那里）；点到了返回 True
+_XHS_CORNER_SWITCH_JS = """(boxSel) => {
+    const box = document.querySelector(boxSel);
+    if (!box) return false;
+    const b = box.getBoundingClientRect();
+    for (const img of box.querySelectorAll('img, svg')) {
+        const r = img.getBoundingClientRect();
+        if (!r.width || !r.height || r.width > b.width / 3) continue;
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        if (cx > b.left + b.width * 0.75 && cy < b.top + b.height * 0.25) {
+            img.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+            return true;
+        }
+    }
+    return false;
+}"""
+
+
+def _xhs_qrcode_img(page: Page):
+    return page.locator('.login-box-container').get_by_text("APP扫一扫登录").filter(visible=True).locator("xpath=..//following-sibling::div//img").nth(0)
+
+
+async def _xhs_qrcode_visible(page: Page) -> bool:
+    try:
+        img = _xhs_qrcode_img(page)
+        return bool(await img.count()) and await img.is_visible()
+    except Exception:
+        return False
 
 
 async def _find_xhs_qrcode_locator(page: Page):
     await _open_xhs_qrcode_panel(page)
 
-    qrcode_img = page.locator('.login-box-container').get_by_text("APP扫一扫登录").filter(visible=True).locator("xpath=..//following-sibling::div//img").nth(0)
+    qrcode_img = _xhs_qrcode_img(page)
 
     if await qrcode_img.count():
         return qrcode_img
 
     raise RuntimeError("未在扫一扫登录区域找到小红书二维码图片")
+
+
+XHS_QRCODE_EXPIRED_RE = re.compile(r"已过期|已失效|点击刷新")
+
+
+async def _refresh_xhs_qrcode(page: Page, account_file: str, qrcode_info: dict | None, qrcode_callback=None) -> dict | None:
+    """multipub patch: 上游只上报一次二维码。二维码过期（「已过期」「已失效」「点击刷新」）时点一下刷新；
+    二维码图片变了（页面自己刷新、或点过刷新）就重新保存并上报，无头登录时用户也总能拿到最新的二维码。"""
+    if not qrcode_info or qrcode_info.get("fallback"):
+        return qrcode_info
+    try:
+        expired = page.locator(".login-box-container").get_by_text(XHS_QRCODE_EXPIRED_RE).filter(visible=True).first
+        if await expired.count():
+            xiaohongshu_logger.warning(_msg("😵", "二维码过期了，小人去刷新"))
+            await expired.click(timeout=3000)
+            await page.wait_for_timeout(1000)
+        img = _xhs_qrcode_img(page)
+        if not await img.count():
+            return qrcode_info
+        src = await img.get_attribute("src", timeout=3000)
+    except Exception:
+        return qrcode_info
+    if not src or src == qrcode_info.get("image_data_url"):
+        return qrcode_info
+    previous = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
+    xiaohongshu_logger.info(_msg("🖼️", "二维码刷新了，重新上报"))
+    return await _save_xhs_qrcode(page, account_file, previous, qrcode_callback=qrcode_callback)
 
 
 async def _extract_xhs_qrcode_src(page: Page) -> str:
@@ -330,6 +464,9 @@ async def xiaohongshu_cookie_gen(
             xiaohongshu_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
 
             for _ in range(max_checks):
+                # multipub patch: 二维码过期 / 刷新后重新上报
+                qrcode_info = await _refresh_xhs_qrcode(page, account_file, qrcode_info, qrcode_callback)
+                qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info and qrcode_info.get("image_path") else qrcode_path
                 if await _is_xhs_login_completed(page):
                     await asyncio.sleep(2)
                     await context.storage_state(path=account_file)
@@ -396,9 +533,94 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         self.publish_guard = self.hooks.publish_guard()
         self.published_note_id: str | None = None
         self.publish_api_error: str | None = None
+        self.publish_http_note: str | None = None
         self.declaration_warnings: list[str] = []  # 没能自动完成的声明，适配器写进结果消息
         self._response_tasks: set = set()
         self._captcha = CaptchaWatch(headless=headless, guard=self.publish_guard, logger=xiaohongshu_logger)
+        self._upload_retries = 0
+
+    # multipub patch: 页面被踢回登录页时立即报登录失效（上游要等到上传/发布截止时间才超时，视频默认 50 分钟）
+    @staticmethod
+    def _on_login_page(page: Page) -> bool:
+        try:
+            return str(page.url).startswith(_build_xhs_creator_url("/login"))
+        except Exception:
+            return False
+
+    async def _raise_if_login_page(self, page: Page, step: str) -> None:
+        if not self._on_login_page(page):
+            return
+        shot = await save_screenshot(page, self.hooks, "login")
+        where = "（已点击发布，结果未知）" if self._publish_clicked else ""
+        xiaohongshu_logger.error(_msg("😵", f"{step}时页面跳到了登录页{where}"))
+        raise LoginPageDetected(f"{step}时页面跳到了登录页，登录已失效{where}", step=step,
+                                after_submit=self._publish_clicked, screenshot=shot)
+
+    async def _classify_failure(self, page: Page | None, exc: BaseException) -> None:
+        """multipub patch: 流程里的普通异常（多为填表时的点击 / 输入超时）先看页面停在哪：被踢回登录页 → LoginPageDetected，
+        停在人机验证 → CaptchaRequired（适配器给出 login_required / captcha，点过发布则为结果未知）。
+        上游只会把 30 秒的 Playwright 超时原样抛出，适配器只能报 internal（例如编辑区出来后被风控弹窗遮住、
+        图文页填标题时会话失效）。其余情况直接返回，由调用方重新抛出原异常。"""
+        if page is None:
+            return
+        reason = "login" if self._on_login_page(page) else await diagnose(page)
+        if not reason:
+            return
+        where = "（已点击发布，结果未知）" if self._publish_clicked else ""
+        detail = str(exc).splitlines()[0][:80] if str(exc) else exc.__class__.__name__
+        kw = {"step": "填写发布表单", "after_submit": self._publish_clicked}
+        if reason == "login":
+            xiaohongshu_logger.error(_msg("😵", f"发布过程中页面跳到了登录页{where}（{detail}）"))
+            raise LoginPageDetected(f"发布过程中页面跳到了登录页，登录已失效{where}", **kw) from exc
+        xiaohongshu_logger.error(_msg("😵", f"发布过程中页面停在人机验证{where}（{detail}）"))
+        raise CaptchaRequired(f"发布过程中页面停在人机验证，没能继续{where}", **kw) from exc
+
+    async def _wait_upload_input(self, page: Page, selector: str, what: str):
+        """multipub patch: 等上传框渲染出来（SPA 慢时最多 page_timeout；上游直接 set_input_files，30 秒后报 internal），
+        期间跳到登录页立即报登录失效。"""
+        deadline = Deadline(self.hooks.page_timeout, f"等待{what}上传框出现")
+        upload_input = page.locator(selector).first
+        while True:
+            await self._raise_if_login_page(page, deadline.step)
+            try:
+                await upload_input.wait_for(state="attached", timeout=1000)
+                return upload_input
+            except Exception:
+                pass
+            if deadline.expired:
+                await fail_step(page, self.hooks, deadline, after_submit=False)
+
+    async def _wait_uploads_settled(self, page: Page, deadline: Deadline) -> None:
+        """multipub patch: 图片在后台上传，标题框早就出来了；上传中点「发布」只会弹提示（PublishGuard 要隔 20 秒才补点，
+        最多 3 次，之后报结果未知）。点发布前先等页面上不再显示「上传中」（连续两次检查都没有），最多到上传截止时间。
+        有图片显示「上传失败」时抛 UploadFailed（还没点发布）：页面要么一直不让发（以前报成结果未知），
+        要么少了这张图照样发出去。"""
+        quiet, logged = 0, False
+        while quiet < 2:
+            await self._raise_if_login_page(page, deadline.step)
+            try:
+                state = await page.evaluate(_UPLOAD_STATE_JS, list(XHS_UPLOAD_FAILED_TEXTS))
+            except Exception:
+                state = None
+            busy = str((state or {}).get("busy") or "") if isinstance(state, dict) else ""
+            failed = str((state or {}).get("failed") or "") if isinstance(state, dict) else ""
+            if failed:
+                shot = await save_screenshot(page, self.hooks, "upload-failed")
+                xiaohongshu_logger.error(_msg("😵", f"有素材上传失败（{failed}），不发布"))
+                raise UploadFailed(f"有图片上传失败（页面提示「{failed}」），笔记没有发出；请检查图片和网络后重试"
+                                   + (f"；截图: {shot}" if shot else ""))
+            if busy:
+                quiet = 0
+                if not logged:
+                    logged = True
+                    xiaohongshu_logger.info(_msg("🧍", f"素材还在上传（{busy}），小人等传完再发布"))
+                if deadline.expired:
+                    await fail_step(page, self.hooks, deadline, after_submit=False)
+                await asyncio.sleep(1)
+            else:
+                quiet += 1
+                if quiet < 2:
+                    await asyncio.sleep(0.5)
 
     def _before_publish_click(self) -> None:
         """multipub patch: 第一次点击最终「发布」之前通知适配器（对应 ctx.mark_submit_started）。"""
@@ -441,6 +663,14 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         if not await publish_button_ready(button):
             xiaohongshu_logger.debug(_msg("🧍", "发布按钮还不能点（不唯一、不可见或不可用），小人再等等"))
             return False
+        # multipub patch: 先 trial（只做可点性检查、不派发点击）。按钮被弹窗 / 遮罩挡住时 click() 会超时、根本没点下去，
+        # 以前这也记一次点击并标记已提交，最后报 unknown_outcome（其实什么都没发出，查重还会拦住重发）
+        try:
+            await button.click(timeout=self.PUBLISH_CLICK_TIMEOUT_MS, trial=True)
+        except Exception as exc:
+            xiaohongshu_logger.warning(_msg("🧍", f"发布按钮被挡住或还不能点（{exc.__class__.__name__}），本轮不点"))
+            await self._press_escape(getattr(button, "page", None))  # 收起可能挡着的下拉框
+            return False
         self._before_publish_click()
         self.publish_guard.clicked()  # 先记账再点：点击抛异常时也可能已经触发
         await button.click(timeout=self.PUBLISH_CLICK_TIMEOUT_MS)
@@ -462,6 +692,11 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         async def capture(response) -> None:
             ok: bool | None = None
             try:
+                # multipub patch: 网关错误（5xx、HTML 错误页）记下 HTTP 状态，写进最后的超时报错
+                status = getattr(response, "status", 200)
+                if isinstance(status, int) and status >= 400:
+                    self.publish_http_note = f"创建笔记接口返回 HTTP {status}"
+                    xiaohongshu_logger.warning(_msg("😵", self.publish_http_note))
                 body = await response.json()
                 if not isinstance(body, dict):
                     return
@@ -507,19 +742,35 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             parts.append(f"创建接口已返回笔记 ID {self.published_note_id}")
         if self.publish_api_error:
             parts.append(f"平台返回: {self.publish_api_error}")
+        if self.publish_http_note and not self.publish_api_error:
+            parts.append(self.publish_http_note)
         return "；".join(parts)
+
+    # 创建笔记接口已返回成功、页面却一直没跳成功页：等这么久后按成功处理（接口回执就是笔记已创建的证据）。
+    # 以 hooks.receipt_grace 为准（runtime 里与抖音共用），这里是它不存在时的默认值
+    SUCCESS_REDIRECT_GRACE = 10.0
 
     async def _publish_until_success(self, page: Page, what: str) -> None:
         """上游的发布循环（multipub patch: 带截止时间；视频/图文共用；
         发布按钮只经 _click_publish 点击：PublishGuard 限制重复点击，第一次点击前通知适配器；
-        有头模式下等用户完成人机验证：CaptchaWatch）。"""
+        有头模式下等用户完成人机验证：CaptchaWatch；跳回登录页立即报错；
+        创建接口已返回成功但页面不跳成功页时，宽限 SUCCESS_REDIRECT_GRACE 秒后按成功处理）。"""
         self._watch_publish_response(page)
         deadline = Deadline(self.hooks.publish_timeout, f"等待{what}发布成功")
+        api_success_at: float | None = None
         while True:
             if deadline.expired:
                 await fail_step(page, self.hooks, deadline, after_submit=self._publish_clicked,
                                 detail=self._publish_detail())
             try:
+                await self._raise_if_login_page(page, deadline.step)
+                if self.publish_guard.succeeded:
+                    api_success_at = api_success_at or time.monotonic()
+                    grace = float(getattr(self.hooks, "receipt_grace", self.SUCCESS_REDIRECT_GRACE))
+                    if time.monotonic() - api_success_at >= grace:
+                        xiaohongshu_logger.warning(_msg("🧾", f"创建笔记接口已返回成功，但页面没有跳到成功页（{page.url}），"
+                                                              "按发布成功处理"))
+                        break
                 # multipub patch: 有头模式下页面停在人机验证：等用户在窗口里完成，期间不点「发布」、不判被拒
                 if await self._captcha.blocking(page, deadline):
                     await asyncio.sleep(self.hooks.poll_interval)
@@ -528,11 +779,13 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                 if await publish_button.count():
                     await self._click_publish(publish_button)
                 await page.wait_for_url(
-                    XHS_PUBLISH_SUCCESS_URL_PATTERN,
+                    XHS_PUBLISH_SUCCESS_URL_RE,
                     timeout=3000
                 )
                 xiaohongshu_logger.success(_msg("🥳", f"{what}发布成功，小人开心收工"))
                 break
+            except SauError:
+                raise
             except Exception:
                 # 接口明确失败、宽限期内页面没有进展：直接报平台拒绝（fail_rejected 抛出的异常不会被这里吞掉）
                 rejection = self.publish_guard.rejection_settled(self.hooks.reject_grace)
@@ -684,19 +937,61 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
 
     async def fill_title(self, page: Page) -> None:
         title_container = page.locator('input[placeholder*="填写标题"]')
-        await title_container.fill(self.title[:20])
+        want = self.title[:20]
+        await title_container.fill(want)
+        # multipub patch: 读回核对。标题框的 maxlength 按 UTF-16 计数（emoji 等算 2 个），20 个字里有 emoji 时
+        # 末尾会被网页静默截掉，上游照样发出。重填一次仍被截断就拒绝发布（还没点发布）；其他不一致只告警
+        for attempt in range(2):
+            got = await input_value(title_container.first)
+            if got.strip() == want.strip():
+                return
+            if attempt == 0:
+                await title_container.fill(want)
+        if not got:
+            xiaohongshu_logger.debug(_msg("📝", "没能读回标题框的内容，跳过核对"))
+            return
+        if want.startswith(got):
+            await save_screenshot(page, self.hooks, "title")
+            raise DeclarationFailed(
+                f"标题被网页截成了「{got}」（小红书标题框按 UTF-16 计字数，emoji 等算 2 个字），拒绝继续发布，"
+                "笔记没有发出。请缩短标题后重发"
+            )
+        xiaohongshu_logger.warning(_msg("📝", f"标题框读回来是「{got}」，和要填的「{want}」不一致"))
+        self.declaration_warnings.append(f"标题框显示「{got}」，与清单里的标题不一致，请到笔记管理里检查")
+
+    @staticmethod
+    async def _desc_editor(page: Page):
+        """multipub patch: 正文为空时第一段带 data-placeholder（上游只认它）；页面恢复了草稿、正文不为空时
+        就没有这个属性，上游会在 click 上等 30 秒后报 internal。这时退回到可编辑区本身（随后 Ctrl+A 清空重写）。"""
+        desc = page.locator(XHS_DESC_SELECTOR).first
+        try:
+            await desc.wait_for(state="visible", timeout=5000)
+            return desc
+        except Exception:
+            pass
+        editor = page.locator(XHS_EDITOR_FALLBACK_SELECTOR).filter(visible=True).first
+        if await editor.count():
+            xiaohongshu_logger.warning(_msg("📝", "正文框不是空的（可能恢复了上次的草稿），小人清空后重写"))
+            return editor
+        return desc
 
     async def fill_desc(self, page: Page) -> None:
         if not getattr(self, "desc", ""):
             return
 
-        desc = page.locator('p[data-placeholder*="输入正文描述"]')
+        desc = await self._desc_editor(page)
         await desc.click()
         await page.keyboard.press("Backspace")
         await page.keyboard.press("Control+KeyA")
         await page.keyboard.press("Delete")
-        await page.keyboard.type(self.desc)
-        await page.keyboard.press("Enter")
+        # multipub patch: 逐行输入。正文里写了 #话题 / @某人 时编辑器会弹出候选框，候选框开着时回车会选中第一个候选
+        # （先弹热门话题时会换成一个不相干的话题，还吞掉换行）；这样的行在回车前先按 Escape 收起候选框
+        for line in self.desc.split("\n"):
+            if line:
+                await page.keyboard.type(line)
+            if "#" in line or "@" in line:
+                await page.keyboard.press("Escape")
+            await page.keyboard.press("Enter")
 
     async def fill_tags(self, page: Page) -> None:
         if not getattr(self, "tags", None):
@@ -711,7 +1006,7 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             self.tags = self.tags[:max_tags]
 
         if not getattr(self, "desc", ""):
-            desc = page.locator('p[data-placeholder*="输入正文描述"]')
+            desc = await self._desc_editor(page)
             await desc.click()
 
         for tag in self.tags:  # 循环处理所有 tags
@@ -725,7 +1020,12 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                 )
                 first_item = page.locator('#creator-editor-topic-container .item').first
                 await first_item.wait_for(state="visible", timeout=4000)
-                await first_item.click()
+                # multipub patch: 不再无条件点第一个候选——下拉框可能先显示热门话题、联想结果稍后才刷新，
+                # 那样会挂上不相干的话题；等名字对得上的候选出现（最多约 3 秒），对不上就跳过该标签
+                item = await self._matching_topic_item(page, tag)
+                if item is None:
+                    raise RuntimeError("候选里没有同名话题")
+                await item.click()
             except Exception as exc:
                 xiaohongshu_logger.warning(
                     _msg("🏷️", f"话题『{tag}』未出现候选，跳过该标签继续发布: {exc}")
@@ -734,6 +1034,37 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                 for _ in range(len("#" + tag)):
                     await page.keyboard.press("Backspace")
                 continue
+
+    _TOPIC_TEXTS_JS = """items => items.map(it => [it, ...it.querySelectorAll('*')]
+        .map(e => [...e.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim())
+        .filter(Boolean))"""
+
+    @staticmethod
+    def _topic_name(text: str) -> str:
+        text = re.sub(r"\[话题\]#?$", "", text.strip())
+        return text.strip().lstrip("#").strip().casefold()
+
+    async def _matching_topic_item(self, page: Page, tag: str, wait: float = 3.0):
+        """multipub patch: 话题候选里名字与 tag 相同（忽略 # 和大小写）的那一项；没有时退而求其次取名字包含 tag 的；
+        等 wait 秒仍没有就返回 None。"""
+        items = page.locator('#creator-editor-topic-container .item')
+        want = self._topic_name(tag)
+        deadline = Deadline(wait, f"等话题『{tag}』的候选")
+        while True:
+            try:
+                texts = await items.evaluate_all(self._TOPIC_TEXTS_JS)
+            except Exception:
+                texts = []
+            names = [[self._topic_name(t) for t in parts] for parts in texts]
+            for i, parts in enumerate(names):
+                if want in parts:
+                    return items.nth(i)
+            if deadline.expired:
+                for i, parts in enumerate(names):
+                    if parts and want in parts[0]:
+                        return items.nth(i)
+                return None
+            await asyncio.sleep(0.3)
 
     async def fill_meta(self, page: Page) -> None:
         await self.fill_title(page)
@@ -863,11 +1194,14 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
 
             # 2. 选「来源转载」选项
             import re as _re
-            repost_option = page.locator("#publish-container div").filter(
+            # multipub patch: patchright 里「锚定正则 filter + .last」永远解析不到元素（count() 为 0、操作一直等），
+            # 上游这里实际总是走 JS 兜底；改为数出个数后取最后一个
+            repost_options = page.locator("#publish-container div").filter(
                 has_text=_re.compile(r"^来源转载$")
-            ).last
-            if await repost_option.count():
-                await repost_option.click(force=True)
+            )
+            option_count = await repost_options.count()
+            if option_count:
+                await repost_options.nth(option_count - 1).click(force=True)
             elif not await _js_click_by_text(page, "来源转载"):
                 xiaohongshu_logger.warning(_msg("⚠️", "没找到「来源转载」选项"))
                 return False
@@ -954,6 +1288,35 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         xiaohongshu_logger.warning(_msg("😵", "视频上传摔了一跤，小人马上重新上传"))
         await page.locator('div.progress-div [class^="upload-btn-input"]').set_input_files(self.file_path)
 
+    MAX_UPLOAD_RETRIES = 2
+
+    async def _retry_video_upload(self, page: Page, text: str) -> None:
+        """multipub patch: 预览区显示上传失败：用同一个上传框重传，最多 MAX_UPLOAD_RETRIES 次；
+        用完（或重传不了）截图并抛 UploadFailed（还没点发布，笔记没有发出，可直接重试）。
+        上游把失败页上的「重新上传」当成上传成功，接着去点「发布」，只会弹提示，最后报成结果未知。"""
+        reason = " ".join(text.split())[:40]
+        if self._upload_retries < self.MAX_UPLOAD_RETRIES:
+            self._upload_retries += 1
+            xiaohongshu_logger.warning(_msg("😵", f"视频上传失败（{reason}），小人重新上传（第 {self._upload_retries} 次）"))
+            try:
+                upload_input = page.locator("input.upload-input").first
+                # 同一个文件再设一次浏览器不会触发 change：先清空再设
+                await upload_input.set_input_files([], timeout=10000)
+                await upload_input.set_input_files(self.file_path, timeout=10000)
+                # 等预览区不再显示失败，免得同一次失败被数两次
+                preview = page.locator("input.upload-input ~ div[class*='preview-new']").first
+                for _ in range(10):
+                    await asyncio.sleep(0.5)
+                    shown = await preview.inner_text(timeout=2000) if await preview.count() else ""
+                    if not any(k in shown for k in XHS_UPLOAD_FAILED_TEXTS):
+                        break
+                return
+            except Exception as exc:
+                xiaohongshu_logger.warning(_msg("😵", f"重新上传没能开始: {exc}"))
+        shot = await save_screenshot(page, self.hooks, "upload-failed")
+        raise UploadFailed(f"视频上传失败（页面提示「{reason}」），已重传 {self._upload_retries} 次仍失败，笔记没有发出；"
+                           "请检查网络和视频文件后重试" + (f"；截图: {shot}" if shot else ""))
+
     async def set_thumbnail(self, page: Page, thumbnail_path: str):
         if not thumbnail_path:
             return
@@ -975,19 +1338,32 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             if not await upload_cover.count():
                 upload_cover = page.locator("div.cover-plugin-preview div.default.pointer").first
             await upload_cover.click(force=True)
-            await page.wait_for_timeout(3000)
+            modal = page.locator(XHS_MODAL_SELECTOR).filter(visible=True).first
+            await modal.wait_for(state="visible", timeout=10000)  # multipub patch: 等弹窗出现，不再固定等 3 秒
+            await page.wait_for_timeout(500)
 
             # 2. 切换到「上传封面」tab（默认在「截取封面」）
+            # multipub patch: 有的版本弹窗里直接就是上传框、没有页签（postsail 的写法）：页签 3 秒内没出现就直接找上传框
+            # （上游在这里等 10 秒后失败，并把封面弹窗留在页面上挡住「发布」）
             upload_tab = page.get_by_text("上传封面", exact=True).first
-            await upload_tab.wait_for(state="visible", timeout=10000)
-            await upload_tab.click()
-            await page.wait_for_timeout(2000)
+            try:
+                await upload_tab.wait_for(state="visible", timeout=3000)
+                await upload_tab.click()
+                await page.wait_for_timeout(2000)
+            except Exception:
+                xiaohongshu_logger.info(_msg("🖼️", "封面弹窗里没有「上传封面」页签，直接找上传框"))
 
             # 3. 找到图片 file input（parent class: upload-wrapper）并上传
-            file_input = page.locator('div.upload-wrapper input[type="file"][accept*="image"]').first
-            if not await file_input.count():
-                file_input = page.locator('input[type="file"][accept*="image"]').last
-            await file_input.set_input_files(thumbnail_path)
+            file_input = modal.locator('input[type="file"][accept*="image"]').first
+            try:
+                await file_input.wait_for(state="attached", timeout=5000)
+            except Exception:
+                file_input = page.locator('div.upload-wrapper input[type="file"][accept*="image"]').first
+                if not await file_input.count():
+                    file_input = page.locator('input[type="file"][accept*="image"]').last
+                if not await file_input.count():
+                    raise RuntimeError("封面弹窗里没有找到图片上传框")
+            await file_input.set_input_files(thumbnail_path, timeout=10000)
             await page.wait_for_timeout(4000)  # 等图片加载+裁剪渲染
 
             # 4. 点「确定」按钮
@@ -999,19 +1375,50 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             await confirm.click()
 
             # 5. 等弹窗关闭
-            modal = page.locator("div.d-modal")
-            try:
-                await modal.first.wait_for(state="hidden", timeout=15000)
-            except Exception:
-                pass
+            # multipub patch: 弹窗一直不关（图片不合要求等）不再当成功：上游照样报「封面已经设置完成」，
+            # 弹窗留在页面上挡住「发布」
+            await modal.wait_for(state="hidden", timeout=15000)
             xiaohongshu_logger.success(_msg("🥳", "封面已经设置完成"))
         except Exception as exc:
-            xiaohongshu_logger.warning(_msg("🖼️", f"封面设置失败，跳过该步骤继续发布（用视频首帧）：{exc}"))
+            reason = str(exc).splitlines()[0][:120] if str(exc) else exc.__class__.__name__
+            xiaohongshu_logger.warning(_msg("🖼️", f"封面设置失败，跳过该步骤继续发布（用平台默认封面）：{reason}"))
+            await save_screenshot(page, self.hooks, "cover")
+            # multipub patch: 关掉留在页面上的封面弹窗（上游只按一次 Escape，弹窗不响应 Escape 时一直挡着「发布」，
+            # 点击被遮罩拦下却记作已点击，最后报 unknown_outcome），并把封面没设上写进结果消息
+            await self._close_modal(page)
+            self.declaration_warnings.append("自定义封面没能设置上，用的是平台默认封面，请到笔记管理里检查")
+
+    async def _close_modal(self, page: Page) -> bool:
+        """multipub patch: 关掉页面上可见的 d-modal 弹窗：Escape → 弹窗里的「取消」→ 关闭图标。返回是否已关掉。"""
+        modal = page.locator(XHS_MODAL_SELECTOR).filter(visible=True)
+        closers = (
+            None,  # Escape
+            lambda m: m.locator("div.d-modal-footer").get_by_text("取消", exact=True).first,
+            lambda m: m.get_by_role("button", name="取消").first,
+            lambda m: m.locator(".d-modal-close, [class*='close-icon'], [class*='modal-close']").first,
+        )
+        for closer in closers:
             try:
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(500)
+                if not await modal.count():
+                    return True
+                if closer is None:
+                    await self._press_escape(page)
+                else:
+                    target = closer(modal.first)
+                    if not await target.count():
+                        continue
+                    await target.click(timeout=3000)
+                await modal.first.wait_for(state="hidden", timeout=3000)
+                return True
             except Exception:
-                pass
+                continue
+        try:
+            if not await modal.count():
+                return True
+        except Exception:
+            pass
+        xiaohongshu_logger.warning(_msg("😵", "封面弹窗关不掉，可能会挡住「发布」按钮"))
+        return False
 
     async def upload_video_content(self, page: Page) -> None:
         xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
@@ -1021,13 +1428,16 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         )
         await goto_resilient(page, publish_url)  # multipub patch: 慢网络
         await page.wait_for_url(publish_url)
-        await page.locator("div[class^='upload-content'] input[class='upload-input']").set_input_files(self.file_path)
+        # multipub patch: 等上传框渲染（期间跳登录页立即报错），不再直接 set_input_files（30 秒后报 internal）
+        upload_input_box = await self._wait_upload_input(page, XHS_VIDEO_INPUT_SELECTOR, "视频")
+        await upload_input_box.set_input_files(self.file_path)
 
         # multipub patch: 带截止时间
         deadline = Deadline(self.hooks.upload_timeout, "等待视频上传完成")
         while True:
             if deadline.expired:
                 await fail_step(page, self.hooks, deadline, after_submit=False)
+            await self._raise_if_login_page(page, deadline.step)  # multipub patch
             try:
                 upload_input = await page.wait_for_selector('input.upload-input', timeout=3000)
                 preview_new = await upload_input.query_selector(
@@ -1035,7 +1445,11 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 if preview_new:
                     # 获取整个预览区域的文本，更鲁棒地判断上传状态
                     all_text = await preview_new.inner_text()
-                    upload_success = any(keyword in all_text for keyword in ['上传成功', '分辨率', '重新上传', '编辑封面', '已上传', '已选择', '100%'])
+                    # multipub patch: 先认上传失败（失败时预览区也有「重新上传」）：重传，次数用完抛 UploadFailed
+                    if any(keyword in all_text for keyword in XHS_UPLOAD_FAILED_TEXTS):
+                        await self._retry_video_upload(page, all_text)
+                        continue
+                    upload_success = any(keyword in all_text for keyword in XHS_UPLOAD_SUCCESS_TEXTS)
                     
                     if not upload_success:
                         # 检查是否有特定的状态码或百分比
@@ -1061,6 +1475,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                         xiaohongshu_logger.success(_msg("🥳", "虽然没看到预览区，但标题框出来了，小人继续"))
                         break
                     xiaohongshu_logger.debug(_msg("🧍", "还没拿到预览区域，小人继续等一会"))
+            except SauError:
+                raise
             except Exception as e:
                 xiaohongshu_logger.debug(_msg("😵", f"上传状态还没稳定下来，小人继续观察: {e}"))
             await asyncio.sleep(2)
@@ -1099,9 +1515,10 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 await self.upload_video_content(page)
             except SauError:
                 raise
-            except Exception:
-                # multipub patch: 出错先截图留证
+            except Exception as exc:
+                # multipub patch: 出错先截图留证；停在登录页 / 人机验证时改抛对应的异常
                 await save_screenshot(page, self.hooks, "error")
+                await self._classify_failure(page, exc)
                 raise
             # multipub patch: 发布已成功，回写 cookie / 关浏览器出错不改变结果
             if await save_state_quietly(context, self.account_file):
@@ -1174,11 +1591,9 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         await goto_resilient(page, publish_url)  # multipub patch: 慢网络
         await page.wait_for_url(publish_url)
 
-        upload_input = page.locator('input[type="file"][accept*="image"]').first
-        if not await upload_input.count():
-            upload_input = page.locator("div[class^='upload-content'] input[class='upload-input']").first
-
-        await upload_input.wait_for(state="attached", timeout=30000)
+        # multipub patch: 上游先 count() 图片上传框、没有就换视频页的选择器——SPA 还没渲染完时 count() 为 0，
+        # 会错选兜底选择器；现在两种选择器一起等（期间跳登录页立即报错）
+        upload_input = await self._wait_upload_input(page, XHS_IMAGE_INPUT_SELECTOR, "图片")
         xiaohongshu_logger.info(_msg("📤", "小人正在上传图片"))
         await upload_input.set_input_files(self.image_paths)
 
@@ -1187,10 +1602,11 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         while True:
             if deadline.expired:
                 await fail_step(page, self.hooks, deadline, after_submit=False)
+            await self._raise_if_login_page(page, deadline.step)  # multipub patch
             try:
                 title_container = page.locator('input[placeholder*="填写标题"]').first
                 await title_container.wait_for(state="visible", timeout=3000)
-                xiaohongshu_logger.success(_msg("🥳", "图文素材已经传完，可以开始填写内容了"))
+                xiaohongshu_logger.success(_msg("🥳", "图文编辑区已经出来了，可以开始填写内容了"))
                 break
             except Exception:
                 xiaohongshu_logger.debug(_msg("🧍", "图文素材还在上传，小人继续等一会"))
@@ -1204,6 +1620,9 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
 
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
+
+        # multipub patch: 标题框出来时图片可能还在上传：等传完再点发布
+        await self._wait_uploads_settled(page, deadline)
 
         await self._publish_until_success(page, "图文")
 
@@ -1226,9 +1645,10 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
                 await self.upload_note_content(page)
             except SauError:
                 raise
-            except Exception:
-                # multipub patch: 出错先截图留证
+            except Exception as exc:
+                # multipub patch: 出错先截图留证；停在登录页 / 人机验证时改抛对应的异常
                 await save_screenshot(page, self.hooks, "error")
+                await self._classify_failure(page, exc)
                 raise
             # multipub patch: 发布已成功，回写 cookie / 关浏览器出错不改变结果
             if await save_state_quietly(context, self.account_file):

@@ -246,6 +246,8 @@ class QrRelay:
             note = "没定位到二维码元素，这是登录页截图，请扫描其中的二维码"
             if not self.ctx.headless:
                 note += "；也可以直接在弹出的浏览器窗口里扫码或登录"
+            else:  # 无头模式下截图不会刷新，也没有窗口可用
+                note += "；截图里没有二维码时，请去掉 --headless 重新登录，在弹出的窗口里扫码或用手机号登录"
         else:
             note = "二维码过期后会自动刷新，请以最新图片为准"
         self.ctx.qrcode(self.dest, note=note)

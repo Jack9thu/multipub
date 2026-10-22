@@ -170,9 +170,10 @@ def run_worker(
                     on_event(event)
 
         except BaseException:
-            # Ctrl+C / SIGTERM：先结束整棵进程树（浏览器、biliup），再把中断时的状态交给调用方记录
-            _close_stdin(proc)
+            # Ctrl+C / SIGTERM：先结束整棵进程树（浏览器、biliup），再把中断时的状态交给调用方记录。
+            # 先杀再关 stdin：worker 不会在被杀的同时又因为读到 EOF 开始自行取消
             _kill_tree(proc)
+            _close_stdin(proc)
             # 进程已死，把管道里剩下的事件读完：中断前可能已经发出了 submit_started / result
             drain_until = time.monotonic() + 3
             while time.monotonic() < drain_until:
@@ -214,7 +215,8 @@ def run_worker(
     if result is None:
         timed_out = time.monotonic() >= deadline
         if submit_started:
-            code, msg = ErrorCode.UNKNOWN_OUTCOME.value, "worker 异常结束，但已触发发布：请先到平台后台确认，不要直接重发"
+            why = f"超过 {timeout} 秒未完成，已终止" if timed_out else f"worker 异常退出（退出码 {proc.returncode}）"
+            code, msg = ErrorCode.UNKNOWN_OUTCOME.value, f"{why}，但已触发发布：结果未知，请先到平台后台确认，不要直接重发"
         elif timed_out:
             code, msg = ErrorCode.TIMEOUT.value, f"超过 {timeout} 秒未完成，已终止"
         else:

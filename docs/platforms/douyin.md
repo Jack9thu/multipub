@@ -28,7 +28,9 @@
 | `bgm` | note | 无 | 背景音乐名称，搜索后选第一条；搜不到跳过 |
 
 `cover` 的用法：没有填 `thumbnail_*` 时，按图片宽高自动放进横封面（宽>高）或竖封面（其余）。
-封面设置失败不会中断发布，平台会用推荐封面。
+封面设置失败不会中断发布，平台会用推荐封面：封面弹窗打不开，或者上传的封面一直「检测中」、「完成」按钮约 30 秒仍不可点时，
+multipub 点「取消」关掉弹窗（不然它会盖住「发布」）继续发布，并在结果消息里写明「自定义封面没能设置上」。
+同样会写进结果消息的还有：合集没找到 / 可能没选上、背景音乐没加上、简介读回时缺内容。
 
 ```yaml
 platforms:
@@ -63,7 +65,9 @@ platforms:
 | 图文图片 | 1–35 张，格式 `.jpg .jpeg .png .webp .bmp`（不支持 GIF） | error |
 | 封面 / thumbnail_* | 图片格式同上，文件必须存在 | error |
 | `cover` + `thumbnail_*` | 同时设置时 cover 被忽略 | warning |
+| 标题含 emoji 等字符 | 按字符数没超限、按 UTF-16 计数超限（emoji 算 2 个）：网页可能截断 | warning |
 | 话题 | >5 个 | warning |
+| 正文 + 话题 | 正文不超 1000 字、加上「 #话题」超过 1000 字 | warning |
 | 话题内容 | 含空格、`#`、逗号（会被拆开） | warning |
 | 定时 | 必须晚于现在 2 小时以上（发布前在 worker 里会再查一次） | error |
 | 定时 | 离 2 小时下限不足 15 分钟 / 超过 14 天 | warning |
@@ -73,7 +77,9 @@ platforms:
 | 图文 + `cover` | 图文以第一张图为封面，cover 被忽略 | warning |
 | 未知参数 | 拼写错误等 | warning |
 
-长度按 Python 字符数计算，可能与平台的计数方式（如 emoji）不完全一致。
+长度按 Python 字符数计算，可能与平台的计数方式（如 emoji）不完全一致。所以填完标题后还会**读回核对**：
+网页把标题截短了（输入框上限按 UTF-16 计数时，接近 30 字的标题末尾的 emoji 会被截掉）就重填一次，仍不一致则在点「发布」之前
+返回 `failed` / `validation`（作品没有发出），缩短标题后重发即可。简介也会读回，缺内容只告警（编辑器会把话题、表情转换成别的节点）。
 
 ## 登录
 
@@ -108,7 +114,12 @@ mpub login douyin --account main --headless
 - **不会重复点击发布**（multipub 补丁，上游每 3.5 秒点一次）：第一次点击之后只在两种情况下再点——
   平台弹窗拦下了上一次点击（短信验证已完成、提示「请设置封面后再发布」并已选推荐封面），或者 20 秒内既没跳转也没观察到
   发布请求（说明上次点击没生效）。发布请求还没返回、已拿到成功回执、或已经点了 3 次时一律不再点。
+- 点击前会在「发布」按钮中心做命中测试：上面盖着别的弹窗 / 遮罩时这一轮不点（force 点击会落在遮罩上，什么也发不出去），
+  先尝试关掉通知弹窗或按 Esc；一直被挡就在 `publish_timeout` 后返回 `failed` / `timeout`（消息写明「没有点击，作品没有发出」）。
+- 页面上只有「我知道了 / 知道了 / 我已知晓」的通知弹窗（平台公告等）会被自动关掉；不会点「同意」之类有含义的按钮。
 - 发布接口明确返回失败（如内容违规）且 15 秒内没有弹出验证：立即返回 `failed` / `platform_error`（附平台原文），不再空等。
+- 发布接口已返回成功回执（有作品 ID）但页面 10 秒内没有跳到作品管理页（改版、停在原页只提示成功）：按已提交处理。
+- 发布接口返回 HTTP 5xx 等（请求可能已被处理）：不补点，超时后按 `unknown_outcome` 返回，消息里带上 HTTP 状态。
 - 成功：`status = submitted`（立即发布，待审核）或 `scheduled`（定时）。
 - 作品链接：点击发布后被动监听创作者中心的创建接口回执，拿到 `item_id` 时返回
   `https://www.douyin.com/video/<id>`（图文为 `/note/<id>`）。拿不到时 `url` 为空，消息提示去「作品管理」查看。
@@ -124,7 +135,7 @@ mpub login douyin --account main --headless
 
 ### 短信验证码
 
-发布时如果弹出短信验证：
+发布时如果弹出短信验证（点「发布」之后弹出，或者一进上传页 / 发布表单刚出来就弹出的身份验证，处理方式相同）：
 
 1. 自动点「获取验证码」，并发出 `needs_input` 事件（`kind = sms_code`，`path = <数据目录>/sau/verify_code.txt`）。
 2. **发布还在等待时**，在 `sms_timeout`（默认 10 分钟，以 `needs_input` 消息里的秒数为准）内运行
@@ -154,15 +165,16 @@ mpub login douyin --account main --headless
 
 | 情况 | status / error_code |
 |---|---|
-| 没有账号文件、cookie 失效、中途被踢回登录页（点发布前） | `needs_action` / `login_required` |
+| 没有账号文件、cookie 失效、中途被踢回登录页（点发布前；打开上传页时掉线会在几秒内报出） | `needs_action` / `login_required` |
 | 页面停在人机验证（滑块等），点发布前 | `needs_action` / `captcha`（建议 `--headed` 重发并手动验证） |
 | 短信验证码超时；或提交 3 轮验证码后弹窗仍在（验证码错误/过期），点发布前 | `needs_action` / `sms_code_required` |
 | 点发布**之后**出现人机验证或短信验证（超时 / 验证失败） | `failed` / `unknown_outcome`（结果未知：先去后台确认；消息里附验证提示） |
 | 自主声明没能确认设置上（选项文字与页面不一致、点击没生效等），点发布前 | `failed` / `validation`（拒绝发布，作品没有发出） |
+| 标题读回和清单不一致（被网页截断等），点发布前 | `failed` / `validation`（拒绝发布，作品没有发出） |
 | `sync_toutiao: false` 但同步开关开着且关不掉，点发布前 | `failed` / `validation`（拒绝发布） |
 | 填了 `schedule` 但没能核实「定时发布」已选中、时间已填对，点发布前 | `failed` / `validation`（拒绝发布，作品没有发出） |
 | 点发布后接口明确返回失败 | `failed` / `platform_error`（不可重试；作品应未创建，建议先去后台确认） |
-| 点发布前某一步超时 | `failed` / `timeout`（可重试） |
+| 点发布前某一步超时（含「发布」按钮一直被浮层挡住、没有点击） | `failed` / `timeout`（可重试） |
 | 点发布后超时或页面异常 | `failed` / `unknown_outcome`（**先去后台确认，不要直接重发**） |
 | 视频上传失败且重传 3 次仍失败 | `failed` / `platform_error` |
 | 参数问题（SAU 校验） | `failed` / `validation` |
@@ -215,3 +227,14 @@ mpub login douyin --account main --headless
 | 登录二维码兜底 | 定位不到二维码元素时上报整页截图（multipub 新增） | 中 |
 | 作品链接格式 | `https://www.douyin.com/video/<id>`、`/note/<id>` | 中 |
 | 卡住原因判定 | 文本「请完成安全验证」「拖动下方滑块」等、`#captcha_container`（multipub 新增，只影响错误分类） | 低 |
+| 「发布」被挡住的判定 | 按钮中心 `elementFromPoint` 命中的元素属于类名含 modal/mask/overlay、`role=dialog` 或 `#captcha_container` 的层（且该层不包含按钮）（multipub 新增；判断错时表现为一直不点、报 `timeout`） | 低 |
+| 通知弹窗 | `.semi-modal` 里的按钮「我知道了」「知道了」「我已知晓」（multipub 新增） | 低 |
+| 标题读回 | `input[placeholder*="填写作品标题"]` 的 `input_value()` 等于要填的标题（multipub 新增） | 中 |
+| 封面弹窗取消 | 弹窗里的「取消」按钮 / `.semi-modal-close` / Esc（multipub 新增） | 中低 |
+
+## 本地仿真测试
+
+`tests/sim/test_sim_douyin.py` 用真实 CLI（`mpub publish / login / check / verify-code`）+ 真 Chromium 跑一遍上面的流程，
+页面和接口是 `tests/sim/douyin/` 里按上述选择器、文案和接口形状写的仿真页（异步上传进度、上传完才出表单或「发布」才可用、
+创建接口回执、跳转、toast、短信 / 人机验证、新手引导、通知弹窗、关不掉的封面弹窗……），真实网络一律拦截。
+没有 Chromium 时自动跳过。仿真页只证明流程面对这样的页面时行为正确，不能代替真实账号验证。

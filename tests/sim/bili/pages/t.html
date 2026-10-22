@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>动态首页-哔哩哔哩</title>
+<meta name="spm_prefix" content="333.1365">
+<style>
+body{margin:0;font-family:sans-serif;background:#f6f7f8}
+#bili-header-container{height:64px;background:#fff;display:flex;align-items:center;justify-content:flex-end;padding:0 24px}
+.header-login-entry{width:40px;height:40px;border-radius:50%;background:#00aeec;color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer}
+#dyn-home-app{width:640px;margin:16px auto}
+.bili-dyn-publishing{background:#fff;border-radius:6px;padding:16px}
+.bili-dyn-publishing__title__input{width:100%;font-size:16px;border:none;outline:none;padding:6px 0}
+.bili-rich-textarea__inner{min-height:72px;outline:none;padding:6px;border:1px solid #eee;white-space:pre-wrap}
+.bili-dyn-publishing__control{display:flex;justify-content:space-between;align-items:center;margin-top:8px}
+.bili-dyn-publishing__tools{display:flex;gap:8px}
+.bili-dyn-publishing__tools__item{width:28px;height:28px;background:#e3e5e7;border-radius:4px;cursor:pointer}
+.bili-dyn-publishing__tools__item.active{background:#00aeec}
+.bili-dyn-publishing__action{padding:6px 18px;border-radius:4px;background:#00aeec;color:#fff;cursor:pointer;user-select:none}
+.bili-dyn-publishing__action.disabled{background:#9adcf3;cursor:not-allowed}
+.bili-pics-uploader__content{display:flex;flex-wrap:wrap;gap:6px;padding:8px 0}
+.bili-pics-uploader__item,.bili-pics-uploader__add{width:88px;height:88px;border-radius:4px;background:#f1f2f3;position:relative}
+.bili-pics-uploader__add{cursor:pointer;border:1px dashed #ccc;box-sizing:border-box}
+.bili-pics-uploader-item-preview__pic{width:100%;height:100%;object-fit:cover}
+.bili-pics-uploader-item-preview__progress{position:absolute;left:0;right:0;bottom:0;height:4px;background:#ddd}
+.bili-pics-uploader-item-preview__progress__stage{height:100%;background:#00aeec}
+.bili-pics-uploader-item-error{color:#f25d8e;font-size:12px;padding:4px}
+.bili-dyn-publishing__datetime{margin-top:8px;color:#00aeec}
+.bili-toast{position:fixed;top:40%;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.7);color:#fff;padding:8px 16px;border-radius:4px;z-index:999}
+.bili-modal__mask,.bili-dyn-specification-popup,.bili-mini-mask{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:900}
+.bili-modal,.bili-popup__wrap,.bili-mini-login{background:#fff;padding:20px;border-radius:8px;min-width:320px}
+.geetest_panel{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:950;display:flex;align-items:center;justify-content:center}
+.geetest_box{width:340px;height:380px;background:#fff}
+</style>
+</head>
+<body>
+<div id="bili-header-container"></div>
+<div id="dyn-home-app"></div>
+<script>window.__SIM__ = /*__SIM__*/{};</script>
+<script>
+(function () {
+  'use strict';
+  var SIM = window.__SIM__ || {};
+  var API = 'https://api.bilibili.com';
+
+  function ev(evt, data) {
+    try {
+      fetch('/__sim/evt', {method: 'POST', body: JSON.stringify(Object.assign({evt: evt}, data || {}))});
+    } catch (e) { /* ignore */ }
+  }
+  function cookie(name) {
+    var m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]; }); }
+  function toast(text, type) {
+    var t = document.createElement('div');
+    t.className = 'bili-toast ' + (type || '');
+    t.textContent = text;
+    document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, 3000);
+    ev('toast', {text: text, level: type || ''});
+  }
+  function modal(title, content, okText, cancelText) {
+    return new Promise(function (resolve) {
+      var m = document.createElement('div');
+      m.className = 'bili-modal__mask';
+      m.innerHTML = '<div class="bili-modal"><div class="bili-modal__title">' + esc(title) + '</div><div class="bili-modal__content">' +
+        esc(content) + '</div><div class="bili-modal__footer"><button class="bili-modal__button confirm">' + esc(okText) +
+        '</button><button class="bili-modal__button cancel">' + esc(cancelText) + '</button></div></div>';
+      document.body.appendChild(m);
+      ev('modal', {title: title});
+      m.querySelector('.confirm').onclick = function () { m.remove(); resolve(true); };
+      m.querySelector('.cancel').onclick = function () { m.remove(); resolve(false); };
+    });
+  }
+  async function getJson(url) {
+    var resp = await fetch(url, {credentials: 'include'});
+    return resp.json();
+  }
+  async function postJson(url, body) {
+    var resp = await fetch(url, {method: 'POST', credentials: 'include', headers: {'Content-Type': 'application/json'},
+                                 body: JSON.stringify(body)});
+    try { return await resp.json(); } catch (e) { throw {code: null, message: '网络错误（' + resp.status + '）'}; }
+  }
+
+  var header = document.getElementById('bili-header-container');
+
+  async function boot() {
+    var nav;
+    try { nav = await getJson(API + '/x/web-interface/nav'); } catch (e) { nav = {code: -1, data: null}; }
+    if (!nav.data || !nav.data.isLogin) {
+      if (SIM.logged_out === 'redirect') {
+        location.href = 'https://passport.bilibili.com/login?gourl=' + encodeURIComponent(location.href);
+        return;
+      }
+      header.innerHTML = '<div class="header-login-entry">登录</div>';
+      document.getElementById('dyn-home-app').innerHTML = '<div class="bili-dyn-login-tip">登录后即可查看动态</div>';
+      ev('logged_out');
+      return;
+    }
+    header.innerHTML = '<div class="header-entry-avatar">' + esc(nav.data.uname) + '</div>';
+    if (SIM.page === 'blank') return;
+    setTimeout(function () { mount(nav.data); }, SIM.render_delay_ms || 0);
+  }
+
+  function mount(user) {
+    var app = document.getElementById('dyn-home-app');
+    app.innerHTML = '<section class="bili-dyn-publishing">' +
+      (SIM.title_visible ? '<div class="bili-dyn-publishing__title"><input class="bili-dyn-publishing__title__input" maxlength="20" placeholder="好的标题更容易获得支持，选填20字"></div>' : '') +
+      '<div class="bili-dyn-publishing__input"><div class="bili-rich-textarea"><div class="bili-rich-textarea__inner" contenteditable="true"></div></div></div>' +
+      '<div class="bili-dyn-publishing__image-upload" style="display:none"><div class="bili-pics-uploader"><div class="bili-pics-uploader__content"></div></div></div>' +
+      '<div class="bili-dyn-publishing__datetime" style="display:none"></div>' +
+      '<div class="bili-dyn-publishing__control"><div class="bili-dyn-publishing__tools">' +
+      '<div class="bili-dyn-publishing__tools__item emoji"></div><div class="bili-dyn-publishing__tools__item pic"></div>' +
+      '<div class="bili-dyn-publishing__tools__item topic"></div></div>' +
+      '<div class="bili-dyn-publishing__action launcher disabled">发布</div></div></section>';
+    var root = app.querySelector('.bili-dyn-publishing');
+    var titleInput = root.querySelector('.bili-dyn-publishing__title__input');
+    var editor = root.querySelector('.bili-rich-textarea__inner');
+    var picPanel = root.querySelector('.bili-dyn-publishing__image-upload');
+    var picContent = root.querySelector('.bili-pics-uploader__content');
+    var picTool = root.querySelector('.bili-dyn-publishing__tools__item.pic');
+    var datetimePanel = root.querySelector('.bili-dyn-publishing__datetime');
+    var launcher = root.querySelector('.launcher');
+
+    // 发布器组件状态（Vue 2：根元素上的 __vue__）
+    var vm = {
+      title: '',
+      content: {value: ''},
+      uploadId: '',
+      tools: {
+        pic: {active: false, data: [], config: {maxAmount: 9, maxSize: 20}},
+        timingSetting: {visible: SIM.timing !== 'hidden', active: false,
+                        data: {id: 0, next: false, datetime: 0}, config: {}},
+        emoji: {active: false}
+      },
+      creationOption: {active: true, title: '创作声明', value: 0,
+                       list: SIM.aigc_option ? [{title: '无', value: 0}, {title: '作者声明：该内容由AI生成', value: 1}] : []},
+      picModeOption: {active: true, title: '图片排版', value: 0,
+                      list: [{title: '九宫格', value: 0}, {title: '大封面', value: 1}]},
+      loadingState: {init: false, publish: false},
+      $parent: null,
+      $children: []
+    };
+    if (SIM.timing === 'swallow') {
+      Object.defineProperty(vm.tools.timingSetting, 'active', {
+        enumerable: true, get: function () { return false; }, set: function () { ev('timing_swallowed'); }
+      });
+    }
+    root.__vue__ = vm;
+    function genUploadId() { vm.uploadId = user.mid + '_' + Math.floor(Date.now() / 1e3) + '_' + Math.floor(1e4 * Math.random()); }
+    genUploadId();
+
+    // ---------------------------------------------------------------- 图片
+    var list = [];
+    var queue = [];
+    var running = false;
+    var input = document.createElement('input');  // 线上：不挂在 DOM 上
+    input.type = 'file';
+    if (SIM.pic_multiple) input.setAttribute('multiple', 'multiple');
+    input.accept = 'image/png, image/jpeg, image/jpg, image/gif';
+    input.name = 'upload';
+    input.addEventListener('change', function (e) {
+      var files = Array.from(e.target.files);
+      e.target.value = '';
+      onFiles(files);
+    });
+    function trigger() { ev('chooser_opened'); input.click(); }
+
+    function syncPicData() {
+      vm.tools.pic.data = list.map(function (i) { return i.status === 'SUCCESS' ? i.data : null; });
+    }
+    function renderPics() {
+      var html = '';
+      list.forEach(function (item) {
+        html += '<div class="bili-pics-uploader__item ' + item.status.toLowerCase() + '"><div class="bili-pics-uploader__item__remove"></div>';
+        if (item.status === 'ERROR') {
+          html += '<div class="bili-pics-uploader-item-error"><div class="bili-pics-uploader-item-error__icon"></div>' +
+                  '<div class="bili-pics-uploader-item-error__msg">' + esc(item.msg) + '</div>' +
+                  (item.retryable ? '<div class="bili-pics-uploader-item-error__retry">点击重试</div>' : '') + '</div>';
+        } else if (item.src) {
+          html += '<div class="bili-pics-uploader-item-preview"><img class="bili-pics-uploader-item-preview__pic" src="' + item.src + '">' +
+                  (item.status === 'LOADING' ? '<div class="bili-pics-uploader-item-preview__progress"><div class="bili-pics-uploader-item-preview__progress__stage" style="width:' + item.progress + '%"></div></div>' : '') +
+                  '</div>';
+        } else {
+          html += '<div class="bili-pics-uploader-item-skeleton"><div class="bili-pics-uploader-item-skeleton__loading"></div></div>';
+        }
+        html += '</div>';
+      });
+      if (list.length < 9) html += '<div class="bili-pics-uploader__add"></div>';
+      picContent.innerHTML = html;
+      var add = picContent.querySelector('.bili-pics-uploader__add');
+      if (add) add.addEventListener('click', trigger);
+    }
+    function onFiles(files) {
+      ev('files_chosen', {n: files.length, names: files.map(function (f) { return f.name; })});
+      if (!files.length) return;
+      var over = files.length + list.length - 9;
+      if (over > 0) { files.splice(files.length - over); toast('上传图片不得超过9张（￣∞￣）', 'warning'); }
+      files.forEach(function (f) {
+        var item = {status: 'LOADING', msg: '', src: '', progress: 0, data: null, file: f, retryable: false};
+        list.push(item);
+        queue.push(item);
+      });
+      syncPicData();
+      renderPics();
+      pump();
+    }
+    async function pump() {
+      if (running) return;
+      running = true;
+      while (queue.length) {
+        var item = queue.shift();
+        try { await processOne(item); } catch (e) { /* item 已标记 */ }
+        syncPicData();
+        renderPics();
+      }
+      running = false;
+    }
+    function imageSize(f) {
+      return new Promise(function (resolve) {
+        var img = new Image();
+        img.onload = function () { resolve({w: img.width, h: img.height}); };
+        img.onerror = function () { resolve(null); };
+        img.src = URL.createObjectURL(f);
+      });
+    }
+    async function processOne(item) {
+      var f = item.file;
+      var fail = function (msg, retryable) { item.status = 'ERROR'; item.msg = msg; item.retryable = !!retryable; ev('pic_error', {msg: msg}); };
+      if (!/^image\/(png|jpeg|jpg|gif)$/.test(f.type || '')) return fail('仅支持PNG JPEG JPG GIF');
+      if (Math.floor(f.size / 1048576) >= 20) return fail('请上传小于20MB的图片');
+      var dims = await imageSize(f);
+      if (!dims) return fail('图片读取失败');
+      if (dims.w < 10) return fail('图片宽度不得小于10像素');
+      if (dims.h < 10) return fail('图片高度不得小于10像素');
+      item.src = URL.createObjectURL(f);
+      renderPics();
+      var fd = new FormData();
+      fd.append('file_up', f);
+      fd.append('biz', 'dyn');
+      fd.append('category', 'daily');
+      fd.append('csrf', cookie('bili_jct') || '');
+      var ticker = setInterval(function () {
+        item.progress = Math.min(95, item.progress + 5);
+        var stage = picContent.querySelectorAll('.bili-pics-uploader__item')[list.indexOf(item)];
+        stage = stage && stage.querySelector('.bili-pics-uploader-item-preview__progress__stage');
+        if (stage) stage.style.width = item.progress + '%';
+      }, 100);
+      var ctrl = new AbortController();
+      var to = setTimeout(function () { ctrl.abort(); }, 20000);
+      try {
+        var resp = await fetch(API + '/x/dynamic/feed/draw/upload_bfs', {method: 'POST', body: fd, credentials: 'include', signal: ctrl.signal});
+        var res = await resp.json();
+        if (res.code !== 0) throw res;
+        item.status = 'SUCCESS';
+        item.progress = 100;
+        item.data = {img_src: res.data.image_url, img_width: res.data.image_width, img_height: res.data.image_height,
+                     img_size: f.size / 1024, ai_gen_pic: res.data.ai_gen_pic};
+      } catch (e) {
+        fail(e && e.name === 'AbortError' ? '上传超时' : '上传失败', true);
+        toast('图片上传失败，点击图片可重试', 'error');
+      } finally {
+        clearInterval(ticker);
+        clearTimeout(to);
+      }
+    }
+    picTool.addEventListener('click', function () {
+      vm.tools.pic.active = !vm.tools.pic.active;
+      sync();
+      // 线上：PicsUploader 变为可见且还没有图片时立即弹出选文件框
+      if (vm.tools.pic.active && !list.length && SIM.pic_autotrigger) trigger();
+    });
+    renderPics();
+
+    // ---------------------------------------------------------------- 文本
+    if (titleInput) titleInput.addEventListener('input', function () { vm.title = titleInput.value; sync(); });
+    editor.addEventListener('input', function () { vm.content.value = editor.innerText.replace(/\n$/, ''); sync(); });
+
+    // ---------------------------------------------------------------- 状态同步（代替 Vue 的响应式）
+    function launcherDisabled() {
+      var empty = !vm.content.value.replace(/\s/g, '').length && vm.tools.pic.data.length === 0;
+      return vm.loadingState.init || vm.loadingState.publish || empty;
+    }
+    function pad(n) { return (n < 10 ? '0' : '') + n; }
+    function sync() {
+      var t = vm.tools.timingSetting;
+      launcher.classList.toggle('disabled', launcherDisabled());
+      launcher.textContent = t.active ? '定时发布' : '发布';
+      picPanel.style.display = vm.tools.pic.active ? '' : 'none';
+      picTool.classList.toggle('active', vm.tools.pic.active);
+      if (t.active) {
+        var d = new Date(t.data.datetime || Date.now());
+        datetimePanel.style.display = '';
+        datetimePanel.textContent = '定时发布：' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+      } else {
+        datetimePanel.style.display = 'none';
+      }
+    }
+    setInterval(sync, 100);
+    sync();
+
+    // ---------------------------------------------------------------- 发布
+    function reset() {
+      vm.title = '';
+      if (titleInput) titleInput.value = '';
+      editor.innerHTML = '';
+      vm.content.value = '';
+      list = [];
+      queue = [];
+      syncPicData();
+      renderPics();
+      vm.tools.pic.active = false;
+      vm.tools.timingSetting.active = false;
+      vm.creationOption.value = 0;
+      vm.picModeOption.value = 0;
+      genUploadId();
+      sync();
+    }
+    function checkSpec() {
+      return new Promise(function (resolve) {
+        if (parseInt(cookie('dy_spec_agreed'), 10) === 1 && !SIM.spec_always) return resolve(true);
+        ev('spec_popup');
+        var el = document.createElement('div');
+        el.className = 'bili-popup bili-dyn-specification-popup';
+        el.innerHTML = '<div class="bili-popup__wrap"><div class="bili-dyn-specification-popup__content">' +
+          '<iframe src="//t.bilibili.com/h5/dynamic/specification"></iframe></div><div class="bili-dyn-specification-popup__footer">' +
+          '<button class="bili-button bili-dyn-specification-popup__btn primary">\n        确认并发送\n      </button>' +
+          '<button class="bili-button bili-dyn-specification-popup__btn plain">\n        取消\n      </button></div></div>';
+        document.body.appendChild(el);
+        var btns = el.querySelectorAll('.bili-dyn-specification-popup__btn');
+        btns[0].onclick = function () {
+          document.cookie = 'dy_spec_agreed=1; domain=.bilibili.com; path=/; max-age=31536000';
+          el.remove();
+          ev('spec_confirmed');
+          resolve(true);
+        };
+        btns[1].onclick = function () { el.remove(); ev('spec_cancelled'); resolve(false); };
+        // 模拟坐在有头浏览器前的人：过一会儿点「确认并发送」或「取消」
+        if (SIM.human_spec) {
+          setTimeout(function () { btns[SIM.human_spec === 'confirm' ? 0 : 1].click(); }, SIM.human_delay_ms || 1500);
+        }
+      });
+    }
+    async function create(opts) {
+      var dynReq = {
+        content: {contents: vm.content.value ? [{raw_text: vm.content.value, type: 1, biz_id: ''}] : []},
+        pics: opts.pics, scene: 2, upload_id: vm.uploadId,
+        meta: {app_meta: {from: 'create.dynamic.web', mobi_app: 'web'}},
+        option: {aigc: vm.creationOption.value === 1 ? 1 : 2}
+      };
+      if (vm.title) dynReq.content.title = vm.title;
+      if (opts.pics.length) dynReq.option.pic_mode = vm.picModeOption.value;
+      if (opts.datetime) dynReq.option.timer_pub_time = Math.floor(opts.datetime / 1e3);
+      var csrf = cookie('bili_jct') || '';
+      var chk = await postJson(API + '/x/dynamic/feed/create/submit_check?csrf=' + encodeURIComponent(csrf),
+                               {content: dynReq.content, pics: dynReq.pics, attach_card: null, scene: 2, create_option: dynReq.option});
+      if (chk.code) throw chk;
+      var res = await postJson(API + '/x/dynamic/feed/create/dyn?platform=web&csrf=' + encodeURIComponent(csrf), {dyn_req: dynReq});
+      if (res.code !== 0) throw res;
+      return res.data;
+    }
+    launcher.addEventListener('click', async function () {
+      var disabled = launcherDisabled();
+      ev('publish_clicked', {disabled: disabled, timing: !!vm.tools.timingSetting.active});
+      if (disabled) return;
+      var pics = [];
+      var pending = false;
+      vm.tools.pic.data.forEach(function (d) { if (d && d.img_src) pics.push(d); else pending = true; });
+      if (pending && !(await modal('图片上传中', '未上传完成的图片将不可见，是否直接发布？', '确认发布', '取消'))) return;
+      var t = vm.tools.timingSetting;
+      if (t.active) {
+        if (!(t.data.datetime > Date.now() + 3e5) &&
+            !(await modal('定时发布', '定时发布时间已过或距现在不足5分钟，是否立即发布？', '是', '否'))) return;
+        vm.loadingState.publish = true;
+        sync();
+        try {
+          await create({pics: pics, datetime: SIM.timing === 'drop' ? 0 : t.data.datetime});
+          toast('定时发布成功', 'success');
+          reset();
+        } catch (e) {
+          toast((e && e.message) || '发布失败，请重试', 'error');
+        }
+        vm.loadingState.publish = false;
+        sync();
+        return;
+      }
+      vm.loadingState.publish = true;
+      sync();
+      if (!(await checkSpec())) { vm.loadingState.publish = false; sync(); return; }
+      if (SIM.create === 'captcha') {
+        var cap = document.createElement('div');
+        cap.className = 'geetest_panel';
+        cap.innerHTML = '<div class="geetest_box"><div class="geetest_title">请完成安全验证</div></div>';
+        document.body.appendChild(cap);
+        ev('captcha_shown');
+        if (!SIM.human_captcha) return;
+        await sleep(SIM.human_delay_ms || 1500);  // 有头模式下人完成了验证
+        cap.remove();
+        ev('captcha_solved');
+      }
+      if (SIM.create === 'login_popup') {
+        var mask = document.createElement('div');
+        mask.className = 'bili-mini-mask';
+        mask.innerHTML = '<div class="bili-mini-login">请先登录</div>';
+        document.body.appendChild(mask);
+        ev('login_popup_shown');
+        vm.loadingState.publish = false;
+        sync();
+        return;
+      }
+      try {
+        await create({pics: pics});
+        toast('发布成功', 'success');
+        reset();
+      } catch (e) {
+        toast((e && e.message) || '发布失败', 'error');
+      }
+      vm.loadingState.publish = false;
+      sync();
+    });
+    ev('publisher_ready');
+  }
+
+  boot();
+})();
+</script>
+</body>
+</html>

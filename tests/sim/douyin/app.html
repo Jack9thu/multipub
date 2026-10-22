@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>抖音创作者中心</title>
+<style>
+  body { font-family: sans-serif; margin: 0; background: #f5f5f5; }
+  .header-bar { height: 56px; background: #fff; display: flex; align-items: center; padding: 0 24px; gap: 24px; }
+  #root { min-height: 100vh; }
+  .container-upload-page, .publish-page, .manage-page, .home-page { background: #fff; margin: 16px; padding: 24px; }
+  .tab-wrap { display: flex; gap: 24px; margin-bottom: 16px; }
+  .tab-item { cursor: pointer; padding: 8px 0; }
+  .tab-item.active { border-bottom: 2px solid #fe2c55; }
+  .container-drag-area { border: 1px dashed #ccc; height: 240px; display: flex; align-items: center; justify-content: center; }
+  .form-item { margin: 16px 0; }
+  .label { font-weight: bold; margin-bottom: 8px; }
+  .semi-input { width: 600px; height: 32px; }
+  .zone-container { width: 600px; min-height: 120px; border: 1px solid #ddd; padding: 8px; }
+  .cover-main-x1 { position: relative; width: 120px; height: 160px; background: #eee; }
+  .cover-main-x1 img { width: 120px; height: 160px; }
+  .cover-hover-x { display: none; position: absolute; inset: 0; background: rgba(0,0,0,.5); color: #fff;
+                   align-items: center; justify-content: center; cursor: pointer; }
+  .cover-main-x1:hover .cover-hover-x { display: flex; }
+  .recommend-list { display: flex; gap: 8px; margin-top: 8px; }
+  .recommend-list img { width: 60px; height: 80px; }
+  .declare-entry-x, .semi-select-selection { display: inline-block; min-width: 240px; padding: 6px; border: 1px solid #ddd; cursor: pointer; }
+  .semi-switch { display: inline-block; position: relative; width: 40px; height: 24px; background: #ccc; border-radius: 12px; }
+  .semi-switch-checked { background: #fe2c55; }
+  .semi-switch-native-control { position: absolute; inset: 0; opacity: 0; margin: 0; width: 100%; height: 100%; cursor: pointer; }
+  label[class^="radio"] { margin-right: 16px; cursor: pointer; }
+  .content-confirm-container { margin-top: 24px; }
+  .content-confirm-container button { width: 120px; height: 36px; margin-right: 16px; }
+  .semi-portal { position: absolute; left: 0; top: 0; width: 100%; z-index: 1000; }
+  .mention-wrapper-x { position: absolute; left: 40px; top: 260px; width: 700px; height: 1400px; background: #fff;
+                       border: 1px solid #ccc; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+  .semi-modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 2000; }
+  .semi-modal-wrap { position: fixed; inset: 0; z-index: 2001; display: flex; align-items: flex-start; justify-content: center; padding-top: 80px; }
+  .semi-modal-content { background: #fff; padding: 16px; min-width: 420px; }
+  .semi-modal-footer { margin-top: 16px; text-align: right; }
+  .semi-button-disabled { opacity: .5; cursor: not-allowed; }
+  .semi-popover-wrapper { position: absolute; background: #fff; border: 1px solid #ccc; width: 300px; }
+  .semi-select-option { padding: 6px; cursor: pointer; }
+  .semi-sidesheet-content { position: fixed; right: 0; top: 0; bottom: 0; width: 400px; background: #fff; z-index: 3000; border-left: 1px solid #ccc; padding: 16px; }
+  .apply-btn-LUPP0D { visibility: hidden; }
+  .semi-toast-wrapper { position: fixed; top: 20px; left: 0; right: 0; text-align: center; z-index: 9000; pointer-events: none; }
+  .semi-toast { display: inline-block; background: #333; color: #fff; padding: 8px 16px; }
+  .uc-ui-verify_mask { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 6000; }
+  .uc-ui-verify { position: fixed; left: 50%; top: 120px; transform: translateX(-50%); width: 380px; background: #fff; z-index: 6001; padding: 20px; }
+  .uc-ui-verify_sms-verify_button { margin-top: 12px; background: #fe2c55; color: #fff; text-align: center; padding: 8px; cursor: pointer; }
+  .uc-ui-verify_sms-get_code { margin-left: 8px; color: #fe2c55; cursor: pointer; }
+  #captcha_container { position: fixed; inset: 0; z-index: 7000; background: rgba(0,0,0,.5); }
+  .captcha-panel { background: #fff; margin: 100px auto; width: 340px; padding: 12px; }
+</style>
+<script>window.SIM = __SIM__;</script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(function () {
+  const S = window.SIM;
+  const PIXEL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+  const root = document.getElementById("root");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+  function el(html) { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstElementChild; }
+  function rec(type, data) {
+    try {
+      fetch("/sim/record", {method: "POST", keepalive: true,
+        body: JSON.stringify(Object.assign({type: type, url: location.pathname + location.search}, data || {}))});
+    } catch (e) {}
+  }
+  function toast(msg, ms) {
+    const t = el('<div class="semi-toast-wrapper"><div class="semi-toast"><span class="semi-toast-content-text"></span></div></div>');
+    t.querySelector("span").textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), ms || 2500);
+    rec("toast", {msg: msg});
+  }
+  function nav(url, mode) {
+    if (mode === "push") { history.pushState({}, "", url); route(); }
+    else location.assign(url);
+  }
+
+  // 整个创作者中心是一个 SPA：同一个文档里切换路由，上传中的文件、已选的设置都保存在 st 里
+  const st = {file: null, images: [], uploaded: false, uploads: 0, decl: null, coll: null, cover: null,
+              sync: !!S.sync_default, scheduled: false, timing: null, creating: false, smsOk: false,
+              captchaOk: false, bgm: null, kind: "video"};
+
+  async function route() {
+    if (!S.logged_in) {  // 未登录：前端发现后跳回登录页
+      setTimeout(() => location.replace("https://creator.douyin.com/"), 300);
+      return;
+    }
+    if (S.render_delay_ms) await sleep(S.render_delay_ms);
+    const p = location.pathname;
+    root.innerHTML = "";
+    root.appendChild(el('<div class="header-bar"><span class="logo">抖音创作者中心</span><span class="user-name">模拟用户</span></div>'));
+    if (p === "/creator-micro/content/upload") return renderUpload();
+    if (p === "/creator-micro/content/post/video" || p === "/creator-micro/content/publish") return renderVideo();
+    if (p === "/creator-micro/content/post/image") return renderNote();
+    if (p === "/creator-micro/content/manage") return renderManage();
+    root.appendChild(el('<div class="home-page"><h2>首页</h2><div class="data-overview">数据总览</div></div>'));
+  }
+  window.addEventListener("popstate", route);
+
+  // ------------------------------------------------------------ 上传页
+  function renderUpload() {
+    const box = el('<div class="container-upload-page">' +
+      '<div class="tab-wrap"><div class="tab-item active" data-tab="video">发布视频</div>' +
+      '<div class="tab-item" data-tab="image">发布图文</div><div class="tab-item">发布全景视频</div></div>' +
+      '<div class="container-drag-area" id="drag"></div></div>');
+    root.appendChild(box);
+    const drag = box.querySelector("#drag");
+    function showVideo() {
+      st.kind = "video";
+      drag.innerHTML = '<div class="container-inner-upload"><input class="upload-btn-input" type="file" ' +
+        'accept="video/mp4,video/x-m4v,video/*" style="display:none"><button class="upload-btn">上传视频</button>' +
+        '<div class="tips">点击上传 或直接将视频文件拖入此区域</div></div>';
+      drag.querySelector("input").addEventListener("change", (e) => {
+        const f = e.target.files[0];
+        if (!f) return;
+        st.file = {name: f.name, size: f.size};
+        rec("video_selected", st.file);
+        const url = S.page_version === "v1" ? "/creator-micro/content/publish?enter_from=publish_page"
+                                            : "/creator-micro/content/post/video?enter_from=publish_page";
+        setTimeout(() => { history.pushState({}, "", url); route(); }, 400);
+      });
+    }
+    function showImage() {
+      st.kind = "image";
+      drag.innerHTML = '<div class="container-inner-upload"><input class="upload-btn-input" type="file" multiple ' +
+        'accept="image/png,image/jpeg,image/jpg,image/bmp,image/webp,image/tif" style="display:none">' +
+        '<button class="upload-btn">上传图文</button><div class="tips">最多支持上传35张图片</div></div>';
+      drag.querySelector("input").addEventListener("change", (e) => {
+        const files = Array.from(e.target.files);
+        st.images = files.map((f) => ({name: f.name, size: f.size}));
+        rec("images_selected", {images: st.images});
+        drag.innerHTML = '<div class="progress-text">图片上传中…</div>';
+        setTimeout(() => {
+          st.uploaded = true;
+          history.pushState({}, "", "/creator-micro/content/post/image?default-tab=3&enter_from=publish_page&media_type=image&type=new");
+          route();
+        }, S.note_upload_ms);
+      });
+    }
+    box.querySelectorAll(".tab-item[data-tab]").forEach((t) => t.addEventListener("click", () => {
+      box.querySelectorAll(".tab-item").forEach((x) => x.classList.remove("active"));
+      t.classList.add("active");
+      t.dataset.tab === "image" ? showImage() : showVideo();
+    }));
+    showVideo();
+    if (S.sms === "on_enter" && !st.smsOk) setTimeout(showSms, 500);
+  }
+
+  // ------------------------------------------------------------ 视频发布页
+  function renderVideo() {
+    const page = el('<div class="publish-page">' +
+      '<div class="long-card-x1"><div class="video-name"></div><div class="progress-div" id="prog"><div class="progress-text">上传中 0%</div></div></div>' +
+      '<div id="form-slot"></div><div class="content-confirm-container" id="btns"></div></div>');
+    page.querySelector(".video-name").textContent = (st.file && st.file.name) || "video.mp4";
+    root.appendChild(page);
+    const early = S.page_version === "v1";
+    if (early) renderVideoForm(page);
+    startUpload(page, () => { if (!early) renderVideoForm(page); });
+  }
+
+  function startUpload(page, done) {
+    const prog = page.querySelector("#prog") || page.querySelector(".long-card-x1").appendChild(el('<div class="progress-div" id="prog"></div>'));
+    st.uploads += 1;
+    rec("upload_start", {n: st.uploads});
+    const fail = st.uploads <= (S.upload_fail_times || 0);
+    const total = Math.max(200, S.upload_ms);
+    const t0 = Date.now();
+    const timer = setInterval(() => {
+      const pct = Math.min(100, Math.floor((Date.now() - t0) / total * 100));
+      if (fail && pct >= 40) {
+        clearInterval(timer);
+        prog.innerHTML = '<div class="progress-fail">上传失败</div><div class="retry">点击重试' +
+          '<input type="file" class="upload-btn-input-retry" accept="video/*" style="display:none"></div>';
+        prog.querySelector("input").addEventListener("change", () => { rec("upload_retry", {}); startUpload(page, done); });
+        rec("upload_failed", {n: st.uploads});
+        return;
+      }
+      prog.innerHTML = '<div class="progress-text">上传中 ' + pct + "%</div>";
+      if (pct >= 100) {
+        clearInterval(timer);
+        st.uploaded = true;
+        prog.remove();
+        page.querySelector(".long-card-x1").appendChild(el('<div class="card-actions"><div class="reupload-btn">重新上传</div><div>预览视频</div></div>'));
+        rec("upload_done", {n: st.uploads});
+        updateButton();
+        done();
+      }
+    }, 200);
+  }
+
+  function scheduleHtml() {
+    return '<div class="form-item"><div class="label">发布设置</div><div class="publish-time-x"><span>发布时间</span> ' +
+      '<label class="radio-d4zkru" data-checked="true" id="r-now"><input type="checkbox" class="radio-native-p6VBGt" checked><span>立即发布</span></label>' +
+      '<label class="radio-d4zkru" data-checked="false" id="r-timing"><input type="checkbox" class="radio-native-p6VBGt"><span>定时发布</span></label>' +
+      '<div id="date-slot"></div></div></div>';
+  }
+
+  function titleHtml(max) {
+    return '<div class="form-item"><div class="label">作品标题</div><div class="semi-input-wrapper">' +
+      '<input class="semi-input semi-input-default" type="text" placeholder="填写作品标题，为作品获得更多流量" maxlength="' + max + '" id="title"></div></div>' +
+      '<div class="form-item"><div class="label">作品简介</div><div class="editor-wrap">' +
+      '<div class="zone-container editor-kit-container" contenteditable="true" id="desc"></div></div>' +
+      '<div class="editor-tools"><span>#添加话题</span> <span>@好友</span></div></div>';
+  }
+
+  function renderVideoForm(page) {
+    const f = el('<div class="form-wrap">' + titleHtml(30) +
+      '<div class="form-item"><div class="label">设置封面</div><div class="coverControl-x">' +
+      '<div class="cover-main-x1" id="cover"><img src="' + PIXEL + '" class="cover-img"><div class="cover-hover-x" id="cover-hover">选择封面</div></div>' +
+      '<div class="recommend-list"><div class="recommendCover-a1"><img src="' + PIXEL + '"></div><div class="recommendCover-a2"><img src="' + PIXEL + '"></div></div></div></div>' +
+      '<div class="form-item"><div class="label">自主声明</div><div class="declare-entry-x" id="decl-entry"><span>请选择自主声明</span></div></div>' +
+      '<div class="form-item"><div class="label">添加合集</div><div class="select-collection-x7 semi-select" id="coll"><div class="semi-select-selection"><span class="semi-select-selection-placeholder">请选择合集</span></div></div></div>' +
+      '<div class="form-item"><div class="info-x9"><div class="first-part-y3"><div><div class="semi-switch' + (st.sync ? " semi-switch-checked" : "") + '" id="sync">' +
+      '<input type="checkbox" class="semi-switch-native-control"' + (st.sync ? " checked" : "") + '><div class="semi-switch-knob"></div></div></div>' +
+      '<span class="sync-label">同步至今日头条、西瓜视频</span></div></div></div>' +
+      scheduleHtml() + "</div>");
+    page.querySelector("#form-slot").appendChild(f);
+    wireEditor(f); wireCover(f); wireDecl(f); wireColl(f); wireSync(f); wireSchedule(f);
+    renderButtons(page);
+    if (S.captcha === "on_form") setTimeout(showCaptcha, 300);  // 表单一出来就弹人机验证（还没点发布）
+  }
+
+  // ------------------------------------------------------------ 图文发布页
+  function renderNote() {
+    st.kind = "image";
+    const page = el('<div class="publish-page image-publish"><div class="image-list"></div><div id="form-slot"></div>' +
+      '<div class="content-confirm-container" id="btns"></div></div>');
+    const list = page.querySelector(".image-list");
+    st.images.forEach((i) => {
+      const item = el('<div class="image-item"><img src="' + PIXEL + '"><span></span></div>');
+      item.querySelector("span").textContent = i.name;
+      list.appendChild(item);
+    });
+    root.appendChild(page);
+    const f = el('<div class="form-wrap">' + titleHtml(20) +
+      '<div class="form-item"><div class="label">选择音乐</div><div class="music-x"><span class="music-btn">选择音乐</span><span id="bgm-name"></span></div></div>' +
+      scheduleHtml() + "</div>");
+    page.querySelector("#form-slot").appendChild(f);
+    wireEditor(f); wireSchedule(f); wireMusic(f);
+    renderButtons(page);
+  }
+
+  // ------------------------------------------------------------ 表单部件
+  function wireEditor(f) {
+    const ed = f.querySelector("#desc");
+    let portal = null;
+    const close = () => { if (portal) { portal.remove(); portal = null; } };
+    ed.addEventListener("input", () => {
+      const text = ed.innerText;
+      const m = text.match(/#([^\s#]*)$/);
+      if (m) {  // 话题联想下拉：盖在下面的表单上，拦截点击
+        if (!portal) {
+          portal = el('<div class="semi-portal"><div class="mention-wrapper-x publish-mention-wrapper"></div></div>');
+          document.body.appendChild(portal);
+        }
+        portal.firstChild.innerHTML = "";
+        ["", "日常", "生活"].forEach((sfx) => {
+          const it = el('<div class="mention-item"></div>');
+          it.textContent = "#" + m[1] + sfx + "  " + (Math.floor(Math.random() * 900) + 100) + "万次播放";
+          portal.firstChild.appendChild(it);
+        });
+      } else close();
+    });
+    // mention_close: escape（Esc/空格收起，默认）| sticky（只有编辑框失焦才收起：Esc 无效）
+    ed.addEventListener("keydown", (e) => { if (S.mention_close !== "sticky" && (e.key === "Escape" || e.key === " ")) close(); });
+    ed.addEventListener("blur", () => setTimeout(close, 100));
+  }
+
+  function wireCover(f) {
+    f.querySelector("#cover-hover").addEventListener("click", openCoverModal);
+    f.querySelectorAll('[class^="recommendCover-"]').forEach((c, i) => c.addEventListener("click", () => {
+      const m = el('<div class="semi-portal"><div class="semi-modal-mask"></div><div class="semi-modal-wrap"><div class="semi-modal"><div class="semi-modal-content">' +
+        '<div class="semi-modal-body">是否确认应用此封面？</div><div class="semi-modal-footer"><button class="semi-button">取消</button>' +
+        '<button class="semi-button semi-button-primary">确定</button></div></div></div></div></div>');
+      document.body.appendChild(m);
+      const [cancel, ok] = m.querySelectorAll("button");
+      cancel.addEventListener("click", () => m.remove());
+      ok.addEventListener("click", () => { st.cover = {source: "recommend", index: i}; rec("cover_set", st.cover); m.remove(); });
+    }));
+  }
+
+  function openCoverModal() {
+    if (document.querySelector(".dy-creator-content-modal")) return;
+    rec("cover_modal_open", {});
+    const m = el('<div class="dy-creator-content-portal"><div class="semi-modal-mask"></div><div class="semi-modal-wrap">' +
+      '<div class="semi-modal dy-creator-content-modal"><div class="semi-modal-content">' +
+      '<div class="semi-modal-header">设置封面</div>' +
+      '<div class="cover-tabs"><span class="tab active" data-o="portrait">设置竖封面</span> <span class="tab" data-o="landscape">设置横封面</span></div>' +
+      '<div class="cover-body"><div class="ai-ref"><div class="semi-upload"><div class="semi-upload-drag-area semi-upload-drag-area-custom"><span>+</span></div>' +
+      '<input type="file" class="semi-upload-hidden-input" accept="image/*" style="display:none"><input type="file" class="semi-upload-hidden-input-replace" style="display:none"></div><div>生成参考图</div></div>' +
+      '<div class="frame-area"><div class="semi-upload"><div class="semi-upload-drag-area"><div class="semi-upload-drag-area-main-text">点击上传文件或拖拽文件到此处</div></div>' +
+      '<input type="file" class="semi-upload-hidden-input" accept="image/png,image/jpeg,image/jpg" style="display:none"><input type="file" class="semi-upload-hidden-input-replace" style="display:none"></div>' +
+      '<div class="cover-status"></div></div></div>' +
+      '<div class="semi-modal-footer"><button class="semi-button semi-button-tertiary">取消</button> ' +
+      '<button class="semi-button semi-button-primary semi-button-disabled" aria-disabled="true" id="cover-done">完成</button></div>' +
+      "</div></div></div></div>");
+    document.body.appendChild(m);
+    let orientation = "portrait", pending = null;
+    m.querySelectorAll(".cover-tabs .tab").forEach((t) => t.addEventListener("click", () => {
+      m.querySelectorAll(".cover-tabs .tab").forEach((x) => x.classList.remove("active"));
+      t.classList.add("active");
+      orientation = t.dataset.o;
+    }));
+    const [aiInput] = m.querySelectorAll(".ai-ref input.semi-upload-hidden-input");
+    const frameInput = m.querySelector(".frame-area input.semi-upload-hidden-input");
+    const done = m.querySelector("#cover-done");
+    aiInput.addEventListener("change", () => { rec("cover_ai_slot", {}); m.querySelector(".cover-status").textContent = "AI 生成中…"; });
+    frameInput.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      m.querySelector(".cover-status").textContent = "检测中…";
+      if (S.cover_stuck) { rec("cover_stuck", {}); return; }  // 封面一直「检测中」，「完成」不解禁、弹窗关不掉
+      setTimeout(() => {
+        pending = {source: "upload", name: file && file.name, orientation: orientation};
+        m.querySelector(".cover-status").textContent = "检测通过";
+        done.classList.remove("semi-button-disabled");
+        done.removeAttribute("aria-disabled");
+      }, 1200);
+    });
+    m.querySelector(".semi-button-tertiary").addEventListener("click", () => m.remove());
+    done.addEventListener("click", () => {
+      if (done.classList.contains("semi-button-disabled")) return;
+      st.cover = pending;
+      rec("cover_set", st.cover);
+      m.remove();
+    });
+  }
+
+  function wireDecl(f) {
+    const entry = f.querySelector("#decl-entry");
+    entry.addEventListener("click", () => {
+      if (document.querySelector(".decl-modal")) return;
+      const m = el('<div class="semi-portal decl-modal"><div class="semi-modal-mask"></div><div class="semi-modal-wrap"><div class="semi-modal"><div class="semi-modal-content">' +
+        '<div class="semi-modal-header"><span>请选择声明类型（单选）</span></div><div class="semi-modal-body"><div class="semi-radioGroup"></div></div>' +
+        '<div class="semi-modal-footer"><button class="semi-button semi-button-tertiary">取消</button> <button class="semi-button semi-button-primary">确定</button></div>' +
+        "</div></div></div></div>");
+      const group = m.querySelector(".semi-radioGroup");
+      let chosen = st.decl;
+      S.declarations.forEach((d) => {
+        const lab = el('<label class="semi-radio"><span class="semi-radio-inner"><input type="radio" class="semi-radio-input" name="decl"></span><span class="semi-radio-addon"></span></label>');
+        lab.querySelector(".semi-radio-addon").textContent = d;
+        if (d === chosen) { lab.classList.add("semi-radio-checked"); lab.querySelector("input").checked = true; }
+        lab.addEventListener("click", (e) => {
+          e.preventDefault();
+          chosen = d;
+          group.querySelectorAll("label").forEach((x) => { x.classList.remove("semi-radio-checked"); x.querySelector("input").checked = false; });
+          lab.classList.add("semi-radio-checked");
+          lab.querySelector("input").checked = true;
+        });
+        group.appendChild(lab);
+      });
+      document.body.appendChild(m);
+      m.querySelector(".semi-button-tertiary").addEventListener("click", () => m.remove());
+      m.querySelector(".semi-button-primary").addEventListener("click", () => {
+        if (chosen) { st.decl = chosen; entry.querySelector("span").textContent = chosen; rec("declaration_set", {value: chosen}); }
+        m.remove();
+      });
+    });
+  }
+
+  function wireColl(f) {
+    const trigger = f.querySelector("#coll");
+    trigger.querySelector(".semi-select-selection").addEventListener("click", () => {
+      if (document.querySelector(".coll-dropdown")) return;
+      const r = trigger.getBoundingClientRect();
+      const d = el('<div class="semi-portal coll-dropdown"><div class="semi-popover-wrapper"><div class="semi-select-option-list"></div></div></div>');
+      d.firstChild.style.left = r.left + "px";
+      d.firstChild.style.top = (r.bottom + window.scrollY) + "px";
+      S.collections.forEach((c) => {
+        const o = el('<div class="semi-select-option collection-option"><span class="option-title-x2"></span><span class="option-count">3个作品</span></div>');
+        o.querySelector(".option-title-x2").textContent = c;
+        o.addEventListener("click", () => {
+          st.coll = c;
+          trigger.querySelector(".semi-select-selection").textContent = c;
+          rec("collection_set", {value: c});
+          d.remove();
+        });
+        d.querySelector(".semi-select-option-list").appendChild(o);
+      });
+      document.body.appendChild(d);
+    });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") document.querySelectorAll(".coll-dropdown").forEach((x) => x.remove()); });
+  }
+
+  function wireSync(f) {
+    const sw = f.querySelector("#sync");
+    sw.querySelector("input").addEventListener("change", (e) => {
+      st.sync = e.target.checked;
+      sw.classList.toggle("semi-switch-checked", st.sync);
+      rec("sync_toggled", {value: st.sync});
+    });
+  }
+
+  function pad(n) { return String(n).padStart(2, "0"); }
+  function fmt(d) { return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes()); }
+
+  function wireSchedule(f) {
+    const now = f.querySelector("#r-now"), tim = f.querySelector("#r-timing"), slot = f.querySelector("#date-slot");
+    function select(timing) {
+      st.scheduled = timing;
+      now.dataset.checked = String(!timing); tim.dataset.checked = String(timing);
+      now.querySelector("input").checked = !timing; tim.querySelector("input").checked = timing;
+      slot.innerHTML = "";
+      if (!timing) { st.timing = null; return; }
+      const d = new Date(Date.now() + (S.schedule_min_lead_min + 60) * 60000);
+      d.setMinutes(0);
+      st.timing = fmt(d);
+      slot.appendChild(el('<div class="semi-datepicker"><div class="semi-input-wrapper"><input class="semi-input semi-input-default" placeholder="日期和时间"></div></div>'));
+      const input = slot.querySelector("input");
+      input.value = st.timing;
+      input.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter") return;
+        const m = input.value.trim().match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/);
+        const when = m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) : null;
+        if (when && when.getTime() >= Date.now() + S.schedule_min_lead_min * 60000) {
+          st.timing = fmt(when);
+          rec("schedule_set", {value: st.timing});
+        } else {
+          rec("schedule_rejected", {value: input.value});
+        }
+        input.value = st.timing;
+        input.blur();
+      });
+    }
+    now.addEventListener("click", (e) => { e.preventDefault(); select(false); });
+    tim.addEventListener("click", (e) => {
+      e.preventDefault();
+      if (S.schedule_swallow) { rec("schedule_click_swallowed", {}); return; }
+      select(true);
+    });
+  }
+
+  function wireMusic(f) {
+    f.querySelector(".music-btn").addEventListener("click", () => {
+      if (document.querySelector(".semi-sidesheet-content")) return;
+      const sh = el('<div class="semi-sidesheet"><div class="semi-sidesheet-content"><div class="semi-sidesheet-header">选择音乐<span class="semi-sidesheet-close">×</span></div>' +
+        '<input class="semi-input" placeholder="搜索音乐"><div class="music-results"></div></div></div>');
+      document.body.appendChild(sh);
+      const close = () => sh.remove();
+      sh.querySelector(".semi-sidesheet-close").addEventListener("click", close);
+      const input = sh.querySelector("input");
+      input.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter") return;
+        const res = sh.querySelector(".music-results");
+        res.innerHTML = "";
+        setTimeout(() => {
+          S.musics.filter((x) => x.indexOf(input.value.trim()) >= 0).forEach((x) => {
+            const card = el('<div class="card-container-tmocjc"><span class="song-name-oRge4d"></span><button class="apply-btn-LUPP0D">使用</button></div>');
+            card.querySelector(".song-name-oRge4d").textContent = x;
+            card.querySelector("button").addEventListener("click", () => {
+              st.bgm = x;
+              f.querySelector("#bgm-name").textContent = x;
+              rec("bgm_set", {value: x});
+              close();
+            });
+            res.appendChild(card);
+          });
+        }, 500);
+      });
+    });
+  }
+
+  // ------------------------------------------------------------ 发布
+  function showGuide() {  // 新手引导（shepherd）：整页遮罩，拦截点击，点「我知道了」才消失
+    if (!S.guide || st.guideShown) return;
+    st.guideShown = true;
+    rec("guide_shown", {});
+    const g = el('<div class="shepherd-modal-overlay-container shepherd-modal-is-visible" style="position:fixed;inset:0;z-index:8000;background:rgba(0,0,0,.5)"></div>');
+    const tip = el('<div class="shepherd-element" style="position:fixed;left:30%;top:30%;z-index:8001;background:#fff;padding:12px">新功能：可以给作品添加合集啦 <button class="shepherd-button">我知道了</button></div>');
+    document.body.appendChild(g); document.body.appendChild(tip);
+    tip.querySelector("button").addEventListener("click", () => { g.remove(); tip.remove(); });
+  }
+
+  function renderButtons(page) {
+    const b = page.querySelector("#btns");
+    b.innerHTML = '<button class="button-dhlUZE primary-cECiOJ fixed-J9O8Yw" id="publish">发布</button>' +
+                  '<button class="button-dhlUZE secondary-x">暂存离开</button>';
+    b.querySelector("#publish").addEventListener("click", onPublish);
+    updateButton();
+    setTimeout(showGuide, 300);
+    if (S.notice_on_form) setTimeout(showNotice, 200);
+    if (S.publish_mask) setTimeout(showPublishMask, 300);
+  }
+
+  function showNotice() {  // 平台公告弹窗：遮罩盖住整页，只能点「我知道了」关闭（Esc 无效）
+    if (st.noticeShown) return;
+    st.noticeShown = true;
+    rec("notice_shown", {});
+    const m = el('<div class="semi-portal notice-portal"><div class="semi-modal-mask"></div><div class="semi-modal-wrap"><div class="semi-modal"><div class="semi-modal-content">' +
+      '<div class="semi-modal-header">创作者服务通知</div><div class="semi-modal-body">平台规则已更新，请知悉。</div>' +
+      '<div class="semi-modal-footer"><button class="semi-button semi-button-primary">我知道了</button></div></div></div></div></div>');
+    m.querySelector("button").addEventListener("click", () => { rec("notice_closed", {}); m.remove(); });
+    document.body.appendChild(m);
+  }
+
+  function showPublishMask() {  // 盖在「发布」按钮上、关不掉的浮层（活动挂件之类）
+    const btn = document.getElementById("publish");
+    if (!btn) return;
+    const r = btn.getBoundingClientRect();
+    const m = el('<div class="activity-mask-x"></div>');
+    m.style.cssText = "position:absolute;z-index:5000;background:rgba(0,0,0,.3);left:" + (r.left + window.scrollX - 10) +
+      "px;top:" + (r.top + window.scrollY - 10) + "px;width:" + (r.width + 300) + "px;height:" + (r.height + 20) + "px";
+    m.addEventListener("click", () => rec("mask_clicked", {}));
+    document.body.appendChild(m);
+    rec("publish_mask_shown", {});
+  }
+
+  function updateButton() {
+    const btn = document.getElementById("publish");
+    if (!btn) return;
+    if (S.disable_until_uploaded && !st.uploaded) btn.setAttribute("disabled", "");
+    else btn.removeAttribute("disabled");
+  }
+
+  async function onPublish(ev) {
+    rec("publish_click", {trusted: ev.isTrusted, creating: st.creating});
+    if (st.creating) return;  // 请求进行中：按钮处于 loading，点击无效
+    if (!st.uploaded) { toast("视频还在上传中，请稍后发布"); return; }
+    if (S.create === "noop") return;
+    if (S.require_cover && st.kind === "video" && !st.cover) { toast("请设置封面后再发布", 4000); return; }
+    if (S.captcha === "on_click" && !st.captchaOk) { showCaptcha(); return; }
+    if (S.sms === "on_click" && !st.smsOk) { showSms(); return; }
+    await doCreate();
+  }
+
+  async function doCreate() {
+    st.creating = true;
+    const btn = document.getElementById("publish");
+    if (btn) btn.classList.add("semi-button-loading");
+    const desc = (document.getElementById("desc") || {}).innerText || "";
+    const title = (document.getElementById("title") || {}).value || "";
+    const payload = {item: {
+      common: {text: desc, item_title: title, media_type: st.kind === "video" ? 4 : 2,
+               timing: st.scheduled ? Math.floor(new Date(st.timing.replace(" ", "T")).getTime() / 1000) : 0},
+      schedule_text: st.scheduled ? st.timing : null,
+      tags: (desc.match(/#[^\s#]+/g) || []).map((t) => t.slice(1)),
+      declare: st.decl, mix: st.coll, cover: st.cover, sync_toutiao: st.sync,
+      video: st.kind === "video" ? st.file : null, images: st.kind === "image" ? st.images : null, bgm: st.bgm,
+    }};
+    let j = null;
+    try {
+      const r = await fetch("/web/api/media/aweme/create_v2/?read_aid=2906&cookie_enabled=true",
+        {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(payload)});
+      j = await r.json();
+    } catch (e) {}
+    st.creating = false;
+    if (btn) btn.classList.remove("semi-button-loading");
+    if (j && j.status_code === 0) {
+      toast("发布成功");
+      if (S.redirect !== "none") {
+        await sleep(S.redirect_delay_ms);
+        nav("/creator-micro/content/manage?enter_from=publish", S.redirect);
+      }
+    } else if (j && j.status_code === 2190) {
+      showSms();
+    } else {
+      toast((j && j.status_msg) || "网络异常，请稍后重试", 4000);
+    }
+  }
+
+  function showSms() {
+    if (document.getElementById("uc-verify")) return;
+    rec("sms_dialog", {});
+    const d = el('<div class="uc-ui-verify_portal" id="uc-verify"><div class="uc-ui-verify_mask"></div><div class="uc-ui-verify uc-ui-verify_sms">' +
+      '<div class="uc-ui-verify_title">身份验证</div>' +
+      '<div class="uc-ui-verify_desc">为保障账号安全，请完成短信验证，验证码将发送至 138****0000</div>' +
+      '<div class="uc-ui-verify_sms-input"><input type="tel" class="uc-ui-input" placeholder="请输入验证码" maxlength="6">' +
+      '<span class="uc-ui-verify_sms-get_code">获取验证码</span></div><div class="uc-ui-verify_error"></div>' +
+      '<div class="uc-ui-verify_sms-verify_button">验证</div></div></div>');
+    document.body.appendChild(d);
+    if (S.sms_user_closes_ms) {  // 用户在浏览器窗口里自己输入验证码完成了验证（--headed）
+      setTimeout(() => {
+        rec("sms_user_verified", {});
+        d.remove();
+        st.smsOk = true;
+        if (S.sms_resubmit === "auto" && document.getElementById("publish")) doCreate();
+      }, S.sms_user_closes_ms);
+    }
+    const get = d.querySelector(".uc-ui-verify_sms-get_code");
+    get.addEventListener("click", async () => {
+      if (get.dataset.sent) return;
+      get.dataset.sent = "1";
+      await fetch("/sim/sms/send", {method: "POST"});
+      get.textContent = "重新发送(60s)";
+    });
+    d.querySelector(".uc-ui-verify_sms-verify_button").addEventListener("click", async () => {
+      const code = d.querySelector("input").value.trim();
+      const r = await fetch("/sim/sms/verify", {method: "POST", body: JSON.stringify({code: code})});
+      const j = await r.json();
+      if (j.ok) {
+        d.remove();
+        st.smsOk = true;
+        if (S.sms_resubmit === "auto" && document.getElementById("publish")) doCreate();
+      } else {
+        d.querySelector(".uc-ui-verify_error").textContent = "验证码错误，请重新输入";
+      }
+    });
+  }
+
+  function showCaptcha() {
+    if (document.getElementById("captcha_container")) return;
+    rec("captcha_shown", {});
+    document.body.appendChild(el('<div id="captcha_container" class="captcha_verify_container"><div class="captcha-panel">' +
+      '<div>请完成下列验证后继续</div><div class="captcha_verify_img">[拼图]</div><div>按住左边按钮拖动完成上方拼图</div></div></div>'));
+  }
+
+  function renderManage() {
+    root.appendChild(el('<div class="manage-page"><h2>作品管理</h2><div class="video-card">审核中</div></div>'));
+  }
+
+  route();
+})();
+</script>
+</body>
+</html>

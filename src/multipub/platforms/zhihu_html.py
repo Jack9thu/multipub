@@ -13,6 +13,9 @@
 - 脚注 [^1] → 知乎参考文献 <sup data-draft-type="reference" …>[1]</sup>，文末脚注列表去掉
 - 图片：调用方先上传到知乎图床，传入 {Markdown 里的原始地址: ZhihuImage}
 - 原始 HTML 原样保留，HTML 注释去掉
+- Markdown 认不出来、会被当成普通文字发出去的图片写法：Obsidian 的 ![[图.png]] / ![[图.png|300]]，
+  以及路径里有空格又没加尖括号的 ![说明](图片/我的 图.png)。指向图片文件的照样当图片处理（collect_image_refs
+  标出 kind，调用方据此解析路径），其余（如 ![[某篇笔记]]）由 unrecognized_images() 报给 validate
 
 只依赖 mistune（纯 Python），不联网。
 """
@@ -39,6 +42,11 @@ _URL_RE = re.compile(r"https?://[^\s<>()\]]+")
 _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((https?://[^\s)]+)[^)]*\)")
 _UNSAFE_SCHEMES = ("javascript:", "vbscript:", "data:")
 _RAW_IMG_RE = re.compile(r"""<img\b[^>]*?\bsrc\s*=\s*["']?([^"'\s>]+)""", re.I)
+# 普通文字里残留的图片写法：Obsidian 嵌入 ![[…]]；路径带空格、Markdown 没认出来的 ![说明](路径 "标题")
+_TEXT_IMG_RE = re.compile(
+    r"!\[\[(?P<embed>[^\[\]\n]+?)\]\]"
+    r"|!\[(?P<alt>[^\[\]\n]*)\]\(\s*<?(?P<src>[^<>()\n]+?)>?(?:\s+(?:\"[^\"\n]*\"|'[^'\n]*'))?\s*\)")
+_IMAGE_FILE_RE = re.compile(r"\.(?:png|jpe?g|gif|webp|bmp)$", re.I)
 
 
 @dataclass
@@ -78,15 +86,61 @@ def _walk(tokens: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
         yield from _walk(tok.get("children") or [])
 
 
+def _text_segments(raw: str) -> list[tuple[str, str, str]]:
+    """普通文字拆成 (kind, 内容, 说明)：kind 是 text / embed / loose（这两种是图片）/ bad（认不出来的嵌入）。"""
+    out: list[tuple[str, str, str]] = []
+    pos = 0
+    for m in _TEXT_IMG_RE.finditer(raw):
+        if m.group("embed") is not None:
+            # ![[文件名|宽度]] / ![[文件名#标题]]：只取文件名
+            target = m.group("embed").split("|", 1)[0].split("#", 1)[0].strip()
+            kind, alt = "embed", ""
+        else:
+            target, kind, alt = m.group("src").strip(), "loose", m.group("alt").strip()
+        if m.start() > pos:
+            out.append(("text", raw[pos:m.start()], ""))
+        if target and _IMAGE_FILE_RE.search(target.split("?", 1)[0]):
+            out.append((kind, target, alt))
+        else:
+            out.append(("bad", m.group(0), ""))
+        pos = m.end()
+    if pos < len(raw):
+        out.append(("text", raw[pos:], ""))
+    return out
+
+
+def collect_image_refs(markdown: str) -> list[tuple[str, str]]:
+    """正文里的图片：[(原样地址, kind)]，按出现顺序去重。kind：md（标准 Markdown 图片）/ embed（Obsidian
+    ![[图.png]]，按文件名找）/ loose（路径有空格、Markdown 没认出来的 ![](a b.png)）。"""
+    tokens, _ = _parse(markdown)
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for tok in _walk(tokens):
+        kind = tok.get("type")
+        found: list[tuple[str, str]] = []
+        if kind == "image":
+            found = [(str((tok.get("attrs") or {}).get("url") or ""), "md")]
+        elif kind == "text":
+            found = [(ref, k) for k, ref, _ in _text_segments(str(tok.get("raw") or "")) if k in ("embed", "loose")]
+        for ref, k in found:
+            if ref and ref not in seen:
+                seen.add(ref)
+                out.append((ref, k))
+    return out
+
+
 def collect_image_urls(markdown: str) -> list[str]:
     """Markdown 里引用的图片地址（按出现顺序去重，原样返回）。"""
+    return [ref for ref, _ in collect_image_refs(markdown)]
+
+
+def unrecognized_images(markdown: str) -> list[str]:
+    """会被当成普通文字发出去的嵌入写法（如 Obsidian 的 ![[某篇笔记]]）。代码块里的不算。"""
     tokens, _ = _parse(markdown)
     out: list[str] = []
     for tok in _walk(tokens):
-        if tok.get("type") == "image":
-            url = str((tok.get("attrs") or {}).get("url") or "")
-            if url and url not in out:
-                out.append(url)
+        if tok.get("type") == "text":
+            out += [raw for k, raw, _ in _text_segments(str(tok.get("raw") or "")) if k == "bad" and raw not in out]
     return out
 
 
@@ -270,7 +324,8 @@ class _Renderer:
         attrs = tok.get("attrs") or {}
         raw = str(tok.get("raw") or "")
         if kind == "text":
-            return _text(raw)
+            return "".join(_text(part) if k in ("text", "bad") else self.image(part, alt)
+                           for k, part, alt in _text_segments(raw))
         if kind in ("softbreak", "linebreak"):
             return _BREAK
         if kind == "strong":

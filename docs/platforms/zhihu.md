@@ -53,7 +53,13 @@ platforms:
 ```
 
 本地图片的相对路径按 **`body_file` 所在目录** 解析，找不到再按 `post.yaml` 所在目录；支持中文、空格（Markdown 里写
-`![](<我的 图.png>)`）、`file:///` 和绝对路径。
+`![](<我的 图.png>)`，直接写 `![](我的 图.png)` 也认）、`file:///` 和绝对路径。
+
+**Obsidian 笔记**：`![[图.png]]`、`![[附件/图.png|300]]`（宽度忽略）这种嵌入写法也当图片上传。和 Obsidian 一样按库查找：
+往上找到含 `.obsidian` 文件夹的库根目录，先按相对库根目录的路径找，再在整个库里按文件名找（广度优先、越浅越优先，
+最多 6 层、3000 个目录，跳过隐藏目录）；认不出库根目录时只在 Markdown / `post.yaml` 所在目录和它们的上一层里找，
+不会翻遍整个用户目录挑中同名的别的图。`![[某篇笔记]]` 这种嵌入笔记知乎没有对应写法，`validate` 会报错（否则会原样当
+文字发出去）。
 
 ### config.toml 可调项（`[platforms.zhihu]`）
 
@@ -73,6 +79,7 @@ platforms:
 | 文章正文里的本地图片 | 文件必须存在；不支持 `data:` 内嵌图 | error |
 | 文章的 `images` | 文件必须存在（想法的图片由通用校验检查） | error |
 | 正文里的原始 HTML `<img>` | 不会上传到知乎图床（`*.zhimg.com` 的除外），可能显示不出来，请改用 `![](路径)` | warning |
+| 正文里认不出来的嵌入 | `![[某篇笔记]]`、`![说明](不是图片的东西)` 会原样当文字发出去 | error |
 | 图片格式 | `.jpg .jpeg .png .gif .webp .bmp`；webp/bmp 自动转 JPEG | error |
 | GIF | 动图只保留第一帧（转成 JPEG） | warning |
 | 创作声明 | 只能是上表 6 个值；与 `ai_generated` 冲突时以 `statement` 为准 | error / warning |
@@ -102,6 +109,7 @@ platforms:
 | `$公式$` / `$$公式$$` | `<img eeimg="1|2" src="//www.zhihu.com/equation?tex=…">` |
 | 脚注 `[^1]` | `<sup data-text data-url data-draft-type="reference" data-numero>`，脚注列表去掉（知乎自动生成「参考」） |
 | 图片 | 先传到知乎图床，再写成带 `data-rawwidth / data-original-src / data-watermark-src …` 的 `<img>`；`![]()` 空地址丢掉 |
+| Obsidian `![[图.png]]`、路径带空格的 `![说明](a b.png)` | 同上（CommonMark 不认它们，会被当成普通文字，这里单独识别；代码里的不算） |
 | 链接 | `<a href>`（`javascript:` 等改成 `#`） |
 | 原始 HTML | 原样保留，HTML 注释去掉 |
 
@@ -126,14 +134,18 @@ mpub login zhihu --account main --headless    # 无头：扫上报的二维码�
 mpub check zhihu --account main
 ```
 
-1. 已有登录文件、`GET /api/v4/me` 正常、且没有待完成的风控验证（见第 4 条）→ 直接返回「已登录」（要换号先删除登录文件）。
+1. 已有登录文件、`GET /api/v4/me` 正常、有 `_xsrf` cookie、且没有待完成的风控验证（见第 4 条）→ 直接返回「已登录」
+   （要换号先删除登录文件）。登录有效但**缺 `_xsrf`**（手动放的只有 `z_c0` 的文件，或上次登录时首页没打开）：
+   `/me` 照样正常、写接口却会被拒，所以这时带着现有登录态打开知乎首页补齐 cookie，**不用重新扫码**。
 2. 否则打开 `https://www.zhihu.com/signin`。登录页自己请求二维码接口（`/api/v3/account/api/login/qrcode`）时，
    拦截返回的 `link` 重新生成二维码 PNG（`<数据目录>/qrcode/zhihu-<账号>.png`）并上报 `qrcode` 事件；
    8 秒内没拦到就截取二维码区域（或整页）作为替代。二维码刷新会再次上报。
-3. 等到 `z_c0` cookie 出现。最长等待 = 本次任务的总超时（`ctx.timeout`，即 `--timeout` 或 `timeouts.login` − 30）
+3. 等到 `z_c0` cookie 出现（扫完码马上关掉窗口也算：cookie 还在浏览器上下文里，会另开一个页面补齐首页 cookie；
+   还没扫码就关掉窗口则立即报「浏览器窗口已关闭」）。最长等待 = 本次任务的总超时（`ctx.timeout`，即 `--timeout` 或 `timeouts.login` − 30）
    − 45 秒，从任务开始算（默认 300 → 270 → 225 秒），留出收尾时间，免得扫完码被 worker 的总超时打断。
    一拿到 `z_c0` 就先把 `storage_state` 存到 `<数据目录>/accounts/zhihu/<账号>.json`，再打开一次首页补齐
-   `_xsrf` / `d_c0` 并覆盖保存，然后用接口校验一次；首页刷新慢或任务超时也不会白扫一次码。
+   `_xsrf` / `d_c0`（等 2 秒，没有 `_xsrf` 再最多等 5 秒）并覆盖保存，然后用接口校验一次；首页刷新慢或任务超时也不会
+   白扫一次码。最后仍没有 `_xsrf` 时，结果里会提示再运行一次 `mpub login`（不用重新扫码）。
    登录浏览器的 User-Agent 记到 `accounts/zhihu/<账号>.ua.txt`（无头模式的 `HeadlessChrome` 改回 `Chrome`），
    之后发布请求沿用它，让登录和发布看起来是同一个浏览器；没有这个文件就用内置的 Windows Chrome UA。
 4. **风控验证**：发布或检查时遇到 40352，验证页地址会记到 `accounts/zhihu/<账号>.verify.txt`；
@@ -145,9 +157,10 @@ mpub check zhihu --account main
    之后任何一次发布成功（含只存草稿）都会删掉这个文件。
 
 登录文件也可以手动放：`storage_state` 格式、浏览器插件导出的 cookie 列表，或 `{"z_c0": "...", "_xsrf": "..."}` 都能读
-（UTF-8，可带 BOM）。
+（UTF-8，可带 BOM）；需要开浏览器（过风控验证、补 `_xsrf`）时会先转换成浏览器能用的格式。
 
-`mpub check` 调 `GET /api/v4/me?include=is_bind_phone`，返回用户名、是否绑定手机、`z_c0` 剩余天数。
+`mpub check` 调 `GET /api/v4/me?include=is_bind_phone`，返回用户名、是否绑定手机、`z_c0` 剩余天数；登录文件里没有
+`_xsrf` 时在结果里提示运行 `mpub login` 补齐。
 
 ## 发布流程与返回
 
@@ -180,6 +193,7 @@ mpub check zhihu --account main
 | 情况 | status / error_code |
 |---|---|
 | 没有登录文件、没有 `z_c0`、`z_c0` 过期、HTTP 401、`ERR_TICKET_NOT_EXIST`、被跳到登录页 | `needs_action` / `login_required` |
+| 登录文件里没有 `_xsrf`，写接口返回 403 | `needs_action` / `login_required`（提示运行 `mpub login` 补齐，不用重新扫码） |
 | HTTP 403 + `error.code=40352`（验证页地址写进 message）、`zh-zse-ck` 挑战、HTTP 429 | `needs_action` / `risk_control` |
 | 发布前网络错误、5xx、图片处理超时 | `failed`（可重试） |
 | 发布请求已发出后超时 / 断网 / 5xx / 返回无法识别 | `failed` / `unknown_outcome`（**先去知乎确认，不要直接重发**） |
@@ -190,6 +204,16 @@ mpub check zhihu --account main
 发布接口只调用一次，绝不自动重试。发布结果不是干净的成功时（被拒、结果未知、没拿到 id），发布接口的原始响应会存成
 `<数据目录>/runs/<本次运行>/zhihu/zhihu-publish-response.txt`，路径在结果的 `evidence` 里（响应里没有 cookie）。
 发布全程不开浏览器，所以没有截图；登录失败/超时会截图。
+
+## 模拟测试
+
+`tests/sim/test_sim_zhihu.py` 用真实 CLI（`mpub publish / login / check`）跑本地仿真（`tests/sim/zhihu/`）：接口经
+`httpx.MockTransport`（cookie / `x-xsrftoken` 校验、40352、401、草稿 / 话题 / 图片登记 / OSS 签名独立校验 / 轮询 / 发布
+请求体校验、作者能查到自己的草稿），登录页经真 Chromium（页面自己请求二维码接口并轮询、扫码后 Set-Cookie `z_c0`、首页下发
+`_xsrf`、验证页）。覆盖：文章（中文 / 空格路径、远程图、封面、话题、声明、目录、Obsidian 库）、想法 9 图、只存草稿、查重与
+`--force`、登录过期（含中途过期）、平台拒绝、风控、502 / 读超时 / 无法识别的响应（结果未知且不拿草稿 id 去确认）、图片
+处理超时、OSS 403、慢网络、扫码登录 / 二维码刷新 / 截图兜底 / 关窗口、风控验证（无头卡住时 20 秒内返回）、缺 `_xsrf`、
+SIGTERM 中断（无孤儿进程、记录与查重正确）。仿真只能按开源实现推断的接口行为来搭，**不能代替真实账号验证**。
 
 ## 已知风险
 
@@ -202,6 +226,9 @@ mpub check zhihu --account main
 - **AI 内容**：知乎创作声明有「包含 AI 辅助创作」；AI 生成的内容请设 `ai_generated: true` 或 `statement: ai`。
 - **登录文件是明文 cookie**，等同账号密码，不要提交到仓库或发给别人。
 - 发布时不会把服务器刷新的 cookie 写回登录文件；登录过期后重新 `mpub login` 即可。
+- 同一条内容在两个终端（或技能重试）几乎同时 `mpub publish`：查重在拿账号锁之前，想法几秒就发完，第二个进程等到锁后
+  会再发一次（核心问题，见 `tests/sim/test_sim_zhihu.py::test_concurrent_runs_publish_once`，未修复前请勿并发重复运行）。
+- `draft: true` 或被拒绝后重跑会再建一篇新草稿，旧草稿留在草稿箱里，需要手动删除。
 
 ## 未在真实账号上验证
 

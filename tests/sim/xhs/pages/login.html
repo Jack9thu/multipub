@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>小红书创作服务平台</title>
+<style>
+  body { margin: 0; font: 14px sans-serif; }
+  .login-box-container { width: 420px; margin: 80px auto; border: 1px solid #eee; padding: 24px; position: relative; }
+  .login-box { min-height: 300px; }
+  .switch-corner { position: absolute; right: 8px; top: 8px; width: 40px; height: 40px; cursor: pointer; background: #eee; }
+  .qrcode-box img { width: 160px; height: 160px; }
+  .hidden { display: none !important; }
+  .qrcode-box { position: relative; }
+  .qrcode-expired { position: absolute; inset: 0; background: rgba(255,255,255,.9); display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; }
+</style></head>
+<body>
+<div class="login-box-container">
+  <div class="css-1w5hw2t login-box">
+    <img class="switch-corner" alt="">
+    <div class="panel-sms">
+      <div class="title">手机号登录</div>
+      <input placeholder="手机号"><input placeholder="验证码"><button type="button">登 录</button>
+      <div class="other">扫码登录</div>
+    </div>
+    <div class="panel-qr hidden">
+      <div class="qr-wrap"><div class="title css-wemwzq-title">APP扫一扫登录</div><div class="qrcode-box"><img class="css-1lhmg90" alt="qrcode"></div>
+      <div class="tips">请使用小红书APP扫一扫</div></div>
+    </div>
+  </div>
+</div>
+<script>
+const SIM = /*SIM_CONFIG*/{};
+const sms = document.querySelector('.panel-sms'), qr = document.querySelector('.panel-qr');
+const corner = document.querySelector('.switch-corner');
+document.querySelector('.qrcode-box img').src = 'data:image/png;base64,' + SIM.qr_png;
+let qrShownAt = Date.now();  // 用户是看到（被上报的）二维码之后才扫的
+function showQr() { if (!qr.classList.contains('hidden')) return; sms.classList.add('hidden'); qr.classList.remove('hidden'); qrShownAt = Date.now(); }
+if (SIM.login_panel === 'qrcode') showQr();
+// 哈希类名的切换图标；nosw：类名改版了（上游的 img.css-wemwzq 找不到），「扫码登录」文字也改了，
+// 只剩右上角的图标能切；broken：连右上角的图标也没有了，只能截图 / 在窗口里用手机号登录
+const mode = SIM.login_panel;
+if (mode === 'qrcode' || mode === 'switch') corner.classList.add('css-wemwzq');
+if (mode === 'broken') corner.remove(); else corner.addEventListener('click', showQr);
+if (mode === 'nosw' || mode === 'broken') document.querySelector('.panel-sms .other').textContent = '其他登录方式';
+// 二维码有效期：过期后盖一层「二维码已过期 点击刷新」，点了换一张新的二维码
+let qrBorn = Date.now(), qrSerial = 0;
+const box = document.querySelector('.qrcode-box');
+function qrExpired() { return SIM.qr_ttl > 0 && Date.now() - qrBorn > SIM.qr_ttl * 1000; }
+if (SIM.qr_ttl > 0) {
+  setInterval(() => {
+    if (qrExpired() && !box.querySelector('.qrcode-expired')) {
+      const mask = document.createElement('div');
+      mask.className = 'qrcode-expired';
+      mask.innerHTML = '<span>二维码已过期</span><span class="refresh">点击刷新</span>';
+      mask.addEventListener('click', () => {
+        qrSerial += 1; qrBorn = Date.now(); mask.remove();
+        box.querySelector('img').src = 'data:image/png;base64,' + (qrSerial % 2 ? SIM.qr_png2 : SIM.qr_png);
+        fetch('/__sim/event', { method: 'POST', body: JSON.stringify({ evt: 'qr_refreshed', serial: qrSerial }) });
+      });
+      box.appendChild(mask);
+      fetch('/__sim/event', { method: 'POST', body: JSON.stringify({ evt: 'qr_expired' }) });
+    }
+  }, 200);
+}
+// 「扫码」成功（用户在 login_after 秒后扫了当时上报的二维码；过期的二维码扫不了）：服务端种 cookie，前端跳创作者首页
+if (SIM.login_after >= 0) {
+  const t = setInterval(() => {
+    if (Date.now() - qrShownAt < SIM.login_after * 1000 || qrExpired()) return;
+    if (qr.classList.contains('hidden') && mode !== 'broken') return;  // 没切到扫码面板就没法扫（broken：用户在窗口里用手机号登录）
+    clearInterval(t);
+    document.cookie = 'web_session=valid-' + Date.now() + '; path=/; domain=.xiaohongshu.com; max-age=86400';
+    document.cookie = 'a1=sim; path=/; domain=.xiaohongshu.com; max-age=86400';
+    location.href = '/new/home';
+  }, 200);
+}
+</script>
+</body></html>

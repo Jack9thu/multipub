@@ -36,7 +36,8 @@ publish_article = 1800 # 单个平台发一篇文章
 # biliup 版本（装在 <数据目录>\tools\biliup\<版本>\）。只有 v1.3.1 有内置 sha256，
 # 其他版本首次下载时记录校验值（trust-on-first-use）。改版本后运行 mpub setup。
 biliup_version = "v1.3.1"
-# 使用已有的 biliup 可执行文件，优先于自动安装；mpub setup 不会动它。
+# 使用已有的 biliup 可执行文件，优先级最高（高于 mpub biliup use 的选择）；mpub setup 不会动它。
+# 一般不用写这里：用 mpub biliup find / mpub biliup use <路径或编号> 选择即可（记在 tools\biliup\selected.json）。
 # biliup_path = 'D:\tools\biliup.exe'
 biliup_path = ""
 # 是否允许 multipub 在浏览器模式里代为确认 B站《动态发布规范》弹窗（对所有账号生效）。

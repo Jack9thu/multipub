@@ -9,6 +9,7 @@ import json
 import locale
 import os
 import re
+import time
 import unicodedata
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,10 +21,11 @@ from patchright.async_api import async_playwright
 # multipub patch: 包内绝对导入；conf 由 multipub._sau.conf.configure() 预先设置
 from multipub._sau import conf as sau_conf
 from multipub._sau.conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
-from multipub._sau.runtime import (CaptchaWatch, goto_resilient, CookieInvalid, Deadline, DeclarationFailed, Hooks, SauError,
-                                   ScheduleFailed, SmsCodeTimeout, SmsVerifyFailed, UploadFailed, close_quietly,
-                                   fail_rejected, fail_step, find_visible_text, input_value, publish_button_ready,
-                                   save_screenshot, save_state_quietly, schedule_value_matches, toggle_state)
+from multipub._sau.runtime import (CaptchaRequired, CaptchaWatch, goto_resilient, CookieInvalid, Deadline, DeclarationFailed,
+                                   Hooks, LoginPageDetected, SauError, ScheduleFailed, SmsCodeTimeout, SmsVerifyFailed,
+                                   UploadFailed, close_quietly, diagnose, fail_rejected, fail_step, find_visible_text,
+                                   input_value, publish_button_ready, save_screenshot, save_state_quietly,
+                                   schedule_value_matches, toggle_state)
 from multipub._sau.uploader.base_video import BaseVideoUploader
 from multipub._sau.utils.base_social_media import set_init_script
 from multipub._sau.utils.login_qrcode import build_login_qrcode_path
@@ -194,46 +196,67 @@ async def douyin_setup(account_file, handle=False, return_detail=False, qrcode_c
     return result if return_detail else True
 
 
+# 新版抖音创作者中心 (single_tab + animate_qrcode_container) 不再用 aria-label="二维码"。
+# 按优先级兜底多个 selector，至少一个能命中即可。
+DOUYIN_QRCODE_SELECTORS = (
+    'div#animate_qrcode_container img[src^="data:image"]',
+    'div[class*="animate_qrcode_container"] img[src^="data:image"]',
+    'div[class*="scan_qrcode_login_content"] img[src^="data:image"]',
+    'img[aria-label="二维码"]',
+)
+DOUYIN_QRCODE_WAIT = 60.0  # 秒；登录卡是前端异步渲染的，慢网络下要等一会
+
+
+class DouyinLoginPageLeft(RuntimeError):
+    """multipub patch: 找二维码时页面已经跳到登录后页面（用户已扫码），不用再找了。"""
+
+
+def _left_login_page(page: Page) -> bool:
+    return "creator.douyin.com/creator-micro" in (page.url or "")
+
+
+async def _extract_douyin_qrcode(page: Page, timeout: float | None = None):
+    """multipub patch: 在 timeout 秒内轮询全部候选选择器，返回 (src, 图片 locator)；页面已跳到登录后页面时立即放弃。
+
+    上游先等 networkidle 15 秒、再等「扫码登录」60 秒、再逐个选择器各等 10 秒：二维码失效刷新后用户马上扫码
+    （有头模式下窗口里的新二维码立刻可见），页面已经跳到首页，上游仍要白等一百多秒、再把首页截图当二维码上报，
+    还可能因此超出登录任务的总时限，把已经成功的登录报成超时。"""
+    deadline = Deadline(DOUYIN_QRCODE_WAIT if timeout is None else timeout, "等待登录二维码")
+    while True:
+        if _left_login_page(page):
+            raise DouyinLoginPageLeft("页面已跳转到登录后页面")
+        for sel in DOUYIN_QRCODE_SELECTORS:
+            qrcode_img = page.locator(sel).first
+            try:
+                if await qrcode_img.count():
+                    src = await qrcode_img.get_attribute("src")
+                    if src:
+                        return src, qrcode_img
+            except Exception:  # 页面跳转中 locator 可能失效
+                continue
+        if deadline.expired:
+            raise RuntimeError(f"{int(deadline.seconds)} 秒内没有找到登录二维码图片")
+        await asyncio.sleep(0.5)
+
+
 async def _extract_douyin_qrcode_src(page: Page) -> str:
-    # 等 SPA 加载完成（不只等"扫码登录"文字，否则抖音慢加载时 30s 就超时）。
-    # 给 domcontentloaded 后足够时间让客户端 JS 注入登录卡。
-    try:
-        await page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        pass
-    scan_login_tab = page.get_by_text("扫码登录", exact=True).first
-    # attached 状态：DOM 里出现即可，不要求 visible/渲染完整，避免 race
-    await scan_login_tab.wait_for(state="attached", timeout=60000)
-
-    # 新版抖音创作者中心 (single_tab + animate_qrcode_container) 不再用 aria-label="二维码"。
-    # 按优先级兜底多个 selector，至少一个能命中即可。
-    qrcode_selectors = [
-        'div#animate_qrcode_container img[src^="data:image"]',
-        'div[class*="animate_qrcode_container"] img[src^="data:image"]',
-        'div[class*="scan_qrcode_login_content"] img[src^="data:image"]',
-        'img[aria-label="二维码"]',
-    ]
-    last_err: Exception | None = None
-    for sel in qrcode_selectors:
-        qrcode_img = page.locator(sel).first
-        try:
-            await qrcode_img.wait_for(state="attached", timeout=10000)
-        except Exception as e:
-            last_err = e
-            continue
-        src = await qrcode_img.get_attribute("src")
-        if src:
-            return src
-        last_err = RuntimeError(f"selector {sel} 命中但 src 为空")
-
-    raise RuntimeError(f"未获取到抖音登录二维码地址 (last_err={last_err})")
+    return (await _extract_douyin_qrcode(page))[0]
 
 
 async def _save_douyin_qrcode(page: Page, account_file: str, previous_qrcode_path: Path | None = None, qrcode_callback=None) -> dict:
     # 提取二维码 src 仅为了保存/终端显示；定位不到时不致命——有头浏览器里二维码可见，直接扫码即可
     try:
-        qrcode_src = await _extract_douyin_qrcode_src(page)
+        qrcode_src, qrcode_img = await _extract_douyin_qrcode(page)
+        if not qrcode_src.startswith("data:image/"):
+            # multipub patch: src 是普通图片地址时（上游 save_data_url_image 会直接抛错、登录失败）改为截取二维码元素
+            qrcode_src = await _element_png_data_url(qrcode_img)
+    except DouyinLoginPageLeft:
+        # multipub patch: 已经扫码跳走了：不再截图上报（那是登录后的页面，不是二维码），交给调用方确认登录
+        douyin_logger.info(_msg("🥳", "页面已离开登录页，不再刷新二维码"))
+        return {"image_path": str(previous_qrcode_path or ""), "image_data_url": ""}
     except Exception as exc:
+        if _left_login_page(page):  # multipub patch: 同上（截图前再确认一次）
+            return {"image_path": str(previous_qrcode_path or ""), "image_data_url": ""}
         douyin_logger.warning(_msg("😵", f"没定位到二维码元素（{str(exc)[:50]}）——请直接在弹出的浏览器里扫码，小人继续等登录跳转"))
         # multipub patch: 把登录页截图当作二维码图片上报（无头登录、或窗口不在前台时也能扫）
         fallback_path = build_login_qrcode_path(account_file, suffix="login_page")
@@ -266,6 +289,14 @@ async def _save_douyin_qrcode(page: Page, account_file: str, previous_qrcode_pat
     return qrcode_info
 
 
+async def _element_png_data_url(locator) -> str:
+    """multipub patch: 元素截图转成 data URL（二维码 src 不是 data:image 时用）。"""
+    import base64
+
+    png = await locator.screenshot(timeout=10000)
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
 async def _is_douyin_login_completed(page: Page) -> bool:
     # 登录后会跳到 creator-micro 下任意页（home/content 等）；登录页是 creator.douyin.com/ 根路径
     if "creator.douyin.com/creator-micro" not in page.url:
@@ -279,13 +310,11 @@ async def _is_douyin_login_completed(page: Page) -> bool:
     ]
 
     for marker in login_markers:
-        if not await marker.count():
-            continue
-        try:
-            if await marker.is_visible():
+        try:  # multipub patch: count() 也放进 try（扫码后页面跳转中 locator 可能报错，下一轮再判断）
+            if await marker.count() and await marker.is_visible():
                 return False
         except Exception:
-            continue
+            return False
 
     return True
 
@@ -302,7 +331,11 @@ async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dic
         # URL 变化 + sessionid 未到位 → 二验流程，继续等
         if page.url != original_url and not await _is_douyin_login_completed(page):
             sms_input = page.locator('input[placeholder*="验证码"], input[type="tel"], input[placeholder*="短信"], input[placeholder*="手机号"]')
-            if await sms_input.count() > 0:
+            try:  # multipub patch: 页面跳转中 locator 可能报错
+                has_sms = await sms_input.count() > 0
+            except Exception:
+                has_sms = False
+            if has_sms:
                 if not saw_2fa:
                     douyin_logger.warning(_msg("⚠️", f"检测到抖音短信/安全二次验证，请在弹出的浏览器中手动输入。等待 sessionid ({_}/{max_checks})"))
                     saw_2fa = True
@@ -310,16 +343,27 @@ async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dic
             continue
 
         expired_box = page.get_by_text("二维码失效", exact=True).locator("..").first
-        if await expired_box.count() and await expired_box.is_visible():
+        try:
+            expired = bool(await expired_box.count() and await expired_box.is_visible())
+        except Exception:  # multipub patch: 扫码后页面正在跳转，locator 失效：下一轮再判断
+            expired = False
+        if expired:
             douyin_logger.warning(_msg("😵", "二维码失效了，小人马上去刷新"))
-            await expired_box.click()
+            try:
+                await expired_box.click(timeout=5000)
+            except Exception as exc:  # multipub patch: 点刷新时页面跳走了（用户刚好扫了码）不算登录失败
+                douyin_logger.warning(_msg("😵", f"点击刷新二维码失败（{exc.__class__.__name__}），继续等待"))
             await asyncio.sleep(1)
             qrcode_info = await _save_douyin_qrcode(page, account_file, qrcode_path, qrcode_callback=qrcode_callback)
             qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
 
         await asyncio.sleep(poll_interval)
 
-    return _build_login_result(False, "timeout", "等待抖音扫码登录超时", account_file, qrcode_info, page.url)
+    result = _build_login_result(False, "timeout", "等待抖音扫码登录超时", account_file, qrcode_info, page.url)
+    if saw_2fa:  # multipub patch: 扫码后卡在短信二次验证（无头模式下无法输入），让调用方给出对的提示
+        result["saw_2fa"] = True
+        result["message"] = "扫码后抖音要求短信二次验证，但一直没有完成"
+    return result
 
 async def douyin_cookie_gen(
     account_file,
@@ -413,7 +457,11 @@ class DouYinBaseUploader(BaseVideoUploader):
         self.publish_guard = self.hooks.publish_guard()
         self._sms_rounds = 0
         self.published_item_id: str | None = None
+        self._receipt_at: float | None = None
         self.publish_api_error: str | None = None
+        self.publish_http_note: str = ""
+        self._publish_covered_by: str = ""
+        self.notes: list[str] = []  # multipub patch: 与清单不一致、需要告诉用户的地方（适配器附在结果消息后）
         self._response_tasks: set = set()
         self._captcha = CaptchaWatch(headless=headless, guard=self.publish_guard, logger=douyin_logger)
 
@@ -502,10 +550,18 @@ class DouYinBaseUploader(BaseVideoUploader):
         title_input = page.locator('input[placeholder*="填写作品标题"]').first
         await title_input.wait_for(state="visible", timeout=120000)
         await title_input.fill(title[:30])
+        await self._verify_title(page, title_input, title[:30])
 
         description_editor = page.locator('div.zone-container[contenteditable="true"]').first
         await description_editor.wait_for(state="visible", timeout=120000)
-        await description_editor.click()
+        try:
+            await description_editor.click(timeout=5000)
+        except Exception as exc:
+            # multipub patch: 新手引导（shepherd）等浮层挡住了编辑框（上游只在设封面、点发布前才清引导层，
+            # 引导一出现就卡在这里 30 秒后报 internal）：清掉浮层再点一次
+            douyin_logger.warning(_msg("🧍", f"简介编辑框被挡住（{exc.__class__.__name__}），先清掉引导/浮层再试"))
+            await self._clear_blocking_overlays(page)
+            await description_editor.click(timeout=10000)
         await page.keyboard.press("Control+KeyA")
         await page.keyboard.press("Delete")
 
@@ -517,6 +573,39 @@ class DouYinBaseUploader(BaseVideoUploader):
             await page.keyboard.type(" #" + tag)
             await page.keyboard.press("Space")
         await page.keyboard.press("Escape")  # 收起话题下拉，避免浮层拦截后续点击
+        await self._check_description(description_editor, description, tags or [])
+
+    async def _verify_title(self, page: Page, title_input, want: str) -> None:
+        """multipub patch: 读回标题框。网页的长度上限按 UTF-16 计数（emoji 等占 2 个字）时，会把接近上限的标题静默截断，
+        上游照样发出去（发出的标题和清单不一样）。读回不一致时重填一次，仍不一致就在点「发布」之前拒绝继续。"""
+        value = await input_value(title_input)
+        if value == want:
+            return
+        await title_input.fill(want)
+        await page.wait_for_timeout(300)
+        value = await input_value(title_input)
+        if value == want:
+            return
+        shot = await save_screenshot(page, self.hooks, "title")
+        hint = ("；抖音网页按 UTF-16 计数，emoji 等字符算 2 个字，请缩短标题后重试"
+                if value and want.startswith(value) else "；请重试，仍失败时到网页上手动发布")
+        raise DeclarationFailed(f"标题没能按原样填入：页面上是「{value}」，应为「{want}」，拒绝继续发布，作品没有发出{hint}"
+                                + (f"（截图: {shot}）" if shot else ""))
+
+    async def _check_description(self, editor, description: str, tags: list[str]) -> None:
+        """multipub patch: 读回简介编辑框，正文或话题没有完整出现时告警（只告警：编辑器会把话题、表情等转换成别的节点）。"""
+        try:
+            text = await editor.inner_text(timeout=3000)
+        except Exception:
+            return
+        squash = lambda s: re.sub(r"[\s\u200b-\u200d\ufeff]+", "", s or "")  # noqa: E731  零宽字符也去掉
+        have = squash(text)
+        missing = [line.strip() for line in (description or "").splitlines() if squash(line) and squash(line) not in have]
+        missing += [f"#{t}" for t in tags if squash(f"#{t}") not in have]
+        if missing:
+            brief = "、".join(f"「{m[:20]}」" for m in missing[:3]) + (" 等" if len(missing) > 3 else "")
+            douyin_logger.warning(_msg("😵", f"简介编辑框里没找到 {brief}，发出的简介可能不完整，请发布后到作品管理核对"))
+            self.notes.append(f"简介里可能缺少 {brief}，请到作品管理核对")
 
     async def set_location(self, page: Page, location: str = ""):
         if not location:
@@ -750,6 +839,7 @@ class DouYinBaseUploader(BaseVideoUploader):
                 await first_card.wait_for(state="visible", timeout=8000)
             except Exception:
                 douyin_logger.warning(_msg("🎵", f"音乐「{bgm_name}」搜索结果为空，小人跳过"))
+                self.notes.append(f"没有加上背景音乐「{bgm_name}」（搜不到）")  # multipub patch
                 await self._close_music_sidesheet(page)
                 return False
 
@@ -776,6 +866,7 @@ class DouYinBaseUploader(BaseVideoUploader):
             return True
         except Exception as exc:
             douyin_logger.warning(_msg("🎵", f"添加 BGM 时出错，跳过该步骤继续发布：{exc}"))
+            self.notes.append(f"没有加上背景音乐「{bgm_name}」（选择时出错）")  # multipub patch
             try:
                 await self._close_music_sidesheet(page)
             except Exception:
@@ -795,18 +886,143 @@ class DouYinBaseUploader(BaseVideoUploader):
     # multipub patch: 以下方法为新增，或从 DouYinVideo 移到基类供图文复用
     # ------------------------------------------------------------------
 
+    async def _handle_entry_verification(self, page: Page) -> None:
+        """multipub patch: 进入上传页 / 发布表单出现后先处理短信身份验证弹窗（上游注释：进入页面后可能弹身份验证）。
+
+        上游只在发布循环里处理：弹窗在填表前出现时，它的遮罩挡住「发布图文」、简介编辑框等点击，30 秒后报一个
+        与验证无关的 Playwright 超时（internal）。这里提前处理：发出 needs_input、等 mpub verify-code；
+        超时还没点过发布 → needs_action / sms_code_required。"""
+        try:
+            await self._handle_sms_verification(page, strict=True)
+        except SauError:
+            raise
+        except Exception as exc:  # 页面跳转中 locator 失效等：交给后续步骤
+            douyin_logger.debug(_msg("🧍", f"检查身份验证弹窗出错（忽略）: {exc!r}"))
+
+    UPLOAD_ENTRY_WAIT = 60.0  # multipub patch: 秒；上游等上传入口 60 秒
+
+    @staticmethod
+    async def _bounced_to_login(page: Page) -> bool:
+        """multipub patch: 页面是不是被踢回了登录页（登录页是 creator.douyin.com 根路径，登录后都在 /creator-micro/ 下）。"""
+        url = page.url or ""
+        if urlparse(url).netloc == "creator.douyin.com" and "/creator-micro/" not in url:
+            return True
+        try:
+            return await diagnose(page) == "login"
+        except Exception:
+            return False
+
+    async def _wait_on_upload_page(self, page: Page, target, what: str) -> None:
+        """multipub patch: 等上传页上的 target 出现。cookie 校验通过后登录态仍可能在打开上传页时失效（页面跳回登录页）：
+        立即报登录失效（适配器返回 login_required），而不是干等 60 秒再报一个 Playwright 超时。"""
+        deadline = Deadline(self.UPLOAD_ENTRY_WAIT, f"等待上传页{what}")
+        while True:
+            # 先看是不是登录页：登录页上也有输入框，可能被上传入口的宽松选择器命中
+            if await self._bounced_to_login(page):
+                shot = await save_screenshot(page, self.hooks, "login")
+                raise LoginPageDetected("打开上传页时跳回了登录页（登录已失效）", step=deadline.step,
+                                        after_submit=False, screenshot=shot)
+            try:
+                if await target.count():
+                    return
+            except Exception:  # 页面跳转中
+                pass
+            if deadline.expired:
+                await fail_step(page, self.hooks, deadline, after_submit=False, detail=f"上传页上一直没有出现{what}")
+            await asyncio.sleep(0.5)
+
+    async def _classify_failure(self, page: Page, exc: BaseException) -> None:
+        """multipub patch: 流程里的普通异常（多为某个元素点不到而超时）先看页面停在哪：人机验证 / 登录页 / 短信验证
+        弹窗时抛对应的异常（适配器据此返回 captcha / login_required / sms_code_required），而不是笼统的 internal 错误。"""
+        if page is None:
+            return
+        try:
+            reason = await diagnose(page)
+            sms = (not reason and await self._visible(page.locator(self.SMS_INPUT_SELECTOR).first)
+                   and await self._sms_dialog_marked(page))
+        except Exception:
+            return
+        if not reason and not sms:
+            return
+        shot = await save_screenshot(page, self.hooks, "blocked")
+        brief = str(exc).splitlines()[0][:120] if str(exc) else exc.__class__.__name__
+        kw = {"step": "填写发布表单", "after_submit": self._publish_clicked, "screenshot": shot}
+        if reason == "captcha":
+            raise CaptchaRequired(f"页面停在人机验证，流程无法继续（{brief}）", **kw) from exc
+        if reason == "login":
+            raise LoginPageDetected(f"页面跳回了登录页（{brief}）", **kw) from exc
+        raise SmsCodeTimeout(f"页面弹出了短信身份验证，流程无法继续（{brief}）", **kw) from exc
+
     def _before_publish_click(self) -> None:
         """第一次点击最终「发布」之前通知适配器（对应 ctx.mark_submit_started）。"""
         if not self._publish_clicked:
             self._publish_clicked = True
             self.hooks.call("before_publish_click")
 
+    async def _clear_blocking_overlays(self, page: Page) -> None:
+        """清除会拦截点击的浮层：填完话题后残留的话题/@提及下拉(publish-mention-wrapper)
+        及其所在 semi-portal、其它非模态 semi-portal(tooltip/popover)、shepherd 引导层，
+        并让当前输入框失焦。合集/声明下拉自身的 portal 是"点开后"才创建，故此处清理不误伤。
+
+        根因见 recorder.log 2026-08-10 05:31：apply_collection 点合集下拉时，
+        publish-mention-wrapper / semi-portal 拦截 pointer events → click 超时 → 归集被跳过。
+
+        multipub patch: 从 DouYinVideo 移到基类：图文流程填完话题后同样会残留话题下拉，挡住背景音乐、定时和「发布」。
+        """
+        await self._dismiss_notice_modals(page)
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        try:
+            await page.evaluate(
+                """() => {
+                    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+                    document.querySelectorAll('.shepherd-element,.shepherd-modal-overlay-container').forEach(e=>e.remove());
+                    document.querySelectorAll('[class*="mention-wrapper"]').forEach(e=>{ const p=e.closest('.semi-portal'); (p||e).remove(); });
+                    // 关闭残留的非模态 Semi 浮层 portal（保留模态框，如声明弹窗）
+                    document.querySelectorAll('.semi-portal').forEach(e=>{ if(!e.querySelector('.semi-modal, .semi-modal-content')) e.remove(); });
+                }"""
+            )
+        except Exception:
+            pass
+        await page.wait_for_timeout(400)
+
+    NOTICE_DISMISS_TEXTS = ("我知道了", "知道了", "我已知晓")  # multipub patch
+
+    async def _dismiss_notice_modals(self, page: Page) -> bool:
+        """multipub patch: 关掉只有「我知道了」一类按钮的通知弹窗（平台公告、新功能介绍）。它们的遮罩挡住表单和「发布」，
+        上游不处理：填表时某次点击超时报 internal，或 force 点「发布」落在遮罩上。不点「同意」之类有含义的按钮。"""
+        dismissed = False
+        for text in self.NOTICE_DISMISS_TEXTS:
+            buttons = page.locator(".semi-modal").get_by_role("button", name=text, exact=True)
+            try:
+                for i in range(await buttons.count()):
+                    btn = buttons.nth(i)
+                    if await btn.is_visible():
+                        await btn.click(timeout=3000)
+                        dismissed = True
+            except Exception:  # 弹窗正在关闭 / 页面跳转中
+                continue
+        if dismissed:
+            douyin_logger.info(_msg("🪟", "关掉了挡在页面上的通知弹窗"))
+            await page.wait_for_timeout(500)
+        return dismissed
+
     # 视频流程：发布按钮用 force 点击、短信弹窗用上游的宽松判定；图文流程相反（见 DouYinVideo）
     PUBLISH_CLICK_KWARGS: dict = {}
     STRICT_SMS_CHECK = True
 
     async def _prepare_publish_attempt(self, page: Page) -> None:
-        """每轮点击「发布」前的准备（视频流程会移除拦截点击的浮层）。"""
+        """每轮点击「发布」前移除会拦截点击的新手引导 / 话题下拉浮层。
+
+        multipub patch: 上游只在视频流程里做；图文流程的「发布」按钮被话题下拉挡住时，非 force 点击会一直超时。"""
+        try:
+            await page.evaluate(
+                "() => { document.querySelectorAll('.shepherd-element, .shepherd-modal-overlay-container, [class*=\"mention-wrapper\"]').forEach(e => e.remove()); }"
+            )
+        except Exception:  # 页面跳转中
+            pass
 
     async def _platform_blocked_publish(self, page: Page) -> bool:
         """上一次点击是否被平台提示拦下并已处理（视频流程：「请设置封面后再发布」）。"""
@@ -819,6 +1035,12 @@ class DouYinBaseUploader(BaseVideoUploader):
         self._watch_publish_response(page)
         deadline = Deadline(self.hooks.publish_timeout, f"等待{what}发布成功")
         while True:
+            if self._receipt_settled():
+                # multipub patch: 创建接口已明确返回成功和作品 ID，但页面没有跳到作品管理页（改版、停在原页提示成功等）：
+                # 作品已经创建，按已提交处理，而不是等到超时报 unknown_outcome
+                douyin_logger.warning(_msg("🧾", f"创建接口已返回作品 ID {self.published_item_id}，但页面没有跳转到作品管理页，"
+                                               f"按已提交处理（当前页面: {page.url}）"))
+                break
             if deadline.expired:
                 await fail_step(page, self.hooks, deadline, after_submit=self._publish_clicked,
                                 detail=self._publish_detail())
@@ -851,6 +1073,11 @@ class DouYinBaseUploader(BaseVideoUploader):
 
     PUBLISH_CLICK_TIMEOUT_MS = 5000
 
+    def _receipt_settled(self) -> bool:
+        """multipub patch: 拿到成功回执（status_code 0 + 作品 ID）已超过 hooks.receipt_grace 秒。"""
+        return (self.published_item_id is not None and self._receipt_at is not None
+                and time.monotonic() - self._receipt_at >= self.hooks.receipt_grace)
+
     async def _click_publish(self, button, **click_kwargs) -> bool:
         """受 PublishGuard 限制地点击最终「发布」；第一次点击前通知适配器。返回是否点击了。
 
@@ -861,11 +1088,52 @@ class DouYinBaseUploader(BaseVideoUploader):
         if not await publish_button_ready(button):
             douyin_logger.debug(_msg("🧍", "发布按钮还不能点（不唯一、不可见或不可用），小人再等等"))
             return False
+        covered = await self._publish_button_covered(button)
+        if covered:
+            # multipub patch: 按钮被弹窗 / 遮罩盖住时 force 点击会落在遮罩上，什么也没发出，却会记作已点击、
+            # 标记已提交（最后报 unknown_outcome）。这一轮不点，先试着用 Esc 关掉浮层
+            if covered != self._publish_covered_by:
+                douyin_logger.warning(_msg("🧍", f"发布按钮被浮层挡住（{covered}），本轮不点"))
+            self._publish_covered_by = covered
+            try:
+                if not await self._dismiss_notice_modals(button.page):
+                    await button.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False
+        if not click_kwargs.get("force"):
+            # multipub patch: 先 trial（只做可点性检查、不派发点击）：按钮被浮层挡住时 click() 会超时而根本没点下去，
+            # 以前这也记一次点击、标记已提交，最后报 unknown_outcome（其实什么都没发出）
+            try:
+                await button.click(timeout=self.PUBLISH_CLICK_TIMEOUT_MS, trial=True, **click_kwargs)
+            except Exception as exc:
+                douyin_logger.warning(_msg("🧍", f"发布按钮被挡住或还不能点（{exc.__class__.__name__}），本轮不点"))
+                return False
         self._before_publish_click()
         self.publish_guard.clicked()  # 先记账再点：点击抛异常时也可能已经触发
         await button.click(timeout=self.PUBLISH_CLICK_TIMEOUT_MS, **click_kwargs)
         self.publish_guard.click_returned()
         return True
+
+    # multipub patch: 按钮中心点上的元素属于别的弹窗 / 遮罩层（且该层不包含按钮）时返回该层的类名
+    _COVERED_JS = """el => {
+        el.scrollIntoView({block: 'center', inline: 'center'});
+        const r = el.getBoundingClientRect();
+        if (!r.width || !r.height) return '';
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        if (!hit || el.contains(hit)) return '';
+        const layer = hit.closest('[class*="modal"], [class*="mask"], [class*="overlay"], [role="dialog"], #captcha_container');
+        if (!layer || layer.contains(el)) return '';
+        return (layer.className && layer.className.toString ? layer.className.toString() : layer.tagName).slice(0, 80);
+    }"""
+
+    async def _publish_button_covered(self, button) -> str:
+        """multipub patch: 按钮中心点上盖着别的弹窗 / 遮罩时返回遮罩的类名；判断不了返回空（照常点击）。"""
+        try:
+            covered = await button.evaluate(self._COVERED_JS)
+        except Exception:
+            return ""
+        return covered if isinstance(covered, str) else ""
 
     async def _raise_if_rejected(self, page: Page) -> None:
         """发布接口明确失败、且宽限期内没有出现验证弹窗：不再等到超时，直接报平台拒绝。"""
@@ -888,6 +1156,10 @@ class DouYinBaseUploader(BaseVideoUploader):
         async def capture(response) -> None:
             ok: bool | None = None
             try:
+                if not 200 <= response.status < 300:
+                    # multipub patch: 网关错误等（请求可能已被处理，也可能没有）：结果不明，记下来写进最终的报错里
+                    self.publish_http_note = f"发布接口返回 HTTP {response.status}"
+                    douyin_logger.warning(_msg("😵", self.publish_http_note))
                 body = await response.json()
                 if not isinstance(body, dict):
                     return
@@ -898,12 +1170,16 @@ class DouYinBaseUploader(BaseVideoUploader):
                         and re.fullmatch(r"[1-9]\d*", str(item_id))):
                     ok = True
                     self.published_item_id = str(item_id)
+                    self._receipt_at = time.monotonic()
                     douyin_logger.info(_msg("🧾", f"发布接口返回作品 ID: {item_id}"))
                 elif isinstance(code, int) and not isinstance(code, bool) and code != 0:
                     ok = False
                     self.publish_api_error = str(body.get("status_msg") or f"status_code={code}")
                     douyin_logger.warning(_msg("😵", f"发布接口返回失败: {self.publish_api_error}"))
-            except Exception:
+            except Exception as exc:
+                # multipub patch: 记下原因（页面紧接着整页跳转时回执可能已经读不到，作品链接因此缺失）
+                douyin_logger.warning(_msg("😵", f"读取发布接口回执失败（HTTP {getattr(response, 'status', '?')}）: {exc!r}"))
+                self.publish_http_note = self.publish_http_note or "发布接口的回执读不出来"
                 return
             finally:
                 self.publish_guard.request_done(ok, self.publish_api_error or "")
@@ -937,6 +1213,10 @@ class DouYinBaseUploader(BaseVideoUploader):
             parts.append(f"创建接口已返回作品 ID {self.published_item_id}")
         if self.publish_api_error:
             parts.append(f"平台返回: {self.publish_api_error}")
+        if self.publish_http_note and not self.published_item_id:
+            parts.append(self.publish_http_note)
+        if self._publish_covered_by and not self._publish_clicked:
+            parts.append(f"「发布」按钮一直被浮层挡住（{self._publish_covered_by}），没有点击，作品没有发出")
         return "；".join(parts)
 
     SMS_INPUT_SELECTOR = 'input[placeholder*="验证码"], input[type="tel"], input[placeholder*="短信"], input[placeholder*="手机号"]'
@@ -1201,32 +1481,6 @@ class DouYinVideo(DouYinBaseUploader):
                 "请在网页上手动关闭后重发，或删掉 sync_toutiao 保持页面默认"
             )
 
-    async def _clear_blocking_overlays(self, page: Page) -> None:
-        """清除会拦截点击的浮层：填完话题后残留的话题/@提及下拉(publish-mention-wrapper)
-        及其所在 semi-portal、其它非模态 semi-portal(tooltip/popover)、shepherd 引导层，
-        并让当前输入框失焦。合集/声明下拉自身的 portal 是"点开后"才创建，故此处清理不误伤。
-
-        根因见 recorder.log 2026-08-10 05:31：apply_collection 点合集下拉时，
-        publish-mention-wrapper / semi-portal 拦截 pointer events → click 超时 → 归集被跳过。
-        """
-        try:
-            await page.keyboard.press("Escape")
-        except Exception:
-            pass
-        try:
-            await page.evaluate(
-                """() => {
-                    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
-                    document.querySelectorAll('.shepherd-element,.shepherd-modal-overlay-container').forEach(e=>e.remove());
-                    document.querySelectorAll('[class*="mention-wrapper"]').forEach(e=>{ const p=e.closest('.semi-portal'); (p||e).remove(); });
-                    // 关闭残留的非模态 Semi 浮层 portal（保留模态框，如声明弹窗）
-                    document.querySelectorAll('.semi-portal').forEach(e=>{ if(!e.querySelector('.semi-modal, .semi-modal-content')) e.remove(); });
-                }"""
-            )
-        except Exception:
-            pass
-        await page.wait_for_timeout(400)
-
     async def apply_collection(self, page: Page) -> None:
         """在发布表单页"添加合集"区选择目标合集（Semi Design select，字节组件库）。
 
@@ -1245,6 +1499,7 @@ class DouYinVideo(DouYinBaseUploader):
             trigger = page.locator('[class*="select-collection-"]').first
             if await trigger.count() == 0:
                 douyin_logger.warning(_msg("😵", "未找到\"添加合集\"下拉框，跳过归集"))
+                self.notes.append(f"没有加入合集「{self.collection_name}」（页面上找不到合集下拉框）")  # multipub patch
                 return
             selection = trigger.locator(".semi-select-selection")
             try:
@@ -1263,6 +1518,7 @@ class DouYinVideo(DouYinBaseUploader):
                 )
                 await page.keyboard.press("Escape")
                 await page.wait_for_timeout(300)
+                self.notes.append(f"没有加入合集「{self.collection_name}」（合集列表里没有这个名字）")  # multipub patch
                 return
 
             try:
@@ -1270,9 +1526,16 @@ class DouYinVideo(DouYinBaseUploader):
             except Exception:
                 await _native_click(page, option.first)
             await page.wait_for_timeout(500)
+            # multipub patch: 核对下拉框显示的就是这个合集（上游点完就当成功）
+            shown = await find_visible_text(page, [self.collection_name])
+            if not shown:
+                douyin_logger.warning(_msg("😵", f"点了合集「{self.collection_name}」，但下拉框没有显示它，可能没选上"))
+                self.notes.append(f"合集「{self.collection_name}」可能没选上，请到作品管理核对")
+                return
             douyin_logger.success(_msg("🥳", f"已选择合集：{self.collection_name}"))
         except Exception as exc:
             douyin_logger.warning(_msg("😵", f"选择合集失败，跳过归集继续发布: {exc}"))
+            self.notes.append(f"没有加入合集「{self.collection_name}」（选择时出错）")  # multipub patch
             try:
                 await page.keyboard.press("Escape")
             except Exception:
@@ -1295,12 +1558,6 @@ class DouYinVideo(DouYinBaseUploader):
     # multipub patch: 发布循环在基类，这几项保持上游视频流程的行为
     PUBLISH_CLICK_KWARGS = {"force": True}
     STRICT_SMS_CHECK = False
-
-    async def _prepare_publish_attempt(self, page: Page) -> None:
-        # 移除会拦截发布按钮点击的新手引导/话题下拉浮层
-        await page.evaluate(
-            "() => { document.querySelectorAll('.shepherd-element, .shepherd-modal-overlay-container, [class*=\"mention-wrapper\"]').forEach(e => e.remove()); }"
-        )
 
     async def _platform_blocked_publish(self, page: Page) -> bool:
         return bool(await self.handle_auto_video_cover(page))
@@ -1409,6 +1666,7 @@ class DouYinVideo(DouYinBaseUploader):
                 continue
         if not opened:
             douyin_logger.warning(_msg("⚠️", "封面弹窗打不开，跳过自定义封面继续发布（交给推荐封面兜底）"))
+            self.notes.append("自定义封面没能设置上（封面弹窗打不开），抖音会用推荐封面")  # multipub patch
             return
 
         await page.wait_for_timeout(1500)
@@ -1449,12 +1707,14 @@ class DouYinVideo(DouYinBaseUploader):
         def _finish_btn():
             return cover_locator.get_by_role("button", name="完成", exact=True).first
 
-        for _ in range(30):  # 最多 ~15s 等图片处理、按钮解禁
+        finish_enabled: bool | None = None  # None: 没找到「完成」按钮；False: 一直禁用
+        for _ in range(self.COVER_FINISH_WAIT_POLLS):  # multipub patch: 上游最多 ~15s，这里 ~30s 等图片处理、按钮解禁
             try:
                 b = _finish_btn()
                 if await b.count():
                     cls = await b.get_attribute("class") or ""
-                    if "semi-button-disabled" not in cls:
+                    finish_enabled = "semi-button-disabled" not in cls
+                    if finish_enabled:
                         break
             except Exception:
                 pass
@@ -1464,7 +1724,8 @@ class DouYinVideo(DouYinBaseUploader):
         # 抖音自定义组件普通 click 可能不抛异常也不生效，所以每轮点后都校验弹窗是否消失：
         # 消失才算成功；否则升级 _native_click、处理可能的二次确认、最后 Esc 兜底。
         closed = False
-        for attempt in range(4):
+        # multipub patch: 「完成」一直是禁用的（封面还在「检测中」）时点它没用，上游还要再白点 4 轮（约 35 秒）
+        for attempt in range(0 if finish_enabled is False else 4):
             btn = _finish_btn()
             if not await btn.count():
                 btn = cover_locator.locator("button.semi-button").filter(has_text="完成").first
@@ -1506,7 +1767,32 @@ class DouYinVideo(DouYinBaseUploader):
         if closed:
             douyin_logger.info(_msg("🥳", "视频封面设置完成，弹窗已关闭"))
         else:
-            douyin_logger.warning(_msg("⚠️", "封面弹窗未能关闭，可能挡住自主声明/发布"))
+            # multipub patch: 弹窗关不掉（封面一直「检测中」等）会盖住「发布」：force 点击落在遮罩上什么也没发出，
+            # 以前却记作已点击、最后报 unknown_outcome。点「取消」放弃自定义封面（与打不开弹窗时一样交给推荐封面），继续发布
+            douyin_logger.warning(_msg("⚠️", "封面弹窗未能关闭，小人点「取消」放弃自定义封面（交给推荐封面兜底）"))
+            if await self._dismiss_cover_modal(page, cover_locator):
+                self.notes.append("自定义封面没能设置上（封面一直没处理完），抖音会用推荐封面")
+            else:
+                douyin_logger.warning(_msg("⚠️", "封面弹窗也取消不掉，可能挡住「发布」"))
+
+    COVER_FINISH_WAIT_POLLS = 60  # multipub patch: × 0.5 秒
+
+    async def _dismiss_cover_modal(self, page: Page, cover_locator) -> bool:
+        """multipub patch: 关掉封面弹窗（不保存）：点「取消」/ 关闭按钮，最后按 Esc。返回弹窗是否已关闭。"""
+        candidates = [cover_locator.get_by_role("button", name="取消", exact=True).first,
+                      cover_locator.locator(".semi-modal-close").first]
+        for btn in candidates:
+            try:
+                if await btn.count() and await btn.is_visible():
+                    await _native_click(page, btn)
+                    await page.wait_for_timeout(1000)
+            except Exception:
+                pass
+            if not await cover_locator.count():
+                return True
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(1000)
+        return not await cover_locator.count()
 
 
     async def upload(self, playwright: Playwright) -> None:
@@ -1529,7 +1815,8 @@ class DouYinVideo(DouYinBaseUploader):
                 await self._upload_video_steps(page)
             except SauError:
                 raise
-            except Exception:
+            except Exception as exc:
+                await self._classify_failure(page, exc)  # multipub patch
                 await save_screenshot(page, self.hooks, "error")
                 raise
             if await save_state_quietly(context, self.account_file):
@@ -1547,8 +1834,12 @@ class DouYinVideo(DouYinBaseUploader):
 
         # ── 进入页面后可能弹身份验证（短信验证码）或被踢到登录页 ──
         await page.wait_for_timeout(2000)
+        await self._handle_entry_verification(page)  # multipub patch
 
         # 确认已经在上传页（非登录页），再找上传 input
+        # multipub patch: 先等上传区渲染出来，期间被踢回登录页就立即报登录失效（上游干等 60 秒后报 Playwright 超时）
+        await self._wait_on_upload_page(page, page.locator("input.upload-btn-input, div[class^='container'] input").first,
+                                        "上传视频的入口")
         # 用更精确的选择器避免匹配到登录表单的 input
         upload_input = page.locator("input.upload-btn-input, div[class^='container'] input[accept]").first
         if not await upload_input.count():
@@ -1590,6 +1881,7 @@ class DouYinVideo(DouYinBaseUploader):
         await self._wait_for_publish_form(page, deadline)
 
         await asyncio.sleep(1)
+        await self._handle_entry_verification(page)  # multipub patch: 填表前再看一次
         douyin_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_title_and_description(page, self.title, self.desc, self.tags)
         douyin_logger.info(_msg("🏷️", f"小人一共贴了 {len(self.tags)} 个话题"))
@@ -1705,6 +1997,10 @@ class DouYinNote(DouYinBaseUploader):
     async def upload_note_content(self, page: Page) -> None:
         douyin_logger.info(_msg("🏃", f"小人开始搬运图文，共 {len(self.image_paths)} 张图片"))
         douyin_logger.info(_msg("🔀", "小人正在切换到图文发布"))
+        # multipub patch: 与视频流程一样先等页面稳定、处理进入页面时可能弹出的身份验证（遮罩会挡住「发布图文」）
+        await page.wait_for_timeout(2000)
+        await self._handle_entry_verification(page)
+        await self._wait_on_upload_page(page, page.get_by_text("发布图文", exact=True).first, "「发布图文」入口")
         await page.get_by_text("发布图文", exact=True).click()
         await page.wait_for_timeout(1000)
 
@@ -1728,8 +2024,10 @@ class DouYinNote(DouYinBaseUploader):
                 await asyncio.sleep(0.5)
 
         await asyncio.sleep(1)
+        await self._handle_entry_verification(page)  # multipub patch
         douyin_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_title_and_description(page, self.title, self.note, self.tags)
+        await self._clear_blocking_overlays(page)  # multipub patch: 收起残留的话题下拉（会挡住音乐、定时、发布）
         title_len = len(self.title) if self.title else 0
         tags_text = " ".join(f"#{t}" for t in self.tags) if self.tags else ""
         desc_and_tags_len = len(self.note or "") + (len(tags_text) + 2 if self.tags else 0)
@@ -1771,8 +2069,9 @@ class DouYinNote(DouYinBaseUploader):
             upload_success = True
         except SauError:
             raise
-        except Exception:
-            # multipub patch: 出错先截图留证
+        except Exception as exc:
+            # multipub patch: 先看页面停在哪（人机验证 / 登录页 / 短信验证），再截图留证
+            await self._classify_failure(page, exc)
             await save_screenshot(page, self.hooks, "error")
             raise
         finally:

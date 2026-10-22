@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>小红书创作服务平台</title></head>
+<body><div class="creator-home"><div class="publish-video"><span>发布笔记</span></div><div>首页</div><div>数据概览</div></div>
+<script>
+const SIM = /*SIM_CONFIG*/{};
+if (!document.cookie.includes('web_session=') || document.cookie.includes('web_session=expired')) {
+  setTimeout(() => location.replace('/login'), SIM.login_redirect_ms);
+}
+</script></body></html>

@@ -2,6 +2,9 @@
 
 multipub 以 Windows 10/11 为主要平台。下面的命令都在 **PowerShell** 里、仓库根目录下运行。
 
+> 从零开始的完整步骤（安装 → 登录 → 第一次发布 → 定时发布 → 常见问题）见 [Windows 使用教程](tutorial-windows.md)；
+> 本页是 Windows 上的细节和排错参考。
+
 ## 终端：用 Windows Terminal
 
 - 推荐 [Windows Terminal](https://aka.ms/terminal)（Win11 自带）：中文、emoji、`✔ ✘` 显示正常，
@@ -63,8 +66,8 @@ winget install Microsoft.VCRedist.2015+.x64
   `uv run mpub publish "D:\视频 素材\第12期"`。
 - `post.yaml` 里的 Windows 路径用**单引号**或**正斜杠**：`video: 'D:\视频素材\第12期.mp4'`、`video: D:/视频素材/第12期.mp4`。
   双引号里的 `\` 是转义符，要写 `"D:\\视频素材\\第12期.mp4"`。最省事的是把素材和 `post.yaml` 放在同一个目录、写相对路径。
-- 文本文件按 UTF-8 读取（记事本「另存为 UTF-8」即可，带 BOM 也行）；`config.toml` 另外也认 PowerShell 5.1
-  `Out-File` 写出的 UTF-16。`config.toml` 写错时所有命令都会报「配置错误」并退出（退出码 2），按提示改正即可。
+- 文本文件建议存成 UTF-8（记事本「另存为 UTF-8」即可，带 BOM 也行）。`post.yaml`、正文文件和 `config.toml`
+  也认 PowerShell 5.1 `Out-File` / `>` 写出的 UTF-16；`post.yaml` 和正文文件还认记事本「ANSI」（GBK）。`config.toml` 写错时所有命令都会报「配置错误」并退出（退出码 2），按提示改正即可。
 - 如果 Windows 用户名是中文、浏览器启动出现奇怪的问题，可以把数据目录和浏览器内核目录都换到纯英文路径再试：
 
   ```powershell
@@ -100,11 +103,13 @@ github_mirror = "https://ghfast.top/"
 ```
 
 v1.3.1 的压缩包 sha256 已内置在代码里，镜像返回的文件不对会直接拒绝安装，所以用第三方镜像也是安全的。
-也可以自己下载 biliup，再用 `biliup_path` 指过去（见 [config.example.toml](config.example.toml)）：
+也可以用自己已经下载好的 biliup（比如以前用 social-auto-upload 时下过的），不用再下载：
 
-```toml
-[platforms.bilibili]
-biliup_path = 'D:\tools\biliup\biliup.exe'
+```powershell
+uv run mpub biliup find                                   # 列出本机找到的 biliup，标出是否兼容
+uv run mpub biliup use 1                                  # 按编号选
+uv run mpub biliup use "D:\tools\biliup\biliup.exe"       # 或直接给路径
+uv run mpub biliup status                                 # 确认现在用哪个
 ```
 
 ## 使用本机 Chrome / Edge

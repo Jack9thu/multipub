@@ -74,10 +74,25 @@ REAL_PROBE = bb.probe_binary
 def biliup_starts(monkeypatch):
     """测试里的「biliup」都是假文件，跑不了 `--version`：默认当作能启动。
     要测真实试运行的用例用 monkeypatch.setattr(bb, "probe_binary", REAL_PROBE) 换回来。"""
+    from multipub.platforms import bili_locate
+
     bb._PROBE_OK.clear()
+    bili_locate._CAP_CACHE.clear()
     monkeypatch.setattr(bb, "probe_binary", lambda path, timeout=bb.PROBE_TIMEOUT: bb.Probe(True, "v1.3.1", 0))
+    # 兼容性检查读 `--help` / `upload --help`：假文件同样跑不了，返回 v1.3.1 的参数表
+    monkeypatch.setattr(bili_locate, "_help", lambda exe, args: V131_HELP["upload" if "upload" in args else "top"])
     yield
     bb._PROBE_OK.clear()
+    bili_locate._CAP_CACHE.clear()
+
+
+V131_HELP = {
+    "top": "Commands:\n  login\n  renew\n  upload\nOptions:\n  -u, --user-cookie <F>\n      --rust-log <L>\n",
+    "upload": "\n".join(f"      {f} <X>" for f in (
+        "--title", "--desc", "--tid", "--tid-v2", "--tag", "--copyright", "--source", "--cover", "--dtime",
+        "--dynamic", "--no-reprint", "--is-only-self", "--up-selection-reply", "--up-close-reply",
+        "--up-close-danmu", "--extra-fields", "--line", "--limit", "--submit")),
+}
 
 
 DLL_NOT_FOUND = 3221225781  # 0xC0000135，Windows 上 Python 拿到的是无符号值
@@ -215,6 +230,11 @@ def test_load_credential_bom_and_fields(tmp_path: Path):
     assert cred.csrf == "csrf123" and cred.has_token and cred.mid == 10086
     assert cred.cookie_dict["SESSDATA"] == "sess%2Cabc"
     assert 99 < cred.days_left() <= 100
+    # biliup（serde_json）不认 BOM：交给它之前原样去掉（内容不变），没有 BOM 时不动文件
+    before = f.read_bytes()
+    assert bc.strip_bom(f) and f.read_bytes() == before[3:]
+    assert not bc.strip_bom(f) and not bc.strip_bom(tmp_path / "missing.json")
+    assert bc.load_credential(f).csrf == "csrf123"
 
 
 def test_load_credential_errors_and_storage_state_shape(tmp_path: Path):
@@ -745,25 +765,105 @@ async def test_publish_video_scheduled(video_env, media: Path, monkeypatch):
     assert result.status is Status.SCHEDULED and result.url.endswith("BV1Ab4y1C7xY")
 
 
-@pytest.mark.parametrize("lines,rc,code", [
-    (["Error: file not found"], 1, ErrorCode.PLATFORM_ERROR),
-    (SUCCESS_LINES[:4] + ["Error: connection reset"], 1, ErrorCode.UNKNOWN_OUTCOME),
+@pytest.mark.parametrize("lines,rc,code,started", [
+    (["Error: file not found"], 1, ErrorCode.PLATFORM_ERROR, False),
+    (SUCCESS_LINES[:4] + ["Error: connection reset"], 1, ErrorCode.UNKNOWN_OUTCOME, True),
     (SUCCESS_LINES[:4] + ['ResponseData { code: 21012, data: None, message: "标签不能为空", ttl: Some(1) }'], 1,
-     ErrorCode.PLATFORM_ERROR),
+     ErrorCode.PLATFORM_ERROR, True),
     (SUCCESS_LINES[:4] + ['ResponseData { code: -504, data: None, message: "服务调用超时", ttl: Some(1) }'], 1,
-     ErrorCode.UNKNOWN_OUTCOME),
-    (["uploading..."], None, ErrorCode.TIMEOUT),
-    (SUCCESS_LINES[:4], None, ErrorCode.UNKNOWN_OUTCOME),
-    (["Error: credential validation failed with Bilibili code -101"], 1, ErrorCode.LOGIN_REQUIRED),
-    (SUCCESS_LINES[:4] + [REJECT_21070], 0, ErrorCode.PLATFORM_ERROR),  # 响应 code 优先于退出码
+     ErrorCode.UNKNOWN_OUTCOME, True),
+    (["uploading..."], None, ErrorCode.TIMEOUT, False),
+    (SUCCESS_LINES[:4], None, ErrorCode.UNKNOWN_OUTCOME, True),
+    (["Error: credential validation failed with Bilibili code -101"], 1, ErrorCode.LOGIN_REQUIRED, False),
+    (SUCCESS_LINES[:4] + [REJECT_21070], 0, ErrorCode.PLATFORM_ERROR, True),  # 响应 code 优先于退出码
 ])
-async def test_publish_video_failures(video_env, media: Path, monkeypatch, lines, rc, code):
+async def test_publish_video_failures(video_env, media: Path, monkeypatch, lines, rc, code, started):
+    """视频传完之前就失败 / 超时：确定没投稿，不标记 submit_started（查重不拦、可直接重发）；传完之后才标记。"""
     monkeypatch.setattr(bb, "run_streaming", fake_run(lines, rc, []))
     ctx, _ = make_ctx(video_env)
     with pytest.raises(PublishError) as info:
         await BilibiliAdapter(ctx).publish(video_post(media))
     assert info.value.code is code
-    assert ctx.submit_started
+    assert ctx.submit_started is started
+
+
+async def test_publish_video_marks_submit_when_upload_completes(video_env, media: Path, monkeypatch):
+    """v1.3.1：看到「Upload completed」那一刻（投稿请求之前）就发出 submit_started 事件，被中断时主进程据此记成结果未知。"""
+    seen: list[tuple[str, bool]] = []
+    ctx, events = make_ctx(video_env)
+
+    async def run(args, *, cwd, timeout, on_line=None, heartbeat=30):
+        for line in SUCCESS_LINES:
+            on_line(line)
+            seen.append((line, ctx.submit_started))
+        return 0, list(SUCCESS_LINES)
+
+    monkeypatch.setattr(bb, "run_streaming", run)
+    result = await BilibiliAdapter(ctx).publish(video_post(media))
+    assert result.status is Status.SUBMITTED and result.submit_started
+    started = [line for line, flag in seen if flag]
+    assert started[0] == SUCCESS_LINES[2] and "Upload completed" in started[0]
+    assert [e["event"] for e in events].count("submit_started") == 1
+
+    # 输出格式没核对过的版本（biliup_path 指向别的版本）：启动 biliup 之前就标记，保守处理
+    monkeypatch.setattr(bb, "probe_binary", lambda path, timeout=bb.PROBE_TIMEOUT: bb.Probe(True, "v1.2.0", 0))
+    bb._PROBE_OK.clear()
+    monkeypatch.setattr(bb, "run_streaming", fake_run(["Error: boom"], 1, []))
+    ctx2, _ = make_ctx(video_env)
+    with pytest.raises(PublishError):
+        await BilibiliAdapter(ctx2).publish(video_post(media))
+    assert ctx2.submit_started
+
+
+def test_marks_submit_phase():
+    assert bb.marks_submit_phase(SUCCESS_LINES[2]) and bb.marks_submit_phase(SUCCESS_LINES[3])
+    assert bb.marks_submit_phase(SUCCESS_LINES[4]) and bb.marks_submit_phase(SUCCESS_LINES[5])
+    assert not bb.marks_submit_phase(SUCCESS_LINES[0]) and not bb.marks_submit_phase(SUCCESS_LINES[1])
+    # 回显的文件名 / 别的模块 / 非 INFO 都不算
+    assert not bb.marks_submit_phase('<unknown time>  INFO biliup::uploader::line::upos: pre_upload: '
+                                     '{"name":"Upload completed: x.mp4"}')
+    assert not bb.marks_submit_phase("Upload completed: video.mp4 => cost 1s")
+    assert not bb.marks_submit_phase("<unknown time>  WARN biliup_cli::uploader: Upload completed: x")
+    assert not bb.marks_submit_phase('<unknown time>  INFO biliup_cli::uploader: ResponseData { code: 0 }')
+
+
+# biliup v1.3.1 真实输出（断网时上传：登录阶段的网络错误），error-stack 报告 + backtrace
+REAL_NETWORK_REPORT = """Error: \x1b[1mUnknown Error\x1b[22m
+├╴at \x1b[3mcrates/biliup-cli/src/uploader.rs:403:31\x1b[23m
+│
+├─▶ \x1b[1merror sending request\x1b[22m
+│   ╰╴at \x1b[3mcrates/biliup-cli/src/uploader.rs:403:31\x1b[23m
+│
+├─▶ \x1b[1mtcp connect error\x1b[22m
+│   ╰╴at \x1b[3mcrates/biliup-cli/src/uploader.rs:403:31\x1b[23m
+│
+╰─▶ \x1b[1mNetwork is unreachable (os error 101)\x1b[22m
+    ├╴at \x1b[3mcrates/biliup-cli/src/uploader.rs:403:31\x1b[23m
+    ╰╴backtrace (1)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+backtrace no. 1
+   0: <unknown>
+   7: __libc_start_call_main
+             at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+   8: __libc_start_main_impl
+             at ./csu/../csu/libc-start.c:360:3
+   9: <unknown>""".encode().decode("unicode_escape").encode("latin-1").decode("utf-8").splitlines()
+
+
+def test_error_text_summarises_error_stack_report():
+    o = bb.parse_upload_output(REAL_NETWORK_REPORT, 1)
+    assert o.error_text == "error sending request → tcp connect error → Network is unreachable (os error 101)"
+    assert "backtrace" in o.tail_text  # 末尾 12 行全是 backtrace：以前给人看的就是这些
+    lock = ["Error: 另一个使用该账号 (1) 的上传进程正在等待限流恢复，请稍后重试。",
+            "如果确认当前没有其他上传进程在运行，可能是上次异常退出残留的锁文件，", "可手动删除以下文件后重试：",
+            "  /tmp/biliup.lock", "├╴at crates/biliup-cli/src/uploader.rs:523:24", "╰╴backtrace (1)"]
+    assert bb.parse_upload_output(lock, 1).error_text.endswith("可手动删除以下文件后重试： /tmp/biliup.lock")
+    head_only = ["Error: open cookies file: c.json", "├╴at x.rs:1:1", "│", "╰─▶ No such file or directory (os error 2)"]
+    assert bb.parse_upload_output(head_only, 1).error_text == \
+        "open cookies file: c.json → No such file or directory (os error 2)"
+    assert bb.parse_upload_output(["just text", "more"], 1).error_text == "just text | more"
 
 
 async def test_publish_video_file_name_with_success_words(video_env, media: Path, monkeypatch):
@@ -852,7 +952,7 @@ async def test_publish_video_through_worker(video_env, media: Path, monkeypatch)
            "headless": True, "run_dir": str(video_env.runs_dir / "w"), "post": video_post(media).to_dict()}
     result = await run_job(job, emit=lambda e: None)
     assert result.status is Status.FAILED and result.error_code == "platform_error"
-    assert result.submit_started and not result.retryable
+    assert not result.submit_started and not result.retryable  # 没传完就失败：确定没投稿
     assert "尚未投稿" in result.message and "--force" not in result.message
 
 
@@ -912,7 +1012,7 @@ async def test_publish_video_startup_failure_exit_code(video_env, media: Path, m
         await BilibiliAdapter(ctx).publish(video_post(media))
     exc = info.value
     assert exc.code is ErrorCode.INTERNAL and "VCRUNTIME140.dll" in str(exc) and "尚未投稿" in str(exc)
-    assert ctx.submit_started  # 已经启动过 biliup，按约定不自动重试
+    assert not ctx.submit_started  # 进程根本没起来，确定没投稿
 
 
 async def test_publish_video_requires_login_and_biliup(settings, media: Path):
@@ -999,6 +1099,14 @@ def test_validate_note_rules(media: Path):
     big = media / "images" / "big.png"
     big.write_bytes(b"\0" * (20 * 1024 * 1024 + 1))
     assert "images" in errors_of(BilibiliAdapter.validate(note_post(media, images=[big])))
+    # 与发布框的本地校验一致：floor(大小/1MB) >= 上限就拒绝；GIF 上限 8MB
+    big.write_bytes(b"\0" * (20 * 1024 * 1024))
+    assert "images" in errors_of(BilibiliAdapter.validate(note_post(media, images=[big])))
+    anim = media / "images" / "anim.gif"
+    anim.write_bytes(b"\0" * (8 * 1024 * 1024))
+    assert "images" in errors_of(BilibiliAdapter.validate(note_post(media, images=[anim])))
+    anim.write_bytes(b"\0" * (8 * 1024 * 1024 - 1))
+    assert "images" not in errors_of(BilibiliAdapter.validate(note_post(media, images=[anim])))
 
 
 @pytest.mark.parametrize("delta,level", [
@@ -1466,6 +1574,46 @@ class _FakePage:
 SPEC_BTN = ".bili-dyn-specification-popup .bili-dyn-specification-popup__btn[确认并发送]"
 
 
+async def test_wait_publisher_stops_early(settings, monkeypatch):
+    """等发布框时：跳到登录页 / 页头登录按钮持续出现 / 整页风控都立即停下，不干等 30 秒；登录按钮一闪而过不算。"""
+    from multipub.platforms import bili_note as bn
+
+    monkeypatch.setattr(bn, "LOGIN_ENTRY_GRACE", 0.5)
+    ctx, _ = make_ctx(settings)
+    pub = bn.BrowserNotePublisher(ctx, account="main")
+
+    page = _FakePage()
+    page.url = "https://passport.bilibili.com/login?gourl=x"
+    with pytest.raises(LoginRequired, match="登录页"):
+        await pub._wait_publisher(page)
+
+    page = _FakePage(visible={".header-login-entry"})
+    t0 = time.monotonic()
+    with pytest.raises(LoginRequired):
+        await pub._wait_publisher(page)
+    assert time.monotonic() - t0 < 5
+
+    page = _FakePage(visible={"text=安全风控策略"})
+    with pytest.raises(NeedsAction) as info:
+        await pub._wait_publisher(page)
+    assert info.value.code is ErrorCode.RISK_CONTROL
+
+    # 登录按钮出现一下就变成发布框：正常继续
+    page = _FakePage(visible={".header-login-entry"})
+
+    async def later():
+        await asyncio.sleep(0.2)
+        page.visible = {".bili-dyn-publishing"}
+
+    task = asyncio.create_task(later())
+    await pub._wait_publisher(page)
+    await task
+
+    monkeypatch.setattr(bn, "PUBLISHER_WAIT", 0.5)
+    with pytest.raises(PublishError, match="改版"):
+        await pub._wait_publisher(_FakePage())
+
+
 @pytest.fixture
 def fast_note(monkeypatch):
     from multipub.platforms import bili_note as bn
@@ -1700,7 +1848,7 @@ async def test_note_browser_result_uses_what_was_sent(note_env, media: Path, mon
     state: dict[str, Any] = {}
 
     class StubPublisher:
-        def __init__(self, ctx, *, account, spec_consent=False, spec_marker=None):
+        def __init__(self, ctx, *, account, spec_consent=False, spec_marker=None, publish_wait=60):
             self.warnings = state.get("warnings", [])
             self.scheduled_at = state.get("scheduled_at")
 
@@ -1747,10 +1895,12 @@ async def test_note_consent_wiring(note_env, media: Path, monkeypatch):
 
     ctx, _, _ = note_env
     seen: list[tuple[bool, Path]] = []
+    waits: list[float] = []
 
     class StubPublisher:
-        def __init__(self, ctx, *, account, spec_consent=False, spec_marker=None):
+        def __init__(self, ctx, *, account, spec_consent=False, spec_marker=None, publish_wait=60):
             seen.append((spec_consent, spec_marker))
+            waits.append(publish_wait)
 
         async def publish(self, **kw):
             assert any(c["name"] == "buvid3" for c in kw["storage_state"]["cookies"])
@@ -1773,6 +1923,12 @@ async def test_note_consent_wiring(note_env, media: Path, monkeypatch):
     marker.write_text("x", encoding="utf-8")
     await adapter.publish(note_post(media))
     assert seen[-1][0] is True
+    # 点发布后等结果的秒数：默认 60，可在 config.toml 调（至少 10 秒）
+    ctx.settings.raw = {"platforms": {"bilibili": {"publish_wait": 120}}}
+    await adapter.publish(note_post(media))
+    ctx.settings.raw = {"platforms": {"bilibili": {"publish_wait": 1}}}
+    await adapter.publish(note_post(media))
+    assert waits[0] == 60 and waits[-2:] == [120, 10]
 
 
 def test_registry_and_doctor(settings):

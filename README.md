@@ -4,6 +4,8 @@
 用浏览器自动化（[patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python)）和平台网页版自己用的接口完成登录与发布，
 并带有一个 [Claude Code skill](#配合-claude-code-使用)，可以让 Claude 帮你准备清单、检查登录、确认后发布。
 
+> **第一次用？看 [Windows 使用教程](docs/tutorial-windows.md)**：从安装、登录到第一次发布、定时发布、常见问题，一步一步来。
+
 > [!WARNING]
 > **代码已实现并有离线测试，但尚未在真实账号上验证——请先用小号测试。**
 > 各平台页面和接口随时会改；每个平台文档末尾都列了「未在真实账号上验证」的清单和置信度。
@@ -38,8 +40,9 @@ platforms:
 
 ## 安全设计
 
-- **不会重复发布**：点「发布」/调用发布接口前会记录 `submit_started`；之后的任何失败都不会自动重试。
-  结果不确定时返回 `unknown_outcome`，提示你先去平台后台确认。同一内容发过之后再发会被查重跳过（`--force` 才会再发）。
+- **不会重复发布**：点「发布」/调用发布接口前会记录 `submit_started`（同时先在发布记录里记一笔「结果待定」，
+  mpub 中途被强行结束也不丢）；之后的任何失败都不会自动重试。结果不确定时返回 `unknown_outcome`，提示你先去平台后台确认。
+  同一内容发过之后再发会被查重跳过，两个 mpub 同时发同一条也只发一次；确实要再发用 `--to <平台> --force`。
 - **先校验再发布**：`mpub validate` / `mpub publish --dry-run` 只做本地检查（标题长度、图片数量、定时窗口……），不联网。
 - **不替你做声明**：AI 声明、转载声明、平台规范确认都只有你明确写了才会勾选（见下文对 social-auto-upload 的修改）。
 - **每个平台一个子进程**：某个平台卡死时连同浏览器一起结束，不影响其他平台；超时、出错都会留下日志和截图。
@@ -94,12 +97,16 @@ multipub 的知乎（接口发布）和 B站（biliup 投稿 + 动态）是自�
    `uv sync` 会按 `.python-version` 准备 Python 3.12、建 `.venv`、装好依赖（含测试用的 dev 组）。
    也可以 `uv venv` 然后 `uv pip install -e .`。或者直接运行 `scripts\install.ps1` 完成第 2、3 步（国内网络加 `-China`：依赖走国内镜像，浏览器改用系统自带的 Edge，详见 [docs/windows.md](docs/windows.md)）。
 
-3. 安装浏览器内核、下载 biliup，并自检：
+3. 安装浏览器内核、准备 biliup，并自检：
 
    ```powershell
    uv run mpub setup
    uv run mpub doctor
    ```
+
+   B站视频上传用的 biliup **由你选怎么来**：`setup` 会列出本机已有的 biliup，问你是直接给路径、用本机找到的，
+   还是下载经过验证的 v1.3.1。也可以随时用 `mpub biliup find` / `mpub biliup use <路径或编号>` /
+   `mpub biliup use --auto` / `mpub biliup use --download` 修改，`mpub biliup status` 查看（详见 [docs/platforms/bilibili.md](docs/platforms/bilibili.md)）。
 
    国内网络下载慢：见 [docs/windows.md](docs/windows.md) 的镜像设置，或改用本机 Chrome / Edge（不用下载内核）。
 
@@ -131,14 +138,15 @@ multipub 的知乎（接口发布）和 B站（biliup 投稿 + 动态）是自�
 | 命令 | 作用 |
 |---|---|
 | `mpub doctor` | 环境自检：Python、patchright、浏览器、biliup、各平台已登录账号 |
-| `mpub setup [--skip-browser]` | 安装 patchright Chromium、下载 biliup（只有它会下载） |
+| `mpub setup [--skip-browser] [--biliup auto\|download\|<路径>]` | 安装 patchright Chromium、准备 biliup（只有它会下载） |
+| `mpub biliup find` / `status` / `use <路径或编号>` / `use --auto` / `use --download` | 选择 B站视频上传用哪个 biliup |
 | `mpub login <平台> --account <名字> [--headless]` | 扫码登录；默认显示浏览器窗口 |
 | `mpub login bilibili --account <名字> --interactive` | 在真实终端里跑 biliup 自带的交互式登录（B站备用方案） |
 | `mpub check [平台…] [--account <名字>]` | 检查登录是否有效；不写平台 = 全部（`--all` 同义） |
 | `mpub accounts` | 列出已登录账号 |
 | `mpub new <目录> --kind video\|note\|article [--force]` | 生成 `post.yaml` 模板 |
 | `mpub validate <post>` | 本地校验清单 |
-| `mpub publish <post> --dry-run` | 本地校验，按发布结果的格式输出 |
+| `mpub publish <post> --dry-run` | 本地校验，按发布结果的格式输出（会提示哪些平台已经发过、真发时会跳过） |
 | `mpub publish <post> [--to 平台,平台] [--account 名字] [--yes] [--headed] [--gap 秒] [--timeout 秒] [--force]` | 发布 |
 | `mpub history [--limit N]` | 查看发布记录 |
 | `mpub verify-code douyin <验证码>` | 抖音发布中途要求短信验证时，提交验证码 |
@@ -155,6 +163,7 @@ multipub 的知乎（接口发布）和 B站（biliup 投稿 + 动态）是自�
 | `1` | 至少一个平台失败 |
 | `2` | 用法或清单错误、校验不通过、没加 `--yes` 又不在交互终端、取消确认 |
 | `3` | 需要人处理：登录失效、验证码、短信验证码、风控验证、平台规范确认 |
+| `130` | 被 Ctrl+C 中断（已点过发布的平台记为结果未知） |
 
 同时有失败和需要处理时返回 `1`。
 
@@ -166,11 +175,13 @@ multipub 的知乎（接口发布）和 B站（biliup 投稿 + 动态）是自�
 %LOCALAPPDATA%\multipub\
 ├─ config.toml              可选配置，见 docs/config.example.toml
 ├─ accounts\<平台>\<账号>.json   登录凭据（cookie / token，等同账号密码，不要发给别人）
-├─ tools\biliup\v1.3.1\     biliup.exe 及其安装记录（install.json、sha256）
+├─ tools\biliup\v1.3.1\     下载的 biliup.exe 及其安装记录（install.json、sha256）
+├─ tools\biliup\selected.json  你选择的 biliup 来源（mpub biliup use 写入）
 ├─ qrcode\                  登录二维码图片（<平台>-<账号>.png，登录结束后删除）
 ├─ runs\<时间>\<平台>\       每次运行的日志和截图（结果里的 evidence 指向这里）
 ├─ sau\                     抖音/小红书流程的日志、抖音短信验证码文件 verify_code.txt
 ├─ locks\                   账号锁（同一账号同一时间只跑一个任务）
+├─ pending\                 已点发布、还没有最终结果的记录（发布途中 mpub 被结束时留下，用于查重）
 └─ history.jsonl            发布记录（查重、对账用）
 ```
 

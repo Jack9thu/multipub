@@ -19,4 +19,5 @@ platforms:
   douyin: {}
   xiaohongshu: {}
   zhihu:
+    tags: []                  # 想法不关联话题：清掉顶层 tags，免得校验警告
     as: pin                   # pin = 想法（默认）；article = 发成知乎文章（正文作为 Markdown，图片插在文末）

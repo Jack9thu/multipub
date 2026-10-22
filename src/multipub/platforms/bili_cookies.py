@@ -110,6 +110,27 @@ def load_credential(path: Path) -> BiliCredential:
     return cred
 
 
+def strip_bom(path: Path) -> bool:
+    """登录文件开头有 UTF-8 BOM（记事本 / PowerShell 另存的）时原样去掉 BOM 重写：biliup 的 serde_json 不认 BOM，
+    会报看不懂的「expected value at line 1 column 1」。返回是否改写了。"""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return False
+    if not raw.startswith(b"\xef\xbb\xbf"):
+        return False
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(raw[3:])
+        if sys.platform != "win32":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return False
+    return True
+
+
 def _bool(value: Any, default: bool) -> bool:
     if value is None:
         return default
