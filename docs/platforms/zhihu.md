@@ -123,8 +123,11 @@ platforms:
 3. `POST https://api.zhihu.com/images {"image_hash": md5, "source": "article"|"pin"}`：
    `state=1` 知乎已有，跳过上传；`state=2` 用返回的临时凭证 `PUT https://zhihu-pics-upload.zhimg.com/<object_key>`，
    阿里云 OSS v1 签名（bucket 是 `zhihu-pics`），签名头包含 `x-oss-date`、`x-oss-security-token`、`x-oss-user-agent`。
-4. 轮询 `GET https://api.zhihu.com/images/<id>` 直到 `status=success`（每 1.5 秒，最多 `image_timeout` 秒）。
-5. 同一次任务里相同的图片只上传一次。
+4. 传完图床后 `PUT https://api.zhihu.com/images/<id>/uploading_status {"upload_result": "success"}` 通知知乎（网页编辑器也这样做）。
+   不发这一步，图片会一直停在 `status=init`，直到超时。
+5. 轮询 `GET https://api.zhihu.com/images/<id>` 直到 `status=success`（每 1.5 秒，最多 `image_timeout` 秒）。
+   `state=1` 的图如果还是 `init`（以前传完没通知），补发一次第 4 步的通知。
+6. 同一次任务里相同的图片只上传一次。
 
 ## 登录
 

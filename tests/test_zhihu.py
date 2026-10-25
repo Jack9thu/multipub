@@ -78,6 +78,9 @@ class FakeZhihu:
         self.known_hashes: set[str] = set()  # 这些图片登记时返回 state=1（知乎已有）
         self.processing_polls = 1  # 每张图先返回几次 processing
         self.polls: dict[str, int] = {}
+        # 等通知的图片：传完图床但还没 PUT uploading_status，状态一直是 init（和真实知乎一样）
+        self.awaiting_notify: set[str] = set()
+        self.stale_known: set[str] = set()  # 这些 state=1 的图也停在 init（以前传完没通知）
         self.publish_response: Any = {"code": 0, "message": "success",
                                       "data": {"result": json.dumps({"publish": {"id": "777"}})}}
         self.article_visible = True
@@ -126,12 +129,19 @@ class FakeZhihu:
             if path == "/images" and method == "POST":
                 md5 = self.json_body(request)["image_hash"]
                 state = 1 if md5 in self.known_hashes else 2
+                if state == 2 or md5 in self.stale_known:
+                    self.awaiting_notify.add(f"id-{md5[:8]}")
                 return httpx.Response(200, json={
                     "upload_file": {"state": state, "image_id": f"id-{md5[:8]}", "object_key": f"v2-{md5}"},
                     "upload_token": {"access_id": "AID", "access_key": "AKEY", "access_token": "STS-TOKEN"},
                 })
+            if path.startswith("/images/") and path.endswith("/uploading_status") and method == "PUT":
+                self.awaiting_notify.discard(path.split("/")[2])
+                return httpx.Response(200)
             if path.startswith("/images/") and method == "GET":
                 image_id = path.rsplit("/", 1)[-1]
+                if image_id in self.awaiting_notify:
+                    return httpx.Response(200, json={"status": "init"})
                 n = self.polls[image_id] = self.polls.get(image_id, 0) + 1
                 if n <= self.processing_polls:
                     return httpx.Response(200, json={"status": "processing"})
@@ -523,6 +533,10 @@ async def test_upload_image_state2_oss_put_and_polling(fake):
     sts = (f"PUT\n\nimage/png\n{put.headers['date']}\nx-oss-date:{put.headers['x-oss-date']}\n"
            f"x-oss-security-token:STS-TOKEN\nx-oss-user-agent:{za.OSS_UA}\n/zhihu-pics/v2-{md5}")
     assert put.headers["authorization"] == f"OSS AID:{independent_oss_sig('AKEY', sts)}"
+    notify = fake.find("PUT", "api.zhihu.com", f"/images/id-{md5[:8]}/uploading_status")
+    assert len(notify) == 1 and fake.json_body(notify[0]) == {"upload_result": "success"}
+    assert fake.requests.index(put) < fake.requests.index(notify[0])  # 先传图床再通知
+    assert notify[0].headers["x-xsrftoken"] == XSRF and notify[0].headers["origin"] == "https://zhuanlan.zhihu.com"
     assert len(fake.find("GET", "api.zhihu.com", f"/images/id-{md5[:8]}")) == 3  # 2 次 processing + 1 次 success
     assert img.original_src == f"https://picx.zhimg.com/v2-{md5[:8]}" and img.ext == "png"
     assert (img.width, img.height, img.md5) == (64, 48, md5)
@@ -535,7 +549,7 @@ async def test_upload_image_state1_skips_oss_and_timeout(fake, monkeypatch):
     async with za.make_client(za.normalize_cookies(storage_state())) as client:
         api = za.ZhihuApi(client, account="main", write_interval=0)
         await api.upload_image(za.prepare_image(data, "k.jpg"), source="pin", referer=za.WWW_HOME)
-        assert not [r for r in fake.requests if r.method == "PUT"]
+        assert not [r for r in fake.requests if r.method == "PUT"]  # 知乎已有、状态正常：不传图床也不通知
         assert fake.json_body(fake.find("POST", "api.zhihu.com", "/images")[0])["source"] == "pin"
 
         fake.processing_polls = 10 ** 6
@@ -544,6 +558,20 @@ async def test_upload_image_state1_skips_oss_and_timeout(fake, monkeypatch):
             await api.upload_image(za.prepare_image(image_bytes("PNG", (5, 5)), "slow.png"),
                                    source="article", referer=za.WWW_HOME)
     assert info.value.code is ErrorCode.TIMEOUT and info.value.retryable
+
+
+async def test_upload_image_state1_stale_init_gets_notified(fake):
+    data = image_bytes("PNG", (7, 7))
+    md5 = hashlib.md5(data).hexdigest()
+    fake.known_hashes.add(md5)
+    fake.stale_known.add(md5)
+    fake.processing_polls = 0
+    async with za.make_client(za.normalize_cookies(storage_state())) as client:
+        api = za.ZhihuApi(client, account="main", write_interval=0)
+        img = await api.upload_image(za.prepare_image(data, "old.png"), source="article", referer=za.WWW_HOME)
+    assert img.src.startswith("https://pic1.zhimg.com/")
+    assert not fake.find("PUT", "zhihu-pics-upload.zhimg.com", f"/v2-{md5}")  # 不重传图床
+    assert len(fake.find("PUT", "api.zhihu.com", f"/images/id-{md5[:8]}/uploading_status")) == 1  # 只补发一次
 
 
 async def test_write_interval_floor(settings, fake, monkeypatch):
@@ -593,7 +621,9 @@ async def test_article_publish_flow(env, media: Path):
 
     regs = [fake.json_body(r) for r in fake.find("POST", "api.zhihu.com", "/images")]
     assert [r["source"] for r in regs] == ["article"] * 4  # 本地 png、远程 webp、追加的 2.jpg、封面
-    assert len([r for r in fake.requests if r.method == "PUT"]) == 3
+    oss_puts = [r for r in fake.requests if r.method == "PUT" and r.url.host == "zhihu-pics-upload.zhimg.com"]
+    notifies = [r for r in fake.requests if r.method == "PUT" and r.url.path.endswith("/uploading_status")]
+    assert len(oss_puts) == 3 and len(notifies) == 3  # 每张传到图床的图都通知一次
     assert fake.find("GET", "img.example.com", "/a.webp")[0].headers.get("cookie") is None
 
     draft = fake.find("POST", "zhuanlan.zhihu.com", "/api/articles/drafts")[0]
