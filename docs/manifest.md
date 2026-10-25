@@ -155,6 +155,8 @@ platforms:
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
+| `declaration` | 不写（跟随 `ai_generated`） | 「内容类型声明」选项文字，必须与页面一致：`虚构演绎，仅供娱乐` / `笔记含AI合成内容` / `内容包含营销广告`；`false` 表示不声明。设置不上则拒绝发布（validation） |
+| `collection` | 无 | 加入已有合集（名称精确匹配；选不上只告警，照常发布） |
 | `repost_source` | 无（不声明） | 填写后声明「来源转载」并填入媒体名称；设置后会核实，设置不上则拒绝发布（validation） |
 
 ### 知乎（`platforms.zhihu`）
@@ -178,7 +180,7 @@ platforms:
 |---|---|---|
 | B站 | 视频投稿（biliup） | `title` 必填 ≤80；`body` → 简介 ≤2000（为空用标题）；`tags` 1–12 个、每个 ≤20 字、不能含逗号；`cover` jpg/png；`schedule` 晚于现在 2 小时~15 天；`ai_generated` → `creation_statement: 1` |
 | 抖音 | 视频 | `title` 必填 ≤30；`body` → 作品描述（>1000 字警告）；`tags` → 话题（>5 个警告）；`cover` → 横/竖封面；`schedule` 晚于现在 2 小时以上（>14 天警告）；`ai_generated` → 自主声明「内容由AI生成」（`declaration` 优先） |
-| 小红书 | 视频笔记 | `title` 必填 ≤20；`body` ≤1000；`tags` ≤10 个话题；`cover` → 封面；`schedule` 晚于现在 2 小时以上；`ai_generated` → 尽力选「笔记含AI合成内容」（选不上只告警，仍发布） |
+| 小红书 | 视频笔记 | `title` 必填 ≤20；`body` ≤1000；`tags` ≤10 个话题；`cover` → 封面；`schedule` 晚于现在 2 小时以上；`ai_generated` → 尽力选「笔记含AI合成内容」（选不上只告警，仍发布；`declaration` 优先，选不上拒绝发布） |
 | 知乎 | ✘ | 暂不支持视频 |
 
 视频格式：B站 `.mp4 .flv .avi .wmv .mov .webm .mpeg .mpg .mkv .m4v .ts .rm .rmvb .3gp`（其他给警告）；

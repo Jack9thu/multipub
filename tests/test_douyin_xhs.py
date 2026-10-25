@@ -1039,6 +1039,112 @@ async def test_xhs_ai_declaration_is_verified(sau, tmp_path: Path):
     assert n.declaration_warnings == [] and option not in page.clicks
 
 
+async def test_xhs_explicit_declaration_verified_or_refused(sau, tmp_path: Path):
+    """platforms.xiaohongshu.declaration 指定任意选项；设置不上拒绝发布（不像 AI 声明只告警）。"""
+    _, _, xhs = sau
+    from multipub._sau.runtime import DeclarationFailed
+
+    text = "虚构演绎，仅供娱乐"
+    option = f"text={text}"
+
+    def note(**kw: Any) -> Any:
+        return xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", declaration=text,
+                                   hooks=_fast_hooks(tmp_path, platform="xiaohongshu"), **kw)
+
+    def page_with(closes: bool) -> FakePage:
+        page = FakePage({"text=添加内容类型声明": True, option: True})
+
+        def pick(p: FakePage) -> None:
+            p.shown_texts.add(text)
+            if closes:
+                p.visible[option] = False
+
+        page.on_click[option] = pick
+        return page
+
+    n = note()
+    page = page_with(closes=True)
+    await n.apply_declarations(page)
+    assert n.declaration_warnings == [] and option in page.clicks
+
+    # 显式声明优先于 ai_generated：只选指定的一项，不再去点 AI 声明
+    n = note(ai_generated=True)
+    page = page_with(closes=True)
+    await n.apply_declarations(page)
+    assert f"text={xhs.XHS_AI_DECLARATION}" not in page.clicks and n.declaration_warnings == []
+
+    for bad in (page_with(closes=False), FakePage()):  # 点了没生效 / 页面上根本没有入口
+        with pytest.raises(DeclarationFailed) as info:
+            await note().apply_declarations(bad)
+        assert "platforms.xiaohongshu.declaration" in str(info.value) and text in str(info.value)
+    assert (tmp_path / "xiaohongshu-declaration.png").is_file()
+
+
+class CollectionPage(FakePage):
+    """模拟发布页「加入合集」：只响应 XHS_COLLECTION_JS 的 current / open / pick 三个操作。"""
+
+    def __init__(self, names: list[str], *, current: str = "", has_section: bool = True, pick_works: bool = True):
+        super().__init__()
+        self.names, self.current, self.has_section, self.pick_works = names, current, has_section, pick_works
+        self.opened = False
+        self.ops: list[str] = []
+
+    async def evaluate(self, script: str = "", arg: Any = None) -> Any:
+        if not (isinstance(arg, dict) and "op" in arg):
+            return await super().evaluate(script, arg)
+        self.ops.append(arg["op"])
+        if not self.has_section:
+            return {"ok": False, "why": "nowrap"}
+        if arg["op"] == "current":
+            return {"ok": True, "current": self.current, "why": ""}
+        if arg["op"] == "open":
+            self.opened = True
+            return {"ok": True, "current": self.current}
+        if arg["op"] == "pick":
+            if not self.opened:
+                return {"ok": False, "why": "noitem", "names": []}
+            if arg["name"] not in self.names:
+                return {"ok": False, "why": "noitem", "names": list(self.names)}
+            if self.pick_works:
+                self.current = arg["name"]
+            return {"ok": True}
+        return {"ok": False, "why": "op"}
+
+
+async def test_xhs_collection_selected_or_warned(sau):
+    """platforms.xiaohongshu.collection：发布页选合集；选不上只告警、照常发布。"""
+    _, _, xhs = sau
+    names = ["up短剧", "娱乐游戏", "思考随笔", "社会经济", "科研学习"]
+
+    def note(collection: str | None) -> Any:
+        return xhs.XiaoHongShuNote(["1.jpg"], "正文", [], 0, "x.json", title="标题", collection=collection)
+
+    n, page = note("科研学习"), CollectionPage(names)
+    await n.apply_collection(page)
+    assert page.current == "科研学习" and n.declaration_warnings == [] and page.ops == ["current", "open", "pick", "current"]
+
+    n, page = note("科研学习"), CollectionPage(names, current="科研学习")  # 已经选好（例如恢复的草稿）：不再点开
+    await n.apply_collection(page)
+    assert page.ops == ["current"] and n.declaration_warnings == []
+
+    n, page = note("不存在"), CollectionPage(names)
+    await n.apply_collection(page)
+    assert page.current == "" and "合集列表里没有这个名字" in n.declaration_warnings[0] and "社会经济" in n.declaration_warnings[0]
+    assert "Escape" in page.keyboard.pressed  # 收起浮层
+
+    n, page = note("科研学习"), CollectionPage(names, pick_works=False)  # 点了但按钮没显示这个合集
+    await n.apply_collection(page)
+    assert "可能没选上" in n.declaration_warnings[0]
+
+    n, page = note("科研学习"), CollectionPage(names, has_section=False)
+    await n.apply_collection(page)
+    assert "找不到「加入合集」" in n.declaration_warnings[0]
+
+    n, page = note(None), CollectionPage(names)  # 没写 collection：完全不碰
+    await n.apply_collection(page)
+    assert page.ops == [] and n.declaration_warnings == []
+
+
 async def test_cleanup_helpers_never_raise():
     from multipub._sau.runtime import close_quietly, save_state_quietly
 
@@ -1687,6 +1793,39 @@ def test_xiaohongshu_validate_rules(media: Path):
     assert _levels(article, "kind") == {"error"}
 
 
+def test_xiaohongshu_declaration_option(media: Path):
+    """platforms.xiaohongshu.declaration。"""
+    from multipub.platforms.xiaohongshu import resolve_declaration as xhs_decl
+
+    def issues(**kw: Any) -> list:
+        return XiaohongshuAdapter.validate(xhs_post(media, Kind.VIDEO, **kw))
+
+    assert issues(options={"declaration": "虚构演绎，仅供娱乐"}) == []
+    assert issues(options={"declaration": "内容包含营销广告"}) == []
+    assert issues(options={"declaration": False}) == []
+    assert _levels(issues(options={"declaration": "随便写的"}), "options.declaration") == {"warning"}
+    for bad in ("来源转载", "自主拍摄", True, 3, ["虚构演绎，仅供娱乐"]):
+        assert _levels(issues(options={"declaration": bad}), "options.declaration") == {"error"}, bad
+    # 和 ai_generated / repost_source 同时用：单选，给 warning
+    assert _levels(issues(ai_generated=True, options={"declaration": "虚构演绎，仅供娱乐"}),
+                   "options.declaration") == {"warning"}
+    assert _levels(issues(ai_generated=True, options={"declaration": "none"}), "options.declaration") == {"warning"}
+    assert issues(ai_generated=True, options={"declaration": "笔记含AI合成内容"}) == []
+    assert _levels(issues(options={"declaration": "虚构演绎，仅供娱乐", "repost_source": "某媒体"}),
+                   "options.repost_source") == {"warning"}
+
+    # collection：字符串、不能为空
+    assert issues(options={"collection": "社会经济"}) == []
+    assert _levels(issues(options={"collection": 3}), "options.collection") == {"error"}
+    assert _levels(issues(options={"collection": "  "}), "options.collection") == {"error"}
+
+    assert xhs_decl(xhs_post(media)) == (None, False)
+    assert xhs_decl(xhs_post(media, ai_generated=True)) == (None, True)
+    assert xhs_decl(xhs_post(media, ai_generated=True, options={"declaration": "off"})) == (None, False)
+    assert xhs_decl(xhs_post(media, ai_generated=True, options={"declaration": " 内容包含营销广告 "})) == (
+        "内容包含营销广告", False)
+
+
 # ------------------------------------------------------------------ 参数映射
 
 class Recorder:
@@ -1804,8 +1943,17 @@ async def test_xiaohongshu_option_mapping(settings, media: Path, tmp_path: Path,
     kw = recorder.instances[-1].kwargs
     assert type(recorder.instances[-1]).__name__ == "XiaoHongShuVideo"
     assert kw["thumbnail_path"] == str(media / "cover.jpg") and kw["desc"] == "正文"
-    assert kw["ai_generated"] is True and kw["repost_source"] == "某媒体"
+    assert kw["ai_generated"] is True and kw["repost_source"] == "某媒体" and kw["declaration"] is None
     assert result.status is Status.SUBMITTED and result.url is None and result.submit_started
+
+    # 显式 declaration：传给上传器，并且不再让它尽力选 AI 声明
+    await XiaohongshuAdapter(ctx).publish(xhs_post(media, Kind.VIDEO, ai_generated=True,
+                                                   options={"declaration": "虚构演绎，仅供娱乐"}))
+    kw = recorder.instances[-1].kwargs
+    assert kw["declaration"] == "虚构演绎，仅供娱乐" and kw["ai_generated"] is False and kw["collection"] is None
+
+    await XiaohongshuAdapter(ctx).publish(xhs_post(media, options={"collection": " 社会经济 "}))
+    assert recorder.instances[-1].kwargs["collection"] == "社会经济"
 
     when = _future(6)
     result = await XiaohongshuAdapter(ctx).publish(xhs_post(media, title="", schedule=when))

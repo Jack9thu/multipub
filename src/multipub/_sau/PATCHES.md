@@ -57,6 +57,16 @@
 - AI 声明要核实：去掉 omnipost「选项附近有 取消/×/已选 就当作已选」的判断；先按 Esc 收起面板，页面上已显示该声明才跳过，
   否则点选项后核实——点过的选项已随面板收起、且页面上显示着这几个字，才算成功，否则记入 `declaration_warnings`。
 - 原因：上游无条件声明「来源转载」且媒体名为空，会把原创内容标成转载。
+- **任意内容类型声明（2026-10-24）**：`__init__` 再加 `declaration=None`（视频、图文都透传）；
+  `set_ai_content_declaration()` 的选择和核实逻辑泛化成 `set_content_declaration(page, text)`，AI 声明改为调用它。
+  `apply_declarations()`：有 `declaration` 时选这一项（不再尽力选 AI 声明），核实不了就截图并抛 `DeclarationFailed`（拒绝发布）。
+  原因：网信办 2026-05 要求发布时做内容标注，原来只能选 AI 合成和来源转载，「虚构演绎」「营销广告」选不了。
+  适配器侧见 `platforms/xiaohongshu.py` 的 `resolve_declaration()` 和 validate。
+- **加入合集（2026-10-25）**：`__init__` 再加 `collection=None`；新增 `apply_collection()`，在视频、图文流程的 `apply_declarations()` 之后调用。
+  用页面脚本 `XHS_COLLECTION_JS` 操作发布页「内容设置 → 加入合集」（结构为真实页面实测：未选时 `.collection-plugin-button`，
+  选中后换成 `.collection-plugin-choose > .collection-name`；浮层 `.collection-plugin-popover .item > .item-content > .item-label`）。
+  按名称精确匹配点选，再核对 `.collection-name`；任何一步失败只记入 `declaration_warnings`，照常发布。
+  用页面脚本而不是 locator：patchright 的 CSS locator 在这个页面上时常定位不到这些元素。在真实发布页上实测过选中和「列表里没有」两种情况（没发布）。
 
 ### d. 所有等待循环加截止时间；区分「点击发布前/后」
 - 文件：`runtime.py`（新增）、两个 uploader 的 `main.py`

@@ -23,18 +23,21 @@
 | `tags` | 话题，≤10 个。只选名字与标签相同的候选（没有时退而求其次选名字包含标签的）；6 秒内没出现候选、或约 3 秒内候选里没有对得上的，就跳过该标签（不影响发布） |
 | `cover` | 视频封面。设置失败时关掉封面弹窗、用平台默认封面照常发布，结果消息里注明「自定义封面没能设置上」；图文以第一张图为封面，`cover` 会被忽略 |
 | `schedule` | 定时发布（本地时间） |
-| `ai_generated` | `true` 时尽力在「添加内容类型声明」里选择「笔记含AI合成内容」，选完核实（面板收起、页面上显示该声明）；没能确认选上只告警（写进结果消息），仍会发布 |
+| `ai_generated` | `true` 时尽力在「添加内容类型声明」里选择「笔记含AI合成内容」，选完核实（面板收起、页面上显示该声明）；没能确认选上只告警（写进结果消息），仍会发布。写了 `declaration` 时以 `declaration` 为准 |
 
 平台私有参数（`platforms.xiaohongshu` 下）：
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
+| `declaration` | 不写（跟随 `ai_generated`） | 「添加内容类型声明」要选的选项文字，必须与页面完全一致：`虚构演绎，仅供娱乐` / `笔记含AI合成内容` / `内容包含营销广告`（2026-10 调研到的网页端选项，未在真实账号上验证）。选完核实，**核实不了就拒绝发布**（`validation`，笔记没有发出）。`false` / `none` 表示不声明（`ai_generated` 的 AI 声明也不选）。「来源转载」请用 `repost_source`；「自主拍摄」要填地点和日期，不支持 |
+| `collection` | 不写（不加入合集） | 发布页「内容设置 → 加入合集」里要选的已有合集，名称精确匹配。选完核对按钮上显示的就是这个合集名；找不到「加入合集」、列表里没有这个名字、没能确认选上，都只告警（写进结果消息），照常发布。不会新建合集 |
 | `repost_source` | 无（不声明） | 填写后声明「来源转载」并填入媒体名称。上游会无条件声明转载（且名称为空），这里改为只有填写才声明。设置后会核实（点「确认」后输入框关闭、页面上显示出来源或「来源转载」），**核实不了就拒绝发布**（`validation`，笔记没有发出）：此时可去掉 `repost_source` 重发并在网页上手动声明 |
 
 ```yaml
 platforms:
   xiaohongshu:
     title: 3分钟学会XXX🔥
+    # declaration: 虚构演绎，仅供娱乐
     # repost_source: 某某日报
 ```
 
@@ -62,7 +65,11 @@ platforms:
 | 图片 BMP | 网页端可能不接受，建议转 JPG/PNG | warning |
 | 定时 | 必须晚于现在 2 小时以上 | error |
 | 定时 | 离 2 小时下限不足 15 分钟 / 超过 14 天 | warning |
-| `ai_generated` + `repost_source` | 声明可能是单选，以 AI 声明为准 | warning |
+| `ai_generated` / `declaration` + `repost_source` | 声明可能是单选，以后选的 AI / `declaration` 声明为准 | warning |
+| `declaration` | 不是字符串或 `false`；写成 `来源转载` / `自主拍摄` / `内容来源声明` | error |
+| `collection` | 不是字符串，或是空字符串 | error |
+| `declaration` | 不在已知选项里（文字可能和页面不一致） | warning |
+| `declaration` + `ai_generated` | 声明不是 AI 那一项（单选，以 `declaration` 为准）；或 `declaration: false` 关掉了 AI 声明 | warning |
 | 未知参数 | 拼写错误等 | warning |
 
 ## 登录
@@ -129,6 +136,7 @@ mpub login xiaohongshu --account main --headless   # 小红书无头登录可用
 | 点发布前某一步超时（含发布按钮一直不可点 / 不唯一） | `failed` / `timeout`（可重试） |
 | 点发布后超时、页面异常，或停在人机验证 | `failed` / `unknown_outcome`（先去后台确认，不要直接重发；发布记录会拦住不带 `--force` 的重发） |
 | 填了 `repost_source` 但没能确认设置上「来源转载」，点发布前 | `failed` / `validation`（拒绝发布，笔记没有发出） |
+| 填了 `declaration` 但没能确认选上该项，点发布前 | `failed` / `validation`（拒绝发布，笔记没有发出） |
 | 填了 `schedule` 但没能核实「定时发布」开关已打开、时间已填对，点发布前 | `failed` / `validation`（拒绝发布，笔记没有发出） |
 | 点发布后接口明确返回失败 | `failed` / `platform_error`（不可重试；笔记应未创建，建议先去后台确认） |
 | 参数问题（SAU 校验） | `failed` / `validation` |

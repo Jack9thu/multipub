@@ -166,6 +166,8 @@ def test_publish_success_paths(tmp_path: Path):
         Case("video_sidebar_button", scenario={"sidebar_button": True}),
         Case("video_ai_declaration", fields={"ai_generated": True}, scenario={"decl_popover": "body"}),
         Case("video_repost", fields={"platforms": {"xiaohongshu": {"repost_source": "某某 日报"}}}),
+        # 显式指定内容类型声明
+        Case("video_fiction_declaration", fields={"platforms": {"xiaohongshu": {"declaration": "虚构演绎，仅供娱乐"}}}),
         # 一输入 # 就弹热门话题、联想结果稍后才刷新；正文里自己写了 #话题 / @某人
         Case("video_topics_instant", scenario={"topics": "instant", "topic_delay_ms": 800},
              fields={"body": "周末去爬山 #徒步\n第二行 @小明\n最后一行"}),
@@ -220,6 +222,11 @@ def test_publish_success_paths(tmp_path: Path):
         assert body_of(run)["common"]["declaration"] == "笔记含AI合成内容"
         assert "注意" not in run.result["message"]
 
+    def fiction(run: Run) -> None:
+        ok_submitted(run)
+        assert body_of(run)["common"]["declaration"] == "虚构演绎，仅供娱乐"
+        assert "注意" not in run.result["message"]
+
     def repost(run: Run) -> None:
         ok_submitted(run)
         common = body_of(run)["common"]
@@ -253,6 +260,7 @@ def test_publish_success_paths(tmp_path: Path):
         "video_sidebar_button": sidebar,
         "video_ai_declaration": ai,
         "video_repost": repost,
+        "video_fiction_declaration": fiction,
         "video_topics_instant": topics_instant,
         "video_cover": cover,
         "video_cover_direct": cover,
@@ -278,6 +286,8 @@ def test_publish_failure_paths(tmp_path: Path):
         Case("schedule_time_reverted", fields={"schedule": when}, scenario={"schedule_switch": "revert"}),
         Case("repost_unavailable", fields={"platforms": {"xiaohongshu": {"repost_source": "某某日报"}}},
              scenario={"declaration": "none"}),
+        # 页面上没有指定的声明选项（模拟页没有「内容包含营销广告」）→ 拒绝发布
+        Case("declaration_option_missing", fields={"platforms": {"xiaohongshu": {"declaration": "内容包含营销广告"}}}),
         Case("video_upload_keeps_failing", scenario={"upload_fail": 9}),
         Case("note_image_failed_block", "note", scenario={"image_fail": [1]}),
         Case("note_image_failed_drop", "note", scenario={"image_fail": [1], "image_fail_mode": "drop"}),
@@ -322,6 +332,10 @@ def test_publish_failure_paths(tmp_path: Path):
         failed_before_submit(run, "validation")
         assert "来源转载" in run.result["message"]
 
+    def declaration_failed(run: Run) -> None:
+        failed_before_submit(run, "validation")
+        assert "内容包含营销广告" in run.result["message"] and "笔记没有发出" in run.result["message"]
+
     def upload_failed(run: Run) -> None:
         failed_before_submit(run, "platform_error")
         assert run.result["retryable"] is True
@@ -345,6 +359,7 @@ def test_publish_failure_paths(tmp_path: Path):
         "schedule_switch_swallowed": schedule_failed,
         "schedule_time_reverted": schedule_failed,
         "repost_unavailable": repost_failed,
+        "declaration_option_missing": declaration_failed,
         "video_upload_keeps_failing": upload_failed,
         "note_image_failed_block": upload_failed,
         "note_image_failed_drop": upload_failed,
