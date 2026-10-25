@@ -16,7 +16,8 @@
 - content/publish：草稿 id 不对 → 200 {"code": 2000, "message": "发布失败"}；成功 → {"code": 0, "message": "success",
   "data": {"result": "<JSON 字符串>"}}；
 - 图片：POST api.zhihu.com/images → state 1（已有）/ 2（要传）+ STS 凭证 → OSS PUT（v1 签名，bucket zhihu-pics）→
-  GET /images/<id>：init（还没传）/ processing / success；
+  PUT /images/<id>/uploading_status {"upload_result": "success"}（通知传完了）→
+  GET /images/<id>：init（还没传或还没通知）/ processing / success；
 - 草稿和文章同一个 id：GET www/api/v4/articles/<草稿 id> 对作者本人也可能返回 200（draft_visible）。
 """
 
@@ -308,6 +309,9 @@ class Api:
             m = re.fullmatch(r"/images/(\d+)", path)
             if m and method == "GET":
                 return "image_status", (m.group(1),)
+            m = re.fullmatch(r"/images/(\d+)/uploading_status", path)
+            if m and method == "PUT":
+                return "image_notify", (m.group(1),)
         return None
 
     # ---- 账号
@@ -540,7 +544,8 @@ class Api:
         key = f"v2-{md5}"
         token = {"access_id": "STS.sim" + md5[:6], "access_key": "sk-" + os.urandom(6).hex(),
                  "access_token": "CAIS" + os.urandom(12).hex(), "access_timestamp": int(time.time()) + 3600}
-        _MEM["images"][image_id] = {"md5": md5, "key": key, "uploaded": known, "source": data["source"]}
+        _MEM["images"][image_id] = {"md5": md5, "key": key, "uploaded": known, "notified": known,
+                                    "source": data["source"]}
         _MEM["tokens"][key] = token
         log_event("image_registered", id=image_id, md5=md5, state=1 if known else 2, source=data["source"])
         return self.json(200, {"upload_file": {"state": 1 if known else 2, "image_id": image_id, "object_key": key},
@@ -550,7 +555,7 @@ class Api:
         img = _MEM["images"].get(image_id)
         if img is None:
             return self.json(*_not_found("图片不存在"))
-        if not img["uploaded"]:
+        if not (img["uploaded"] and img["notified"]):
             return self.json(200, {"status": "init"})
         n = _MEM["polls"][image_id] = _MEM["polls"].get(image_id, 0) + 1
         mode = self.cfg["image_status"]
@@ -559,6 +564,16 @@ class Api:
         if mode == "fail":
             return self.json(200, {"status": "fail"})
         return self.json(200, image_info(img["md5"]))
+
+    async def h_image_notify(self, image_id: str, data: Any, **_: Any) -> tuple[int, dict[str, str], bytes]:
+        img = _MEM["images"].get(image_id)
+        if img is None:
+            return self.json(*_not_found("图片不存在"))
+        if data != {"upload_result": "success"}:
+            return self.json(400, {"error": {"code": 400, "message": "upload_result 不合法"}})
+        img["notified"] = True
+        log_event("image_notified", id=image_id, uploaded=img["uploaded"])
+        return 200, {}, b""
 
     def oss(self, method: str, path: str, headers: dict[str, str], body: bytes,
             cookies: dict[str, list[str]]) -> tuple[int, dict[str, str], bytes]:

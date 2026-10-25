@@ -233,8 +233,8 @@ patchright's Chromium lives in its own directory (Windows: `%LOCALAPPDATA%\ms-pl
 - **Check the dashboard when the outcome is unknown**: when you see `unknown_outcome` or a failure with `submit_started: true`, check the platform's dashboard first instead of publishing again.
 - **Zhihu may start requiring signatures**: in a 2026-10-25 test, publishing itself succeeded, but the post-publish verification request was rejected (HTTP 403, "请求参数异常，请升级客户端后重试").
   If publishing starts failing the same way, Zhihu has started requiring the `x-zse-96` signature and API publishing will stop working.
-- **Zhihu image processing can be slow**: a single image has taken 6-10+ minutes to process, while the default wait is 90 seconds, so the run times out while uploading images (before publish is pressed, so nothing is published).
-  Raise `image_timeout` (seconds) under `[platforms.zhihu]` in `config.toml`, and give the whole task more time with `--timeout`.
+- **Zhihu image processing timeouts**: if a run times out while uploading images (before publish is pressed, so nothing is published), raise `image_timeout` (seconds) under `[platforms.zhihu]` in `config.toml`,
+  and give the whole task more time with `--timeout`. Older versions sometimes waited 6-10+ minutes per image because they never told Zhihu the upload had finished (fixed; images now finish within seconds).
 - **Xiaohongshu's main site blocks headless browsers**: opening www.xiaohongshu.com in a headless browser is flagged as "IP at risk" (the creator platform used for publishing is not affected); use headed mode if you need to visit the main site.
 
 ## Using it with Claude Code

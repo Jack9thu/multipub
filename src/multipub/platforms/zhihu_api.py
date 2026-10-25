@@ -633,9 +633,11 @@ class ZhihuApi:
             if not isinstance(token, dict) or not {"access_id", "access_key", "access_token"} <= token.keys():
                 raise PublishError(f"{what}没有返回上传凭证", retryable=True)
             await self.oss_put(str(upload_file.get("object_key") or f"v2-{md5}"), prepared, token)
+            await self.notify_uploaded(image_id, prepared.name, origin=origin, referer=referer)
         elif state != 1:  # 1 = 知乎已有这张图，跳过上传
             raise PublishError(f"{what}返回未知状态 {state}", retryable=True)
-        info = await self.wait_image(image_id, prepared.name, referer=referer)
+        info = await self.wait_image(image_id, prepared.name, origin=origin, referer=referer,
+                                     notified=state == 2)
         img = ZhihuImage(
             src=str(info["src"]), original_src=str(info.get("original_src") or info["src"]),
             watermark=str(info.get("watermark") or "watermark"), watermark_src=str(info.get("watermark_src") or ""),
@@ -655,7 +657,13 @@ class ZhihuApi:
             raise PublishError(f"上传图片 {prepared.name} 到知乎图床失败（HTTP {resp.status_code}: "
                                f"{_snippet(resp)[:200]}）", retryable=True)
 
-    async def wait_image(self, image_id: str, name: str, *, referer: str) -> dict[str, Any]:
+    async def notify_uploaded(self, image_id: str, name: str, *, origin: str, referer: str) -> None:
+        """告诉知乎这张图已经传到图床。不发这一步，图片会一直停在 init，网页编辑器传完图也会发。"""
+        await self.call("PUT", f"{IMAGES_URL}/{image_id}/uploading_status", what=f"通知知乎图片 {name} 已上传",
+                        origin=origin, referer=referer, body={"upload_result": "success"})
+
+    async def wait_image(self, image_id: str, name: str, *, origin: str = WWW, referer: str,
+                         notified: bool = False) -> dict[str, Any]:
         deadline = time.monotonic() + self.image_timeout
         while True:
             info = await self.call("GET", f"{IMAGES_URL}/{image_id}", what=f"查询图片 {name} 的处理状态",
@@ -665,6 +673,11 @@ class ZhihuApi:
                 return info
             if status in ("fail", "failed", "error"):
                 raise PublishError(f"知乎处理图片 {name} 失败（{status}）")
+            if status == "init" and not notified:
+                # 知乎已有这张图（state 1），但以前传完没通知（旧版 mpub 或中断），补发一次
+                await self.notify_uploaded(image_id, name, origin=origin, referer=referer)
+                notified = True
+                continue
             if time.monotonic() > deadline:
                 raise PublishError(f"知乎处理图片 {name} 超过 {int(self.image_timeout)} 秒仍未完成，稍后重试",
                                    code=ErrorCode.TIMEOUT, retryable=True)
