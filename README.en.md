@@ -14,7 +14,7 @@ It ships with a [Claude Code skill](#using-it-with-claude-code) so Claude can pr
 
 > [!NOTE]
 > **Real-account test (2026-10-25)**: basic publishing succeeded on all four platforms (one Bilibili video, one Douyin video, one Xiaohongshu image note and one Zhihu column article, each with a content label).
-> Douyin `collection`, Xiaohongshu `collection` and Zhihu `column` (adding to a collection / column while publishing) have not been used in a real publish yet.
+> Douyin `collection`, Xiaohongshu `collection` and Zhihu `column` (adding to a collection / column while publishing) were also used in real publishes the same day: the Douyin and Xiaohongshu logs show the collection was selected, and the Zhihu column API confirmed the article was added.
 
 ## Platforms and content types
 
@@ -247,7 +247,7 @@ and just say things like "publish posts/ep12 to Bilibili and Douyin", "check the
 3. run `mpub login` and show you the QR-code image when a login has expired, and ask you for the SMS code when Douyin needs one;
 4. remind you to check the platform dashboard when an outcome is uncertain, and **never republish automatically**.
 
-You can also ask for **pre-publish preparation** only, e.g. "do the pre-publish preparation for <work directory>": Claude checks or fills in titles, descriptions, tags, covers, content labels and collections for each platform,
+You can also ask for **pre-publish preparation** only, e.g. "do the pre-publish preparation for `<work directory>`": Claude checks or fills in titles, descriptions, tags, covers, content labels and collections for each platform,
 checks how Zhihu articles render as Markdown (e.g. bold that breaks when Chinese punctuation touches `**`), leftover Markdown symbols in plain-text bodies (Xiaohongshu etc.) and whether Zhihu topics have exact matches,
 and stops at the confirmation summary without publishing (see [prepare.md](.claude/skills/multipub/references/prepare.md) and [content-check.md](.claude/skills/multipub/references/content-check.md), in Chinese).
 
