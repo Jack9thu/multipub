@@ -64,6 +64,9 @@ uv run mpub doctor --json
   （常见原因：登录时用了 `--account main`，清单却没写 `account`，默认是 `default`），按提示改清单或去登录。
 - 写清单时：标题、正文里带 `#话题` 要给整个值加引号（`body: "今天去徒步 #徒步"`），`tags` 直接写 `[徒步, 周末]`；
   不加引号的 `#xxx` 会被 YAML 当成注释，validate 会报「会被 YAML 当成注释而丢掉」。Windows 路径用单引号。
+- 合集 / 专栏（合集要用户先手动建好）：抖音 `platforms.douyin.collection: 合集名`、小红书 `platforms.xiaohongshu.collection: 合集名`、
+  知乎 `platforms.zhihu.column: c_…`；B站发完用 `biliup season add <section_id> --vid <BV>` 补加。选不上合集不拦发布，结果 `message` 里会注明，要转告用户。
+- 内容标注（2026-05 起发布时必选）：B站 `creation_statement`、抖音 `declaration`、小红书 `declaration`、知乎 `statement`。属于铁律 4，用户确认后才写。
 
 ### 3. 检查登录
 
@@ -86,7 +89,7 @@ uv run mpub publish posts/<名字> --dry-run --json    # 发布前的最终本�
 汇总时单独列出（已发过 / 点过发布但结果未知），问用户是否要对这个平台强制再发（`--to <平台> --force`）。
 给用户一张汇总表，每个平台一行：平台 / 账号 / 内容类型（发成什么：B站视频或动态、抖音视频或图文、小红书笔记、知乎想法或文章）/
 标题 / 定时（`schedule`，没有就写「立即」）/ 声明（`ai_generated`；抖音 `declaration`、B站 `creation_statement` 与 `copyright`/`source`、
-小红书 `repost_source`、知乎 `statement`、知乎 `draft`）/ 标签 / 媒体文件。再列出跳过的平台和所有 warning。
+小红书 `declaration` / `repost_source`、知乎 `statement`、知乎 `draft`）/ 合集（`collection` / `column`，没有就写「不加入」）/ 标签 / 媒体文件。再列出跳过的平台和所有 warning。
 然后问：「确认发布到以上平台吗？」只有明确的肯定回答才继续。
 
 ### 5. 发布

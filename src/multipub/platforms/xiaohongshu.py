@@ -18,7 +18,32 @@ BODY_MAX = 1000
 TAGS_MAX = 10
 IMAGES_MAX = 18
 
-KNOWN_OPTIONS = ("repost_source",)
+KNOWN_OPTIONS = ("repost_source", "declaration", "collection")
+
+# 「添加内容类型声明」下拉里能直接选的项。
+# 来源：2026-10 调研到的开源发布工具抓取的网页端页面，未在真实账号上验证。
+# 「来源转载」用 repost_source；「自主拍摄」要填地点和日期，不支持。
+DECLARATION_OPTIONS = ("虚构演绎，仅供娱乐", "笔记含AI合成内容", "内容包含营销广告")
+NO_DECLARATION = {False, "false", "none", "no", "off", "关闭", "无", "不声明"}
+UNSUPPORTED_DECLARATIONS = {
+    "来源转载": "转载请用 repost_source: <来源名称>",
+    "内容来源声明": "转载请用 repost_source: <来源名称>；「自主拍摄」不支持",
+    "自主拍摄": "「自主拍摄」要填地点和日期，multipub 不支持，请在网页上手动声明",
+}
+
+
+def resolve_declaration(post: PlatformPost) -> tuple[str | None, bool]:
+    """内容类型声明：返回 (显式声明文字, 是否尽力选 AI 声明)。
+
+    显式 options.declaration 优先（设置不上拒绝发布）；填 false 表示不声明（ai_generated 的 AI 声明也不选）；
+    没填时沿用 ai_generated：尽力选「笔记含AI合成内容」，失败只告警。
+    """
+    value = post.options.get("declaration")
+    if value is None:
+        return None, post.ai_generated
+    if value in NO_DECLARATION or (isinstance(value, str) and value.strip().lower() in NO_DECLARATION):
+        return None, False
+    return str(value).strip(), False
 
 
 class XiaohongshuAdapter(PlatformAdapter):
@@ -66,8 +91,27 @@ class XiaohongshuAdapter(PlatformAdapter):
                 c.warn("cover", "小红书图文以第一张图片为封面，cover 已忽略")
         c.options(opts, KNOWN_OPTIONS, post.kind)
         c.str_option(opts, "repost_source")
-        if post.ai_generated and opts.get("repost_source"):
-            c.warn("options.repost_source", "内容类型声明可能是单选：同时声明转载和 AI 合成时以 AI 声明为准")
+        c.str_option(opts, "collection")  # 发布页「加入合集」，按名称精确匹配
+        if isinstance(opts.get("collection"), str) and not opts["collection"].strip():
+            c.error("options.collection", "合集名不能为空；不加入合集就删掉这一项")
+        decl = opts.get("declaration")
+        if decl is True or (decl is not None and not isinstance(decl, (str, bool))):
+            c.error("options.declaration", "应为页面上的声明选项文字（如「虚构演绎，仅供娱乐」），或 false 表示不声明")
+        else:
+            text, ai = resolve_declaration(post)
+            if text in UNSUPPORTED_DECLARATIONS:
+                c.error("options.declaration", UNSUPPORTED_DECLARATIONS[text])
+            elif text is not None and text not in DECLARATION_OPTIONS:
+                c.warn("options.declaration", f"「{text}」不在已知选项里（{' / '.join(DECLARATION_OPTIONS)}）："
+                                              "文字必须和页面完全一致，选不上会拒绝发布（笔记不会发出）")
+            if text is not None and post.ai_generated and text != DECLARATION_OPTIONS[1]:
+                c.warn("options.declaration", f"ai_generated 为 true，但声明是「{text}」：内容类型声明是单选，"
+                                              "以 declaration 为准，AI 合成内容请在正文里注明")
+            elif decl is not None and text is None and post.ai_generated:
+                c.warn("options.declaration", "ai_generated 为 true 但关闭了内容类型声明")
+            if opts.get("repost_source") and (text is not None or ai):
+                c.warn("options.repost_source", "内容类型声明可能是单选：同时声明转载和其他类型时，"
+                                                "以后选的 AI / declaration 声明为准")
         c.schedule(post.schedule)
         return c.issues
 
@@ -115,6 +159,7 @@ class XiaohongshuAdapter(PlatformAdapter):
     def build_uploader(self, xhs: Any, post: PlatformPost) -> Any:
         """PlatformPost → vendored SAU 的 XiaoHongShuVideo / XiaoHongShuNote。"""
         scheduled = post.schedule is not None
+        declaration, ai_declaration = resolve_declaration(post)
         common: dict[str, Any] = {
             "tags": list(post.tags),
             "publish_date": post.schedule or 0,
@@ -124,8 +169,10 @@ class XiaohongshuAdapter(PlatformAdapter):
             "debug": False,
             "headless": self.ctx.headless,
             "hooks": bridge.make_hooks(self.ctx, post.kind),
-            "ai_generated": post.ai_generated,
+            "ai_generated": ai_declaration,  # 上传器里只用来决定要不要尽力选 AI 声明
             "repost_source": str(post.options.get("repost_source") or "") or None,
+            "declaration": declaration,
+            "collection": str(post.options.get("collection") or "").strip() or None,
         }
         if post.kind is Kind.VIDEO:
             return xhs.XiaoHongShuVideo(

@@ -71,6 +71,35 @@ XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 # multipub patch: AI 内容声明选项文字（来自 omnipost，未在真实账号上验证）
 XHS_AI_DECLARATION = "笔记含AI合成内容"
+# multipub patch: 发布页「内容设置 → 加入合集」。结构为真实页面实测：
+# 触发器 .collection-plugin-wrapper 里的 .collection-plugin-button（未选时，文字「选择合集」）；选中后换成 .collection-plugin-choose > .collection-name（合集名），
+# 浮层挂在 body 下 .collection-plugin-popover，每项 .item > .item-content > .item-label，底部 .popover-footer 是「创建合集」。
+# 用页面脚本定位和点击：patchright 的 CSS locator 在这个页面上时常定位不到这些元素。
+XHS_COLLECTION_JS = """(arg) => {
+  const wrap = document.querySelector('.collection-plugin-wrapper');
+  if (!wrap) return {ok: false, why: 'nowrap'};
+  // 未选：.collection-plugin-button（「选择合集」）；选中后换成 .collection-plugin-choose > .collection-name（合集名）
+  const btn = wrap.querySelector('.collection-plugin-button, .collection-plugin-choose');
+  const nameEl = wrap.querySelector('.collection-name');
+  const current = nameEl ? (nameEl.textContent || '').trim() : '';
+  if (arg.op === 'current') return {ok: !!btn, current: current, why: btn ? '' : 'nobtn'};
+  if (arg.op === 'open') {
+    if (!btn) return {ok: false, why: 'nobtn'};
+    wrap.scrollIntoView({block: 'center'});
+    btn.click();
+    return {ok: true, current: current};
+  }
+  if (arg.op === 'pick') {
+    const items = [...document.querySelectorAll('.collection-plugin-popover .item')];
+    const label = e => ((e.querySelector('.item-label') || e).textContent || '').trim();
+    const it = items.find(e => label(e) === arg.name);
+    if (!it) return {ok: false, why: 'noitem', names: items.map(label)};
+    it.scrollIntoView({block: 'nearest'});
+    it.click();
+    return {ok: true};
+  }
+  return {ok: false, why: 'op'};
+}"""
 # multipub patch: 创建笔记接口（与开源 xhs 客户端一致；被动监听用于防重复点击和拿笔记 ID，未在真实账号上验证）
 XHS_CREATE_API_RE = re.compile(r"^/web_api/sns/v\d+/note/?$")
 XHS_API_HOSTS = (".xiaohongshu.com", ".rednote.com")
@@ -517,6 +546,8 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         hooks: Hooks | None = None,
         ai_generated: bool = False,
         repost_source: str | None = None,
+        declaration: str | None = None,
+        collection: str | None = None,
     ):
         self.publish_date = publish_date
         self.account_file = str(account_file)
@@ -529,6 +560,10 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         self.hooks = hooks or Hooks(platform="xiaohongshu")
         self.ai_generated = bool(ai_generated)
         self.repost_source = (repost_source or "").strip()
+        # multipub patch: 显式指定的内容类型声明（platforms.xiaohongshu.declaration），设置不上就拒绝发布
+        self.declaration = (declaration or "").strip()
+        # multipub patch: 要加入的合集名（platforms.xiaohongshu.collection），选不上只告警
+        self.collection = (collection or "").strip()
         self._publish_clicked = False
         self.publish_guard = self.hooks.publish_guard()
         self.published_note_id: str | None = None
@@ -631,13 +666,23 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
     async def apply_declarations(self, page: Page) -> None:
         """multipub patch: 上游无条件声明「来源转载」（媒体名称为空），改为显式开启：
         有 repost_source 才声明转载，设置不上就拒绝发布（不能把转载内容当原创发出去）；
-        ai_generated 时尽力选择 AI 合成内容声明（没能确认选上只告警，写进结果消息）。"""
+        ai_generated 时尽力选择 AI 合成内容声明（没能确认选上只告警，写进结果消息）。
+        显式指定 declaration 时选这一项（优先于 ai_generated），设置不上就拒绝发布。"""
         if self.repost_source and not await self.check_original_declaration(page):
             await save_screenshot(page, self.hooks, "declaration")
             raise DeclarationFailed(
                 f"「来源转载」声明（来源：{self.repost_source}）没能设置上，拒绝继续发布，笔记没有发出。"
                 "可去掉 platforms.xiaohongshu.repost_source 后重发，并在网页上手动声明转载"
             )
+        if self.declaration:
+            if not await self.set_content_declaration(page, self.declaration):
+                await save_screenshot(page, self.hooks, "declaration")
+                raise DeclarationFailed(
+                    f"内容类型声明「{self.declaration}」没能设置上，拒绝继续发布，笔记没有发出。"
+                    "请核对 platforms.xiaohongshu.declaration 与页面上的选项文字完全一致，"
+                    "或去掉它后重发，并在网页上手动声明"
+                )
+            return
         if self.ai_generated and not await self.set_ai_content_declaration(page):
             self.declaration_warnings.append(f"未能确认已选择「{XHS_AI_DECLARATION}」声明，请在笔记管理里检查并补充")
 
@@ -1075,13 +1120,18 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         """小红书「添加内容类型声明」选择「笔记含AI合成内容」。
 
         multipub patch: 移植自 omnipost（MIT，基于 SAU 99a392a），尽力而为，失败只告警。
-        不再凭选项附近有「取消/×」就当作已选：点击后核实——点过的选项随面板收起、
-        页面上（输入区以外）显示出这几个字，才返回 True。
         """
         if not getattr(self, "ai_generated", False):
             return False
+        return await self.set_content_declaration(page, XHS_AI_DECLARATION)
 
-        declaration_text = XHS_AI_DECLARATION
+    async def set_content_declaration(self, page: Page, declaration_text: str) -> bool:
+        """在「添加内容类型声明」下拉里选择文字为 declaration_text 的选项。
+
+        multipub patch: 由 set_ai_content_declaration 泛化而来，选项文字由调用方给出（如「虚构演绎，仅供娱乐」）。
+        不再凭选项附近有「取消/×」就当作已选：点击后核实——点过的选项随面板收起、
+        页面上（输入区以外）显示出这几个字，才返回 True。
+        """
         xiaohongshu_logger.info(_msg("🧍", f"小人准备设置内容类型声明：{declaration_text}"))
         try:
             # multipub patch: 兜底从 div.filter(has_text=...)（会命中最外层容器，点到页面中央）
@@ -1148,6 +1198,59 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         except Exception as e:
             xiaohongshu_logger.warning(_msg("😵", f"设置内容类型声明失败: {e}"))
             return False
+
+    async def apply_collection(self, page: Page) -> None:
+        """multipub patch: 在发布页「内容设置 → 加入合集」里选择已有合集（按名称精确匹配）。
+
+        尽力而为，和抖音的合集一致：找不到区域 / 列表里没有这个名字 / 选完按钮没显示这个名字，
+        都只写进 declaration_warnings（适配器放进结果消息），照常发布。不会点「创建合集」。
+        """
+        name = getattr(self, "collection", "")
+        if not name:
+            return
+
+        async def run(op: str) -> dict:
+            r = await page.evaluate(XHS_COLLECTION_JS, {"op": op, "name": name})
+            return r if isinstance(r, dict) else {}
+
+        xiaohongshu_logger.info(_msg("🧍", f"小人准备加入合集：{name}"))
+        try:
+            state: dict = {}
+            for _ in range(8):  # 「加入合集」区域出现后，按钮要再过一会儿才渲染（实测）
+                state = await run("current")
+                if state.get("ok"):
+                    break
+                await page.wait_for_timeout(500)
+            if not state.get("ok"):
+                self.declaration_warnings.append(f"没有加入合集「{name}」（页面上找不到「加入合集」）")
+                return
+            if state.get("current") == name:
+                xiaohongshu_logger.info(_msg("🥳", f"合集已是「{name}」，跳过"))
+                return
+            if not (await run("open")).get("ok"):
+                self.declaration_warnings.append(f"没有加入合集「{name}」（打不开合集列表）")
+                return
+            picked: dict = {}
+            for _ in range(5):  # 浮层和列表是异步渲染的
+                await page.wait_for_timeout(600)
+                picked = await run("pick")
+                if picked.get("ok") or picked.get("names"):
+                    break
+            if not picked.get("ok"):
+                await self._press_escape(page)
+                why = (f"合集列表里没有这个名字，现有：{'、'.join(picked['names'])}" if picked.get("names")
+                       else "合集列表没有出现")
+                self.declaration_warnings.append(f"没有加入合集「{name}」（{why}）")
+                return
+            await page.wait_for_timeout(800)
+            if (await run("current")).get("current") != name:
+                self.declaration_warnings.append(f"合集「{name}」可能没选上，请到 App 里核对")
+                return
+            xiaohongshu_logger.success(_msg("🥳", f"已选择合集：{name}"))
+        except Exception as exc:
+            xiaohongshu_logger.warning(_msg("😵", f"选择合集失败: {exc}"))
+            self.declaration_warnings.append(f"没有加入合集「{name}」（选择时出错）")
+            await self._press_escape(page)
 
     @staticmethod
     async def _press_escape(page: Page) -> None:
@@ -1258,6 +1361,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         hooks: Hooks | None = None,
         ai_generated: bool = False,
         repost_source: str | None = None,
+        declaration: str | None = None,
+        collection: str | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -1268,6 +1373,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             hooks=hooks,
             ai_generated=ai_generated,
             repost_source=repost_source,
+            declaration=declaration,
+            collection=collection,
         )
         self.title = title
         self.file_path = file_path
@@ -1490,6 +1597,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
         # multipub patch: 上游无条件声明「来源转载」，改为显式开启（见 apply_declarations）
         await self.apply_declarations(page)
+        await self.apply_collection(page)  # multipub patch
 
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
@@ -1550,6 +1658,8 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         hooks: Hooks | None = None,
         ai_generated: bool = False,
         repost_source: str | None = None,
+        declaration: str | None = None,
+        collection: str | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -1560,6 +1670,8 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
             hooks=hooks,
             ai_generated=ai_generated,
             repost_source=repost_source,
+            declaration=declaration,
+            collection=collection,
         )
         self.image_paths = image_paths
         self.note = note or ""
@@ -1617,6 +1729,7 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
 
         # multipub patch: 上游无条件声明「来源转载」，改为显式开启（见 apply_declarations）
         await self.apply_declarations(page)
+        await self.apply_collection(page)  # multipub patch
 
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
