@@ -1,6 +1,6 @@
 ---
 name: multipub
-description: 用 multipub（mpub 命令行）把视频、图文、文章发布到 B站、抖音、小红书、知乎。当用户想发布/定时发布视频、图文笔记、动态、想法或知乎文章，检查或登录这些平台的账号，准备或检查 post.yaml 发布清单，或询问发布结果、发布记录时使用。Use when the user wants to publish or schedule videos / image posts / articles to Bilibili, Douyin, Xiaohongshu (RedNote) or Zhihu, check or log in platform accounts, or prepare a post.yaml manifest.
+description: 用 multipub（mpub 命令行）把视频、图文、文章发布到 B站、抖音、小红书、知乎。当用户想发布/定时发布视频、图文笔记、动态、想法或知乎文章，检查或登录这些平台的账号，准备或检查 post.yaml 发布清单，或询问发布结果、发布记录时使用。也负责「作品做好之后、发布之前」的准备工作：给一个作品目录或一组成品（视频、小红书图文、知乎文章），核对或补齐各平台的标题、简介、标签、封面、声明、合集，检查知乎 Markdown 渲染和小红书等纯文本正文里残留的 Markdown 符号，核对知乎话题，做到万事俱备、只差用户说「发」——用户说「发布前的准备」「检查标题封面简介」「检查 md 渲染」时也用。Use when the user wants to publish or schedule videos / image posts / articles to Bilibili, Douyin, Xiaohongshu (RedNote) or Zhihu, check or log in platform accounts, or prepare a post.yaml manifest.
 ---
 
 # multipub：多平台发布
@@ -12,6 +12,10 @@ multipub 是本仓库里的命令行工具 `mpub`。它用浏览器自动化和�
 - [references/cli-contract.md](references/cli-contract.md)：所有命令、参数、JSON 输出、事件、退出码、错误码及处理方式
 - [references/troubleshooting.md](references/troubleshooting.md)：常见问题
 - 仓库里的 `docs/manifest.md`（post.yaml 全部字段）、`docs/platforms/<平台>.md`（各平台细节）
+- [references/prepare.md](references/prepare.md)：**发布前准备**（作品做好之后、发布之前）。用户要做准备工作、或给了作品目录 / 一组成品时，先读它：
+  读现有产物 → 定一句话主旨 → 各平台标题、简介、标签、封面对照表（含小红书图文、知乎文章）→ 声明 → 封面 → 正文检查与知乎话题核对 → 合集 →
+  validate / dry-run → 确认卡片。**用户只要准备时，到确认卡片就停，不发布。**
+- [references/content-check.md](references/content-check.md)：**发布前的正文渲染检查**（知乎 Markdown 逐处核对、小红书等纯文本平台的残留符号、知乎话题），脚本 `scripts/content_check.py`。
 
 ## 怎么运行
 
@@ -66,7 +70,9 @@ uv run mpub doctor --json
   不加引号的 `#xxx` 会被 YAML 当成注释，validate 会报「会被 YAML 当成注释而丢掉」。Windows 路径用单引号。
 - 合集 / 专栏（合集要用户先手动建好）：抖音 `platforms.douyin.collection: 合集名`、小红书 `platforms.xiaohongshu.collection: 合集名`、
   知乎 `platforms.zhihu.column: c_…`；B站发完用 `biliup season add <section_id> --vid <BV>` 补加。选不上合集不拦发布，结果 `message` 里会注明，要转告用户。
-- 内容标注（2026-05 起发布时必选）：B站 `creation_statement`、抖音 `declaration`、小红书 `declaration`、知乎 `statement`。属于铁律 4，用户确认后才写。
+- 内容标注（2026-05 起发布时必选）：B站 `creation_statement`、抖音 `declaration`、小红书 `declaration`、知乎 `statement`，
+  各平台写法对照见 [references/prepare.md](references/prepare.md) 第 4 步。属于铁律 4，用户确认后才写。
+- 标题、简介、标签、封面怎么写和怎么检查，见 [references/prepare.md](references/prepare.md) 第 2、3、5 步。
 
 ### 3. 检查登录
 
@@ -79,6 +85,10 @@ uv run mpub check douyin xiaohongshu --account main --json
 `status: ok` 为有效；`needs_action` + `login_required` 就去登录（见下）。抖音/小红书的检查要开无头浏览器，每个账号可能要一两分钟。
 
 ### 4. dry-run 与确认
+
+**先查正文渲染**（validate / dry-run 不查这个）：`uv run python .claude/skills/multipub/scripts/content_check.py <post.yaml 或其目录> --topics`。
+有错误就按 [references/content-check.md](references/content-check.md) 逐处做最小修复，重跑到没有错误；知乎文章查 Markdown 渲染，
+其他平台的正文按纯文本查（不渲染 Markdown，符号会原样显示）；`--topics` 联网只读核对知乎话题有没有同名的。
 
 ```bash
 uv run mpub validate posts/<名字> --json            # 取每个平台实际要发的字段
@@ -165,6 +175,25 @@ uv run mpub publish posts/<名字> --yes --json
 - 发布记录：`uv run mpub history --limit 20 --json`
 - 只发其中几个平台 / 统一换账号：`--to bilibili,douyin`、`--account test`
 - 显示浏览器窗口发布（排查问题、手动过验证）：`--headed`
+
+## 本机适配（可选）
+
+本 skill 只写通用的部分。各人的环境不同，下面这些适合在自己的**全局 skill**（复制到用户目录的那一份，见下节）里补充，
+补充的文件放进 `references/` 或 `scripts/`，并在 SKILL.md 末尾记一段「本机安装说明」，列出本机加了哪些文件、哪些段落，
+仓库更新、重新复制 SKILL.md 后照着补回去（本机加的文件不会被覆盖）。
+
+| 可以适配的 | 写什么 | 用在哪一步 |
+|---|---|---|
+| 写作规范 | 自己的封面 / 标题 / 简介规范、各题材的形态和风格建议（文档路径） | prepare.md「依据」、第 2–3 步 |
+| 作品目录约定 | 一个作品目录里哪个文件是文案、清单放在哪、成片 / 时间轴 / 封面 / 图卡输出到哪 | prepare.md 第 1 步 |
+| 封面工具 | 用什么画封面（AI 画图 skill、代码画图、设计软件），用什么脚本切各平台尺寸和出检查图，已知会裁字的地方 | prepare.md 第 5 步 |
+| 合集 / 专栏表 | 各系列在四个平台的合集名、B站 section_id、知乎专栏 id；B站发完补加合集的脚本 | prepare.md 第 7 步、第 6 步汇报 |
+| 账号 | 各平台用的账号名（如 `main`）、登录有效期 | 第 3 步 |
+| 署名来源 | 背景音乐、素材放在哪、许可说明在哪 | prepare.md 第 3 步 |
+| 声明习惯 | 常用的内容标注（仍要每次请用户确认，铁律 4） | prepare.md 第 4 步 |
+| 从一个视频出发 | 只给视频路径时：转写（whisper 等，注意 GPU / 解释器路径）、抽帧、推章节，再接 prepare.md | prepare.md 开头 |
+| B站分区表 | 从创作中心刷新的 tid 列表缓存 | prepare.md 第 3 步 |
+| 命令写法 | 全局使用时把 `uv run mpub`、`uv run python .claude/...` 换成带仓库路径的写法 | 全篇 |
 
 ## 全局安装（在任何目录使用）
 
