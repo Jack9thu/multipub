@@ -247,8 +247,13 @@ and just say things like "publish posts/ep12 to Bilibili and Douyin", "check the
 3. run `mpub login` and show you the QR-code image when a login has expired, and ask you for the SMS code when Douyin needs one;
 4. remind you to check the platform dashboard when an outcome is uncertain, and **never republish automatically**.
 
+You can also ask for **pre-publish preparation** only, e.g. "do the pre-publish preparation for <work directory>": Claude checks or fills in titles, descriptions, tags, covers, content labels and collections for each platform,
+checks how Zhihu articles render as Markdown (e.g. bold that breaks when Chinese punctuation touches `**`), leftover Markdown symbols in plain-text bodies (Xiaohongshu etc.) and whether Zhihu topics have exact matches,
+and stops at the confirmation summary without publishing (see [prepare.md](.claude/skills/multipub/references/prepare.md) and [content-check.md](.claude/skills/multipub/references/content-check.md), in Chinese).
+
 To use it from any directory, copy `.claude\skills\multipub` to `%USERPROFILE%\.claude\skills\multipub`
 and change the commands in SKILL.md to include the repository path (see "全局安装" at the end of SKILL.md).
+Your own style guides, work-directory conventions, cover tools, collection tables and so on can be added to that global copy; see "本机适配" in SKILL.md for what fits where.
 
 ## Development
 

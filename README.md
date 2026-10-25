@@ -251,8 +251,13 @@ patchright 的 Chromium 装在它自己的目录（Windows：`%LOCALAPPDATA%\ms-
 3. 登录失效时帮你跑 `mpub login` 并把二维码图片给你看，抖音要短信验证码时向你要验证码；
 4. 结果不确定时提醒你先去平台后台确认，**不会自动重发**。
 
+也可以只做**发布前准备**：说「帮我做 <作品目录> 的发布前准备」，Claude 会核对或补齐各平台的标题、简介、标签、封面、声明、合集，
+检查知乎文章的 Markdown 渲染（如中文标点紧贴 `**` 导致加粗失效）、小红书等纯文本正文里残留的 Markdown 符号、知乎话题有没有同名的，
+做到确认卡片为止，不发布（见 [prepare.md](.claude/skills/multipub/references/prepare.md)、[content-check.md](.claude/skills/multipub/references/content-check.md)）。
+
 想在任何目录都能用，把 `.claude\skills\multipub` 复制到 `%USERPROFILE%\.claude\skills\multipub`，
 并在 SKILL.md 里把命令改成带仓库路径的形式（见 SKILL.md 末尾「全局安装」）。
+自己的写作规范、作品目录约定、封面工具、合集表等可以补进全局那一份，哪些适合补、补在哪，见 SKILL.md「本机适配」。
 
 ## 开发
 
