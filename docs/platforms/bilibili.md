@@ -35,7 +35,7 @@
 | `copyright` | `1` | 1 自制 / 2 转载 → `--copyright` |
 | `source` | 无 | 转载来源，`copyright: 2` 时必填 → `--source` |
 | `dynamic` | 无 | 投稿同时发的粉丝动态文案 → `--dynamic` |
-| `creation_statement` | `ai_generated: true` 时为 `1`，否则不传 | 创作声明 id：-1 无 / 1 AI / 2 虚构演绎 / 3 营销 / 4 个人观点，经 `--extra-fields '{"creation_statement":{"id":N}}'` 提交（用法来自 OmniPost，**未验证**） |
+| `creation_statement` | `ai_generated: true` 时为 `1`，否则不传 | 创作声明 id：-1 无 / 1 AI / 2 虚构演绎 / 3 营销 / 4 个人观点，经 `--extra-fields '{"creation_statement":{"id":N}}'` 提交（用法来自 OmniPost；2026-10-25 真实投稿时带上、投稿成功，创作中心里显示是否正确**未核对**） |
 | `no_reprint` | `false` | `true` → `--no-reprint=1`（禁止转载） |
 | `is_only_self` | `false` | `true` → `--is-only-self=1`（仅自己可见） |
 | `selection_reply` / `close_reply` / `close_danmu` | `false` | 精选评论 / 关闭评论 / 关闭弹幕 → `--up-selection-reply` 等（biliup 注明仅 app 投稿接口有效，默认就是 app；`submit: web` / `b-cut-android` 时给 warning） |

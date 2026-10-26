@@ -208,7 +208,7 @@ If there are both failures and items needing a human, the exit code is `1`.
 
 ## Data directory
 
-Default `%LOCALAPPDATA%\multipub` (Linux/macOS: `~/.local/share/multipub`); change it with the `MULTIPUB_HOME` environment variable or `--home`:
+Default `%LOCALAPPDATA%\multipub` (Linux/macOS: `$XDG_DATA_HOME/multipub`, or `~/.local/share/multipub` when it is not set); change it with the `MULTIPUB_HOME` environment variable or `--home`:
 
 ```
 %LOCALAPPDATA%\multipub\
@@ -271,6 +271,18 @@ The browser simulation tests under `tests/sim/` are skipped by default; set `MUL
 $env:MULTIPUB_SIM_CHROMIUM = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 uv run pytest -q tests/sim/test_sim_xhs.py -k "not sigterm"   # the sigterm test reads /proc and only runs on Linux
 ```
+
+On Windows the following tests currently fail. In each case an assumption the test makes about the environment does not hold; the features themselves are fine:
+
+| Test | Reason |
+|---|---|
+| `tests/test_bilibili.py::test_run_streaming_real_subprocess` | when a subprocess's stdout and stderr are read together, the order on Windows differs from what the test expects |
+| `tests/test_zhihu.py::test_headless_verify_fails_fast_with_risk_control` | the Windows clock resolution is about 15 ms; with the wait set to 0 the loop runs over a thousand extra times within one clock tick |
+| `tests/sim/test_sim_daily.py::test_new_edit_validate_dry_run_like_a_user` | the manifest the test writes gets CRLF line endings on Windows, leaving a stray `\r` in the body |
+| `tests/sim/test_sim_daily.py::test_skill_walkthrough_commands_and_fields` | when run directly in a terminal, the subprocess inherits the terminal's stdin, so `mpub publish` stops to ask for confirmation while the test expects a non-interactive environment |
+
+`tests/test_bilibili.py::test_publish_video_deadline_accounts_for_elapsed` also depends on timing and occasionally fails when the machine is busy; rerunning it on its own passes.
+`tests/sim/test_sim_daily.py` does not need a browser and runs even without `MULTIPUB_SIM_CHROMIUM`.
 
 pip users: `pip install -e ".[dev]"`. The optional extra `terminal-qr` (opencv) prints ASCII-art QR codes in the logs.
 
