@@ -19,6 +19,7 @@ platforms:
     tid: 231                  # 必填：分区 id（231=计算机技术），见 docs/platforms/bilibili.md
     copyright: 1              # 1 自制，2 转载（转载必须填 source）
     # dynamic: 新视频上线啦    # 投稿时同步发的粉丝动态
+    # collection: 编程小课堂   # 加入已有合集（投稿成功后立即加入，不用等审核）
   douyin:
     title: 三分钟讲清楚 Git 分支  # 抖音标题最多 30 字
     # declaration: 内容为个人观点或见解   # 自主声明，文字需与页面一致；不写则不声明

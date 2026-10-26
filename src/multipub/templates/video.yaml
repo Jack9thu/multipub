@@ -16,6 +16,7 @@ platforms:
     tid: 231                # 分区 id（231=计算机技术），见 docs/platforms/bilibili.md
     copyright: 1            # 1 自制，2 转载（转载必须填 source）
     # source: https://...
+    # collection: 我的合集    # 加入已有合集（投稿成功后立即加入，不用等审核）
   douyin:
     title: 三分钟讲清楚 XXX   # 抖音标题最多 30 字
     # declaration: 内容由AI生成   # 抖音自主声明，选项文字需与页面一致；不填则不声明

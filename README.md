@@ -213,7 +213,7 @@ multipub 的知乎（接口发布）和 B站（biliup 投稿 + 动态）是自�
 
 ## 数据目录
 
-默认 `%LOCALAPPDATA%\multipub`（Linux/macOS：`~/.local/share/multipub`），可用环境变量 `MULTIPUB_HOME` 或 `--home` 改：
+默认 `%LOCALAPPDATA%\multipub`（Linux/macOS：`$XDG_DATA_HOME/multipub`，没设时是 `~/.local/share/multipub`），可用环境变量 `MULTIPUB_HOME` 或 `--home` 改：
 
 ```
 %LOCALAPPDATA%\multipub\
@@ -276,6 +276,18 @@ uv run pytest -q                 # 全部离线测试，不需要浏览器和账
 $env:MULTIPUB_SIM_CHROMIUM = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 uv run pytest -q tests/sim/test_sim_xhs.py -k "not sigterm"   # sigterm 那个测试读 /proc，只能在 Linux 上跑
 ```
+
+在 Windows 上，下面几个测试目前会失败。都是测试本身对环境的假设不成立，不是功能问题，不影响使用：
+
+| 测试 | 原因 |
+|---|---|
+| `tests/test_bilibili.py::test_run_streaming_real_subprocess` | 子进程的 stdout 和 stderr 合在一起读时，Windows 上的先后顺序和测试预期的不同 |
+| `tests/test_zhihu.py::test_headless_verify_fails_fast_with_risk_control` | Windows 的计时精度约 15 毫秒，测试把等待时间设成 0 时，循环在同一个时钟刻度里多跑了上千次 |
+| `tests/sim/test_sim_daily.py::test_new_edit_validate_dry_run_like_a_user` | 测试写出的清单在 Windows 上是 CRLF 换行，正文里多出 `\r` |
+| `tests/sim/test_sim_daily.py::test_skill_walkthrough_commands_and_fields` | 在终端里直接运行时，子进程继承了终端的 stdin，`mpub publish` 会停下来问确认，而测试预期的是非交互环境 |
+
+另外 `tests/test_bilibili.py::test_publish_video_deadline_accounts_for_elapsed` 依赖计时，机器忙时偶尔失败，单独重跑能过。
+`tests/sim/test_sim_daily.py` 不需要浏览器，不设 `MULTIPUB_SIM_CHROMIUM` 也会运行。
 
 pip 用户：`pip install -e ".[dev]"`。可选 extra `terminal-qr`（opencv）用于在日志里打印字符画二维码。
 
