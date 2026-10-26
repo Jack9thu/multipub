@@ -42,6 +42,7 @@
 
 上面 5 个开关**必须是 YAML 布尔值** `true` / `false`（不写或 `null` 等于 false）。`"false"`、`"no"`、`0`、`1`
 这类字符串或数字会在 validate 时报 error，不会被当成 true（否则 `is_only_self: "false"` 会把视频发成仅自己可见）。
+| `collection` | 无 | 投稿成功后立即加入已有合集（合集名精确匹配；合集有多个小节时加入第一个）。审核中就能加入，不用等过审；找不到合集或加入失败只告警，照常投稿。见下文「加入合集」 |
 | `extra_fields` | 无 | 映射，原样 JSON 合并进投稿参数 → `--extra-fields`（高级用法） |
 | `line` | 自动探测 | 上传线路：`bldsa cnbldsa andsa atdsa bda2 cnbd anbd atbd tx cntx antx attx txa alia estx akbd` → `--line` |
 | `limit` | 3（biliup 默认） | 单文件并发分片数 → `--limit` |
@@ -279,6 +280,23 @@ mpub login bilibili --account main
 | 启动上传时 biliup 起不来（退出码 0xC0000135 等，没传完） | `failed` / `internal` | 带 VC++ 运行库提示，尚未投稿 |
 | 输出里是登录错误（`credential validation failed`、`账号未登录` 等）且没传完 | `needs_action` / `login_required` | 重新登录 |
 
+#### 加入合集（`collection`）
+
+和 B站投稿页的做法一致（投稿页前端在投稿成功后调用 `season/section/episodes/add`），不经过 biliup：
+
+1. **上传前**按合集名查小节（`GET member.bilibili.com/x2/creative/web/seasons`，只读，最多 20 秒）。
+   找不到合集（日志列出现有合集）或查询失败：告警，照常投稿，不加入合集。登录失效则在上传前报 `login_required`。
+2. **投稿成功后**用创作中心的稿件接口取 cid（`GET /x/vupre/web/archive/view`），再
+   `POST /x2/creative/web/season/section/episodes/add`（`{sectionId, episodes: [{aid, cid, title}], csrf}`），
+   最后看小节的稿件列表（`GET /x2/creative/web/season/section?id=<小节>`）里有没有这条：以列表为准，不只看接口返回 OK。
+   刚投稿时稿件接口可能还查不到、合集写接口太频繁会返回 20111 / 256000、列表里暂时还没有，都隔 3 秒重试，每步最多 4 次；
+   整步最多 60 秒，并且不超过本次任务的剩余时间。
+3. 结果仍以投稿为准：加入成功时消息末尾加「已加入合集「X」」；失败时加原因和补加办法（创作中心「合集管理」，
+   或过审后 `biliup season add <section_id> --vid <BV>`），状态不变。
+
+不用 `biliup season add` 的原因：它用公开接口 `api.bilibili.com/x/web-interface/view` 查 cid，审核中的稿件返回 -404，
+所以只能过审后再加；创作中心接口能查到自己审核中的稿件。投稿参数里不带 `season_id`（APP 投稿接口实测不会因此加入合集）。
+
 > 取舍：看到「上传完成」才标记依赖 biliup 的日志格式，所以只对核对过的 v1.3.1 这样做；其他版本仍在启动前标记
 > （「上传阶段就失败」也带 `submit_started: true`，错误消息里写明「尚未投稿」，查重只拦截 `published` / `submitted` /
 > `scheduled` 和 `unknown_outcome`，确认后直接重发即可）。
@@ -396,7 +414,9 @@ mpub login bilibili --account main
 
 下表各项大多**没有在真实账号上逐一核对**，置信度沿用调研时的判断。
 
-> **真实账号实测（2026-10-25）**：视频投稿在真实账号上走通过：biliup 上传、分区 `tid`、自制 `copyright: 1`、创作声明 `creation_statement`、4:3 封面、投稿成功并过审；过审后用 `biliup season add` 加入合集成功（审核中的稿件加不进）。
+> **真实账号实测（2026-10-25）**：视频投稿在真实账号上走通过：biliup 上传、分区 `tid`、自制 `copyright: 1`、创作声明 `creation_statement`、4:3 封面、投稿成功并过审；过审后用 `biliup season add` 加入合集成功。
+> **真实账号实测（2026-10-26）**：审核中（state -30）的稿件，用创作中心接口 `/x/vupre/web/archive/view` 取到 cid，调 `episodes/add` 加入合集成功，合集里显示为待审核（公开接口同一时刻返回 -404，这正是 `biliup season add` 在审核中失败的原因）；APP 投稿接口带 `season_id` 不会自动加入合集。
+> **真实账号实测（2026-10-26，`collection`）**：清单写 `collection: <已有合集名>`，`mpub publish` 结果为「投稿成功，等待B站审核；已加入合集「…」」，投稿后约 3 秒完成；随后独立核对：稿件审核中（state -30），`season/aid` 返回该合集，小节稿件列表里有这条（状态 -30）。
 > 声明在创作中心显示是否正确、动态（opus）发布没有在这次核对。
 
 置信度说明：高 = 源码/官方脚本/文档多方一致；

@@ -176,7 +176,8 @@ def sau_session(ctx: "JobContext", business_name: str) -> Iterator[None]:
         record = message.record
         text = _EMOJI_PREFIX.sub("", record["message"]).strip()
         if text:
-            ctx.log(text, level="warning" if record["level"].no >= 30 else "info")
+            # loguru 自己的 stderr sink 已经写过这一行
+            ctx.log(text, level="warning" if record["level"].no >= 30 else "info", to_stderr=False)
 
     handler_id = logger.add(
         sink, level="SUCCESS", format="{message}", colorize=False,

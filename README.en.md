@@ -15,6 +15,7 @@ It ships with a [Claude Code skill](#using-it-with-claude-code) so Claude can pr
 > [!NOTE]
 > **Real-account test (2026-10-25)**: basic publishing succeeded on all four platforms (one Bilibili video, one Douyin video, one Xiaohongshu image note and one Zhihu column article, each with a content label).
 > Douyin `collection`, Xiaohongshu `collection` and Zhihu `column` (adding to a collection / column while publishing) were also used in real publishes the same day: the Douyin and Xiaohongshu logs show the collection was selected, and the Zhihu column API confirmed the article was added.
+> Bilibili `collection` (tested 2026-10-26): about 3 seconds after the submission succeeded the video was added to the collection while still under review; it already appeared in the collection's video list (marked as pending review), with no need to wait for approval.
 
 ## Platforms and content types
 
@@ -53,7 +54,7 @@ There are two approaches:
 
 | Platform | Basic publishing | Adding to a collection |
 |---|---|---|
-| **Bilibili** | **Video: API** - calls the [biliup](https://github.com/biliup/biliup) CLI, which uploads and submits through Bilibili's upload API; **dynamic posts: browser automation** (the t.bilibili.com composer) | **API, after publishing** - biliup's `season add`, then checks the collection list; videos still under review cannot be added |
+| **Bilibili** | **Video: API** - calls the [biliup](https://github.com/biliup/biliup) CLI, which uploads and submits through Bilibili's upload API; **dynamic posts: browser automation** (the t.bilibili.com composer) | **API, right after submitting** - calls the creator center's collection API once the submission succeeds (the same as the upload page), so videos still under review can be added |
 | **Douyin** | **Browser automation** - the creator center publish page: upload, title and description, topics, cover, declaration, press publish, and listen for the create-API response | **Browser automation, during publishing** - picks the collection in the form's "add to collection" dropdown by exact name and verifies it |
 | **Xiaohongshu** | **Browser automation** - the creator platform publish page, same flow as Douyin | **Browser automation, during publishing** - "content settings → add to collection", picked with a page script and verified against the name shown on the button |
 | **Zhihu** | **API** (a browser is opened only for QR-code login) - the web API Zhihu's own site uses: upload images → create draft → body, topics, declaration → publish | **API, during publishing** - the column id (`column`) is sent in the publish request |
@@ -64,12 +65,12 @@ None of the platforms can **create** a collection (collections / columns must be
 
 | Platform | In the manifest | Notes |
 |---|---|---|
-| Bilibili | not handled by multipub itself; after publishing run `biliup season add <section_id> --vid <BV>` | videos under review cannot be added; add them after approval |
+| Bilibili | `platforms.bilibili.collection: <collection name>` | exact name match; videos only; added right after submitting, no need to wait for approval |
 | Douyin | `platforms.douyin.collection: <collection name>` | exact name match; videos only |
 | Xiaohongshu | `platforms.xiaohongshu.collection: <collection name>` | exact name match; videos and image notes |
 | Zhihu | `platforms.zhihu.column: c_1234567890` (or the column URL) | articles only; ignored when `draft: true` |
 
-For content that is already published: Douyin - creator center "Content management → Collections → Edit collection → Add works"; Zhihu - "Settings → Remove from column" under the article on the column page, or "Add content" on the column page;
+For content that is already published: Bilibili - add it under "Collection management" in the creator center, or run `biliup season add <section_id> --vid <BV>` after approval; Douyin - creator center "Content management → Collections → Edit collection → Add works"; Zhihu - "Settings → Remove from column" under the article on the column page, or "Add content" on the column page;
 Xiaohongshu - only in the app (collections are not visible on the web).
 
 ## Safety design
@@ -79,6 +80,8 @@ Xiaohongshu - only in the app (collections are not visible on the web).
 - **Validate before publishing**: `mpub validate` / `mpub publish --dry-run` only run local checks (title length, image count, schedule window, ...) and never touch the network.
 - **No declarations on your behalf**: AI-content declarations, repost declarations and platform rule confirmations are only ticked when you explicitly set them (see the changes to social-auto-upload below).
 - **One subprocess per platform**: if one platform hangs it is killed together with its browser without affecting the others; timeouts and errors leave logs and screenshots.
+- **Every step is logged**: each progress step shown in the terminal (plus debug messages the terminal hides) is written with a timestamp to the run's `<platform>-<action>.log`, so you can still see where it got stuck after closing the terminal, from a scheduled task or a background run; on `unknown_outcome` it helps tell whether the publish request went out.
+  Before writing to disk, the values of login credentials such as `SESSDATA`, `bili_jct`, `z_c0`, `access_token`, `sessionid` and `Cookie:` headers are masked, so sharing a log for troubleshooting does not hand over your account.
 - **Login credentials stay in the local data directory** (default `%LOCALAPPDATA%\multipub`), never in the repository.
 
 ## Why upstream social-auto-upload rather than omnipost
@@ -214,7 +217,7 @@ Default `%LOCALAPPDATA%\multipub` (Linux/macOS: `~/.local/share/multipub`); chan
 ├─ tools\biliup\v1.3.1\     downloaded biliup.exe and its install record (install.json, sha256)
 ├─ tools\biliup\selected.json  the biliup source you chose (written by mpub biliup use)
 ├─ qrcode\                  login QR-code images (<platform>-<account>.png, deleted after login)
-├─ runs\<time>\<platform>\  logs and screenshots of each run (the evidence in results points here)
+├─ runs\<time>\<platform>\  logs (<platform>-<action>.log, every step timestamped, credentials masked) and screenshots of each run (the evidence in results points here)
 ├─ sau\                     logs of the Douyin/Xiaohongshu flows, Douyin SMS code file verify_code.txt
 ├─ locks\                   account locks (one task per account at a time)
 ├─ pending\                 records of posts where publish was pressed but no final result arrived (left when mpub is killed mid-publish; used by the duplicate check)

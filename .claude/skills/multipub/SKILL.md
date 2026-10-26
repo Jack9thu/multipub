@@ -68,8 +68,8 @@ uv run mpub doctor --json
   （常见原因：登录时用了 `--account main`，清单却没写 `account`，默认是 `default`），按提示改清单或去登录。
 - 写清单时：标题、正文里带 `#话题` 要给整个值加引号（`body: "今天去徒步 #徒步"`），`tags` 直接写 `[徒步, 周末]`；
   不加引号的 `#xxx` 会被 YAML 当成注释，validate 会报「会被 YAML 当成注释而丢掉」。Windows 路径用单引号。
-- 合集 / 专栏（合集要用户先手动建好）：抖音 `platforms.douyin.collection: 合集名`、小红书 `platforms.xiaohongshu.collection: 合集名`、
-  知乎 `platforms.zhihu.column: c_…`；B站发完用 `biliup season add <section_id> --vid <BV>` 补加。选不上合集不拦发布，结果 `message` 里会注明，要转告用户。
+- 合集 / 专栏（合集要用户先手动建好）：B站视频 `platforms.bilibili.collection: 合集名`（投稿成功后立即加入，审核中也行）、
+  抖音 `platforms.douyin.collection: 合集名`、小红书 `platforms.xiaohongshu.collection: 合集名`、知乎 `platforms.zhihu.column: c_…`。选不上合集不拦发布，结果 `message` 里会注明，要转告用户。
 - 内容标注（2026-05 起发布时必选）：B站 `creation_statement`、抖音 `declaration`、小红书 `declaration`、知乎 `statement`，
   各平台写法对照见 [references/prepare.md](references/prepare.md) 第 4 步。属于铁律 4，用户确认后才写。
 - 标题、简介、标签、封面怎么写和怎么检查，见 [references/prepare.md](references/prepare.md) 第 2、3、5 步。
@@ -187,7 +187,7 @@ uv run mpub publish posts/<名字> --yes --json
 | 写作规范 | 自己的封面 / 标题 / 简介规范、各题材的形态和风格建议（文档路径） | prepare.md「依据」、第 2–3 步 |
 | 作品目录约定 | 一个作品目录里哪个文件是文案、清单放在哪、成片 / 时间轴 / 封面 / 图卡输出到哪 | prepare.md 第 1 步 |
 | 封面工具 | 用什么画封面（AI 画图 skill、代码画图、设计软件），用什么脚本切各平台尺寸和出检查图，已知会裁字的地方 | prepare.md 第 5 步 |
-| 合集 / 专栏表 | 各系列在四个平台的合集名、B站 section_id、知乎专栏 id；B站发完补加合集的脚本 | prepare.md 第 7 步、第 6 步汇报 |
+| 合集 / 专栏表 | 各系列在四个平台的合集名、知乎专栏 id | prepare.md 第 7 步、第 6 步汇报 |
 | 账号 | 各平台用的账号名（如 `main`）、登录有效期 | 第 3 步 |
 | 署名来源 | 背景音乐、素材放在哪、许可说明在哪 | prepare.md 第 3 步 |
 | 声明习惯 | 常用的内容标注（仍要每次请用户确认，铁律 4） | prepare.md 第 4 步 |

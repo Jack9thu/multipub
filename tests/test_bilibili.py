@@ -1145,6 +1145,12 @@ def nav_payload(login: bool = True) -> dict[str, Any]:
     return {"code": 0 if login else -101, "message": "0", "data": data}
 
 
+def season_item(season_id: int, title: str, *section_ids: int) -> dict[str, Any]:
+    return {"season": {"id": season_id, "title": title},
+            "sections": {"sections": [{"id": s, "title": "正片" if i == 0 else f"第{i + 1}节"}
+                                      for i, s in enumerate(section_ids)]}}
+
+
 class FakeBili:
     """按路径路由的假 B站接口；记录请求，便于断言。"""
 
@@ -1157,6 +1163,12 @@ class FakeBili:
         self.create_response: httpx.Response | None = None
         self.upload_response: httpx.Response | None = None
         self.poll_codes: list[int] = []
+        self.seasons: list[dict[str, Any]] = [season_item(5001, "科技小课堂", 6001),
+                                              season_item(5002, "读书笔记", 6002)]
+        self.archive_views: list[dict[str, Any]] = []  # 依次返回，用完后返回成功
+        self.episode_codes: list[int] = []
+        self.section_aids: dict[int, list[int]] = {}  # 小节 id → 稿件 aid（episodes/add 成功时加入）
+        self.add_takes_effect = True
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -1184,6 +1196,22 @@ class FakeBili:
         if path == "/x/dynamic/feed/create/dyn":
             return self.create_response or httpx.Response(200, json={"code": 0, "data": {
                 "dyn_id": 1, "dyn_id_str": "1234567890123456789", "dyn_type": 2}})
+        if path == "/x2/creative/web/seasons":
+            return httpx.Response(200, json={"code": 0, "data": {"seasons": self.seasons, "total": len(self.seasons)}})
+        if path == "/x/vupre/web/archive/view":
+            if self.archive_views:
+                return httpx.Response(200, json=self.archive_views.pop(0))
+            return httpx.Response(200, json={"code": 0, "data": {
+                "archive": {"aid": 113456789012345, "state": -30}, "videos": [{"cid": 4305787}]}})
+        if path == "/x2/creative/web/season/section/episodes/add":
+            code = self.episode_codes.pop(0) if self.episode_codes else 0
+            if not code and self.add_takes_effect:
+                body = json.loads(request.content)
+                self.section_aids.setdefault(body["sectionId"], []).extend(e["aid"] for e in body["episodes"])
+            return httpx.Response(200, json={"code": code, "message": "0" if not code else "err", "data": None})
+        if path == "/x2/creative/web/season/section":
+            aids = self.section_aids.get(int(request.url.params["id"]), [])
+            return httpx.Response(200, json={"code": 0, "data": {"episodes": [{"aid": a} for a in aids]}})
         if path.endswith("/qrcode/auth_code"):
             n = sum(1 for r in self.requests if r.url.path == path)
             return httpx.Response(200, json={"code": 0, "data": {
@@ -1971,3 +1999,89 @@ console.log(JSON.stringify(out));
     assert out[5] == {"ok": False, "reason": "timing-hidden"}
     assert out[6] == {"ok": True, "aigc": False}  # 没有 AI 声明选项时不勾选
     assert out[7] == {"ok": False, "reason": "no-root"}
+
+
+# ------------------------------------------------------------------ 视频：投稿后加入合集
+
+def test_validate_video_collection(media: Path):
+    ok = video_post(media, options={"tid": 231, "collection": "科技小课堂"})
+    assert not errors_of(BilibiliAdapter.validate(ok)) and not warnings_of(BilibiliAdapter.validate(ok))
+    for bad in ("  ", 123, True):
+        issues = BilibiliAdapter.validate(video_post(media, options={"tid": 231, "collection": bad}))
+        assert "platforms.bilibili.collection" in errors_of(issues)
+    # 图文（动态）没有合集：按未知参数告警
+    assert "platforms.bilibili.collection" in warnings_of(
+        BilibiliAdapter.validate(note_post(media, options={"collection": "科技小课堂"})))
+
+
+async def test_publish_video_joins_collection(video_env, media: Path, monkeypatch, fake_bili):
+    """上传前按名称查合集；投稿成功后（审核中）用创作中心接口取 cid，立即加入小节。"""
+    calls: list[Any] = []
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, calls))
+    ctx, events = make_ctx(video_env)
+    fake_bili.ctx = ctx
+    post = video_post(media, options={"tid": 231, "collection": " 科技小课堂 "})
+    result = await BilibiliAdapter(ctx).publish(post)
+    assert result.status is Status.SUBMITTED and result.message.endswith("；已加入合集「科技小课堂」")
+    assert not any("season" in a for a in calls[0])  # 不在投稿参数里带 season_id
+    assert fake_bili.marks["/x2/creative/web/seasons"] is False  # 上传前查
+    view = fake_bili.by_path("/x/vupre/web/archive/view")[0]
+    assert view.url.params["aid"] == "113456789012345" and fake_bili.marks["/x/vupre/web/archive/view"]
+    add = fake_bili.by_path("/x2/creative/web/season/section/episodes/add")[0]
+    assert add.url.params["csrf"] == "csrf123" and "SESSDATA=sess%2Cabc" in add.headers["cookie"]
+    assert json.loads(add.content) == {"sectionId": 6001, "csrf": "csrf123", "episodes": [
+        {"aid": 113456789012345, "cid": 4305787, "title": "第12期：测试视频"}]}
+    assert any(e.get("message") == "已加入合集「科技小课堂」" for e in events)
+    check = fake_bili.by_path("/x2/creative/web/season/section")[-1]
+    assert check.url.params["id"] == "6001"
+
+
+async def test_publish_video_collection_add_ok_but_missing(video_env, media: Path, monkeypatch, fake_bili):
+    """接口返回 OK 但小节列表里没有：以列表为准，报加入失败。"""
+    from multipub.platforms import bili_season
+
+    monkeypatch.setattr(bili_season, "RETRY_DELAY", 0)
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, []))
+    fake_bili.add_takes_effect = False
+    ctx, _ = make_ctx(video_env)
+    result = await BilibiliAdapter(ctx).publish(video_post(media, options={"tid": 231, "collection": "科技小课堂"}))
+    assert result.status is Status.SUBMITTED
+    assert "加入合集「科技小课堂」失败（接口返回成功，但合集的稿件列表里还没有这条稿件）" in result.message
+    assert len(fake_bili.by_path("/x2/creative/web/season/section")) == bili_season.RETRY_TIMES
+
+
+async def test_publish_video_collection_retries_until_archive_visible(video_env, media: Path, monkeypatch,
+                                                                      fake_bili):
+    from multipub.platforms import bili_season
+
+    monkeypatch.setattr(bili_season, "RETRY_DELAY", 0)
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, []))
+    fake_bili.archive_views = [{"code": -404, "message": "啥都木有"}, {"code": 0, "data": {"archive": {}, "videos": []}}]
+    fake_bili.episode_codes = [20111]  # 太频繁：重试
+    ctx, _ = make_ctx(video_env)
+    result = await BilibiliAdapter(ctx).publish(video_post(media, options={"tid": 231, "collection": "科技小课堂"}))
+    assert result.message.endswith("已加入合集「科技小课堂」")
+    assert len(fake_bili.by_path("/x/vupre/web/archive/view")) == 3
+    assert len(fake_bili.by_path("/x2/creative/web/season/section/episodes/add")) == 2
+
+
+async def test_publish_video_collection_not_found_still_publishes(video_env, media: Path, monkeypatch, fake_bili):
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, []))
+    ctx, events = make_ctx(video_env)
+    result = await BilibiliAdapter(ctx).publish(video_post(media, options={"tid": 231, "collection": "科技"}))
+    assert result.status is Status.SUBMITTED and "合集" not in result.message
+    assert any("没有找到合集「科技」" in e.get("message", "") and "科技小课堂、读书笔记" in e["message"] for e in events)
+    assert not fake_bili.by_path("/x2/creative/web/season/section/episodes/add")
+
+
+async def test_publish_video_collection_join_failure_keeps_result(video_env, media: Path, monkeypatch, fake_bili):
+    """稿件已投出：加入合集失败只在消息里提示补加办法，结果仍是投稿成功。"""
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, []))
+    fake_bili.episode_codes = [20092]
+    fake_bili.seasons = [season_item(1, "科技小课堂", 11, 12)]
+    ctx, events = make_ctx(video_env)
+    result = await BilibiliAdapter(ctx).publish(video_post(media, options={"tid": 231, "collection": "科技小课堂"}))
+    assert result.status is Status.SUBMITTED and result.url.endswith("BV1Ab4y1C7xY")
+    assert "加入合集「科技小课堂」失败" in result.message
+    assert "biliup season add 11 --vid BV1Ab4y1C7xY" in result.message
+    assert any("2 个小节，加入第一个「正片」" in e.get("message", "") for e in events)

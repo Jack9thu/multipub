@@ -135,6 +135,35 @@ def test_worker_failure_modes(home: Path, media: Path, mode, status, code, retry
     assert (r.status.value, r.error_code, r.retryable, r.submit_started) == (status, code, retryable, submit)
 
 
+def test_worker_steps_saved_to_run_log_redacted(home: Path, media: Path):
+    """ctx.log 的每一步存进运行目录的 <平台>-<动作>.log，且 token 已遮掉；终端事件里的原文不受影响。"""
+    settings = load_settings()
+    # fake 平台会 log「fake publish mode=<options.fake>」，未知的 mode 按 ok 处理
+    post = PlatformPost(platform="fake", account="a", kind=Kind.VIDEO, title="t",
+                        video=media / "video.mp4", options={"fake": "ok SESSDATA=abc123,x"})
+    events = []
+    r = run_worker(settings, action="publish", platform="fake", account="a", headless=True,
+                   run_dir=settings.runs_dir / "t", post=post, timeout=60, on_event=events.append)
+    log_file = settings.runs_dir / "t" / "fake-publish.log"
+    assert r.status is Status.PUBLISHED and str(log_file) in r.evidence
+    text = log_file.read_text(encoding="utf-8")
+    assert "INFO: fake publish mode=ok SESSDATA=***,x" in text and "abc123" not in text
+    assert any("SESSDATA=abc123" in e.get("message", "") for e in events)
+
+
+def test_redact():
+    from multipub.redact import redact
+
+    assert redact("SESSDATA=abc; bili_jct=def") == "SESSDATA=***; bili_jct=***"
+    assert redact('{"z_c0": "2|1:0|xx", "access_token": "tok"}') == '{"z_c0": "***", "access_token": "***"}'
+    assert redact("https://x/?access_key=k1&ts=1") == "https://x/?access_key=***&ts=1"
+    assert redact("Cookie: a=1; sessionid=2") == "Cookie: ***"
+    assert redact("passport_csrf_token=p sessionid_ss=s") == "passport_csrf_token=*** sessionid_ss=***"
+    # 中文说明里提到字段名、但没有值的，原样保留
+    for text in ("登录文件里没有 _xsrf cookie（发布时会被拒）", "读取 cookie 失败（KeyError）", "mysessdata=1"):
+        assert redact(text) == text
+
+
 def test_worker_hang_is_killed(home: Path, media: Path):
     settings = load_settings()
     post = PlatformPost(platform="fake", account="a", kind=Kind.VIDEO, title="t",

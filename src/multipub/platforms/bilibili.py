@@ -54,7 +54,7 @@ NOTE_MODES = ("browser", "http")
 
 VIDEO_OPTIONS = frozenset({"tid", "tid_v2", "copyright", "source", "dynamic", "no_reprint", "is_only_self",
                            "selection_reply", "close_reply", "close_danmu", "creation_statement",
-                           "extra_fields", "line", "limit", "submit"})
+                           "extra_fields", "line", "limit", "submit", "collection"})
 NOTE_OPTIONS = frozenset({"mode", "pic_mode", "tags_in_text", "confirm_rules"})
 # config.toml [platforms.bilibili] 里的同意项：允许 multipub 代为确认《动态发布规范》
 CONFIRM_RULES_CONFIG = "confirm_dynamic_rules"
@@ -66,6 +66,8 @@ QR_MAX_REFRESH = 3
 VIDEO_TIMEOUT_MARGIN = 30
 VIDEO_MIN_BUDGET = 60
 TOKEN_PRECHECK_TIMEOUT = 10  # 上传前的令牌预检（每个网络阶段；整体最多两倍）
+COLLECTION_LOOKUP_TIMEOUT = 20  # 上传前按名称查合集
+COLLECTION_JOIN_MAX = 60  # 投稿后加入合集最多用这么久（还受本次任务剩余时间限制）
 
 
 def _login_hint(account: str) -> str:
@@ -122,7 +124,7 @@ class _ProgressLog:
                 self.on_uploaded()
                 self.on_uploaded = None
         if any(m in line for m in self.IMPORTANT) and now - self.last >= self.min_interval:
-            self.ctx.log(f"biliup: {line[-200:]}")
+            self.ctx.log(f"biliup: {line[-200:]}", to_stderr=False)  # 上面已经原样写过 stderr
             self.last = now
 
 
@@ -202,6 +204,11 @@ class BilibiliAdapter(PlatformAdapter):
                  f"ai_generated 为 true，但创作声明设成了 {statement}（不是 1=AI），不会声明 AI 生成")
         if o.get("extra_fields") is not None and not isinstance(o.get("extra_fields"), dict):
             err("platforms.bilibili.extra_fields", "必须是映射（会作为 JSON 合并进投稿参数）")
+        collection = o.get("collection")
+        if collection is not None and not isinstance(collection, str):
+            err("platforms.bilibili.collection", f"应为合集名称（字符串），收到 {collection!r}")
+        elif isinstance(collection, str) and not collection.strip():
+            err("platforms.bilibili.collection", "合集名不能为空；不加入合集就删掉这一项")
 
         from .bili_biliup import APP_ONLY_FLAGS, LINE_CHOICES, SUBMIT_CHOICES, VIDEO_FLAGS
 
@@ -467,6 +474,7 @@ class BilibiliAdapter(PlatformAdapter):
             raise
         except (PublishError, asyncio.TimeoutError) as exc:  # 网络 / 风控：交给 biliup 自己校验
             self.ctx.log(f"预先校验登录令牌失败（{str(exc) or '超时'}），交给 biliup 处理", level="warning")
+        section = await self._lookup_collection(post, cred)
         rust_log = await asyncio.to_thread(bili_locate.supports_rust_log, exe)
         args = bili_biliup.build_upload_args(exe, self.account_file, post, rust_log=rust_log)
         missing = await asyncio.to_thread(bili_locate.unsupported_flags, exe, args)
@@ -496,7 +504,60 @@ class BilibiliAdapter(PlatformAdapter):
         outcome = bili_biliup.parse_upload_output(lines, rc, echo=echo)
         if outcome.uploaded or outcome.submitted or outcome.response_code is not None or rc == 0:
             self.ctx.mark_submit_started()  # 兜底：只有「确定没传完就失败了」才保持未投稿
-        return self._video_result(post, outcome, timeout)
+        result = self._video_result(post, outcome, timeout)
+        if section is not None and outcome.submitted:
+            result.message += await self._join_collection(post, section, outcome)
+        return result
+
+    async def _lookup_collection(self, post: PlatformPost, cred: Any) -> Any:
+        """上传前按名称查合集（只读）。找不到 / 查询失败只告警，照常投稿，不加入合集。"""
+        from . import bili_season
+
+        name = str(post.options.get("collection") or "").strip()
+        if not name:
+            return None
+        try:
+            async with bili_season.make_client(cred.cookie_dict) as client:
+                items = await asyncio.wait_for(bili_season.list_seasons(client, account=self.ctx.account),
+                                               COLLECTION_LOOKUP_TIMEOUT)
+        except LoginRequired:
+            raise
+        except (PublishError, asyncio.TimeoutError) as exc:
+            self.ctx.log(f"读取合集列表失败（{str(exc) or '超时'}），照常投稿，不加入合集「{name}」", level="warning")
+            return None
+        section = bili_season.find_section(items, name)
+        if section is None:
+            titles = "、".join(t for t in bili_season.season_titles(items) if t) or "（没有合集）"
+            self.ctx.log(f"没有找到合集「{name}」，照常投稿，不加入合集；现有合集：{titles}", level="warning")
+            return None
+        note = f"（合集有 {section.sections} 个小节，加入第一个「{section.section_title}」）" if section.sections > 1 else ""
+        self.ctx.log(f"投稿成功后加入合集「{section.season_title}」{note}")
+        return section
+
+    async def _join_collection(self, post: PlatformPost, section: Any, outcome: Any) -> str:
+        """投稿成功后立即加入合集（审核中也可以）。返回追加到结果消息里的一句话；失败不影响投稿结果。"""
+        from . import bili_season
+
+        if not (outcome.aid or outcome.bvid):
+            return f"；没解析到稿件号，没有加入合集「{section.season_title}」，可到创作中心「合集管理」手动添加"
+        manual = (f"可到创作中心「合集管理」手动添加，或过审后运行 "
+                  f"biliup season add {section.section_id} --vid {outcome.bvid or outcome.aid}")
+        budget = min(COLLECTION_JOIN_MAX, self._video_timeout() + VIDEO_TIMEOUT_MARGIN - 10)
+        if budget < 5:
+            self.ctx.log("剩余时间不够，没有加入合集", level="warning")
+            return f"；剩余时间不够，没有加入合集「{section.season_title}」，{manual}"
+        try:
+            cred = self._load_cred(require_token=False)  # biliup 上传时可能刷新过 cookie，重新读
+            async with bili_season.make_client(cred.cookie_dict) as client:
+                await asyncio.wait_for(
+                    bili_season.join(client, section, aid=outcome.aid, bvid=outcome.bvid, title=post.title.strip(),
+                                     csrf=cred.csrf, account=self.ctx.account, log=self.ctx.log), budget)
+        except Exception as exc:  # noqa: BLE001 - 稿件已经投出去了，加入合集失败只提示
+            reason = str(exc) or type(exc).__name__
+            self.ctx.log(f"加入合集「{section.season_title}」失败：{reason}", level="warning")
+            return f"；加入合集「{section.season_title}」失败（{reason}），{manual}"
+        self.ctx.log(f"已加入合集「{section.season_title}」")
+        return f"；已加入合集「{section.season_title}」"
 
     async def _preflight_biliup(self, exe: Path) -> Any:
         """标记投稿之前先试运行 `biliup --version`（纯本地）：缺 VC++ 运行库这类起不来的情况在这里报，
