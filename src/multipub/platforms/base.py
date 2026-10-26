@@ -17,6 +17,7 @@ import json
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, ClassVar
 
@@ -52,7 +53,12 @@ class JobContext:
     def event(self, name: str, **data: Any) -> None:
         self.emit({"event": name, "platform": self.platform, "account": self.account, **data})
 
-    def log(self, message: str, level: str = "info") -> None:
+    def log(self, message: str, level: str = "info", *, to_stderr: bool = True) -> None:
+        """进度消息：发给主进程显示，同时写一行到 stderr，存进运行目录的 <平台>-<动作>.log
+        （终端不显示的 debug 也会存下来）。这一行已经写过 stderr 的（loguru、biliup 转发）传 to_stderr=False。"""
+        if to_stderr:
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"{stamp} | {level.upper()}: {message}", file=sys.stderr, flush=True)
         self.event("log", level=level, message=message)
 
     def qrcode(self, path: Path | str, note: str = "") -> None:

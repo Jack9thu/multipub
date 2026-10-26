@@ -79,6 +79,8 @@ Xiaohongshu - only in the app (collections are not visible on the web).
 - **Validate before publishing**: `mpub validate` / `mpub publish --dry-run` only run local checks (title length, image count, schedule window, ...) and never touch the network.
 - **No declarations on your behalf**: AI-content declarations, repost declarations and platform rule confirmations are only ticked when you explicitly set them (see the changes to social-auto-upload below).
 - **One subprocess per platform**: if one platform hangs it is killed together with its browser without affecting the others; timeouts and errors leave logs and screenshots.
+- **Every step is logged**: each progress step shown in the terminal (plus debug messages the terminal hides) is written with a timestamp to the run's `<platform>-<action>.log`, so you can still see where it got stuck after closing the terminal, from a scheduled task or a background run; on `unknown_outcome` it helps tell whether the publish request went out.
+  Before writing to disk, the values of login credentials such as `SESSDATA`, `bili_jct`, `z_c0`, `access_token`, `sessionid` and `Cookie:` headers are masked, so sharing a log for troubleshooting does not hand over your account.
 - **Login credentials stay in the local data directory** (default `%LOCALAPPDATA%\multipub`), never in the repository.
 
 ## Why upstream social-auto-upload rather than omnipost
@@ -214,7 +216,7 @@ Default `%LOCALAPPDATA%\multipub` (Linux/macOS: `~/.local/share/multipub`); chan
 ├─ tools\biliup\v1.3.1\     downloaded biliup.exe and its install record (install.json, sha256)
 ├─ tools\biliup\selected.json  the biliup source you chose (written by mpub biliup use)
 ├─ qrcode\                  login QR-code images (<platform>-<account>.png, deleted after login)
-├─ runs\<time>\<platform>\  logs and screenshots of each run (the evidence in results points here)
+├─ runs\<time>\<platform>\  logs (<platform>-<action>.log, every step timestamped, credentials masked) and screenshots of each run (the evidence in results points here)
 ├─ sau\                     logs of the Douyin/Xiaohongshu flows, Douyin SMS code file verify_code.txt
 ├─ locks\                   account locks (one task per account at a time)
 ├─ pending\                 records of posts where publish was pressed but no final result arrived (left when mpub is killed mid-publish; used by the duplicate check)

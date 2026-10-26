@@ -83,6 +83,9 @@ platforms:
 - **先校验再发布**：`mpub validate` / `mpub publish --dry-run` 只做本地检查（标题长度、图片数量、定时窗口……），不联网。
 - **不替你做声明**：AI 声明、转载声明、平台规范确认都只有你明确写了才会勾选（见下文对 social-auto-upload 的修改）。
 - **每个平台一个子进程**：某个平台卡死时连同浏览器一起结束，不影响其他平台；超时、出错都会留下日志和截图。
+- **每一步都存进日志**：终端上显示的每一步进度（含终端不显示的调试信息）都带时间写进本次运行的 `<平台>-<动作>.log`，
+  关掉终端、定时任务、后台运行之后也能查到卡在哪一步；遇到 `unknown_outcome` 时可以看它判断发布请求有没有发出去。
+  日志存盘前会遮掉 `SESSDATA`、`bili_jct`、`z_c0`、`access_token`、`sessionid`、`Cookie:` 头等登录凭据的值，发给别人帮忙排查时不会交出账号。
 - **登录凭据只放在本机数据目录**（默认 `%LOCALAPPDATA%\multipub`），不在仓库里。
 
 ## 为什么基于上游 social-auto-upload，而不是 omnipost
@@ -218,7 +221,7 @@ multipub 的知乎（接口发布）和 B站（biliup 投稿 + 动态）是自�
 ├─ tools\biliup\v1.3.1\     下载的 biliup.exe 及其安装记录（install.json、sha256）
 ├─ tools\biliup\selected.json  你选择的 biliup 来源（mpub biliup use 写入）
 ├─ qrcode\                  登录二维码图片（<平台>-<账号>.png，登录结束后删除）
-├─ runs\<时间>\<平台>\       每次运行的日志和截图（结果里的 evidence 指向这里）
+├─ runs\<时间>\<平台>\       每次运行的日志（<平台>-<动作>.log，每一步带时间、已脱敏）和截图（结果里的 evidence 指向这里）
 ├─ sau\                     抖音/小红书流程的日志、抖音短信验证码文件 verify_code.txt
 ├─ locks\                   账号锁（同一账号同一时间只跑一个任务）
 ├─ pending\                 已点发布、还没有最终结果的记录（发布途中 mpub 被结束时留下，用于查重）

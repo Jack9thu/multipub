@@ -9,7 +9,8 @@ job.json:
      "headless": true, "run_dir": "...", "timeout": 900, "post": {...PlatformPost...}}
 
 stdout：一行一个 JSON 事件（log / qrcode / needs_input / submit_started / result），
-最后一行一定是 {"event": "result", ...}。stderr：平台日志（loguru 等）。
+最后一行一定是 {"event": "result", ...}。stderr：平台日志（loguru、ctx.log 的每一步、biliup 输出），
+已脱敏，由 runner 存成运行目录里的 <平台>-<动作>.log。
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from .models import (ErrorCode, PlatformPost, PublishError, Result, Status,
                      now_iso)
 from .platforms import load_adapter
 from .platforms.base import JobContext, stdout_emit
+from .redact import RedactingStream
 
 
 def _failure(ctx: JobContext, status: Status, code: str, message: str,
@@ -128,6 +130,9 @@ def main() -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         except (AttributeError, ValueError):
             pass
+    # stderr 会存进运行目录的日志文件，写入前遮掉 cookie / token（见 multipub.redact）。
+    # 要在 loguru 安装 stderr sink（conf.configure）之前换掉
+    sys.stderr = RedactingStream(sys.stderr)  # type: ignore[assignment]
     # Windows 上 asyncio 默认就是 Proactor 事件循环，patchright 启动浏览器子进程依赖它
     if sys.platform == "win32":
         # 子进程（浏览器、biliup）缺 DLL 或崩溃时不弹系统对话框，直接返回错误码

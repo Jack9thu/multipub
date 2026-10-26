@@ -122,7 +122,7 @@ class _ProgressLog:
                 self.on_uploaded()
                 self.on_uploaded = None
         if any(m in line for m in self.IMPORTANT) and now - self.last >= self.min_interval:
-            self.ctx.log(f"biliup: {line[-200:]}")
+            self.ctx.log(f"biliup: {line[-200:]}", to_stderr=False)  # 上面已经原样写过 stderr
             self.last = now
 
 
