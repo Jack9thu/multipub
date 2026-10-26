@@ -123,6 +123,7 @@ platforms:
 | `no_reprint` | `false` | 禁止转载 |
 | `is_only_self` | `false` | 仅自己可见 |
 | `selection_reply` / `close_reply` / `close_danmu` | `false` | 精选评论 / 关闭评论 / 关闭弹幕 |
+| `collection` | 无 | 投稿成功后立即加入已有合集（名称精确匹配；审核中就能加入；找不到或加不进只告警，照常投稿） |
 | `extra_fields` | 无 | 映射，原样合并进投稿参数（高级用法） |
 | `line` | 自动 | 上传线路：`bldsa cnbldsa andsa atdsa bda2 cnbd anbd atbd tx cntx antx attx txa alia estx akbd` |
 | `limit` | 3 | 单文件并发分片数（1–64） |

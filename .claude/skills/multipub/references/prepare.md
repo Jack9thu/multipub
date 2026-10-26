@@ -92,8 +92,9 @@ uv run python .claude/skills/multipub/scripts/content_check.py <清单目录> --
 
 ## 7. 合集
 
-作品属于某个系列时写上（合集要用户先手动建好）：抖音、小红书 `collection: 合集名`，知乎 `column: c_…`，B站发完用 `biliup season add <section_id> --vid <BV>` 补加。
-不要擅自新建合集。**本机适配**：把你的合集名、section_id、专栏 id 整理成一张表放进全局 skill。
+作品属于某个系列时写上（合集要用户先手动建好）：B站（视频）、抖音、小红书 `collection: 合集名`，知乎 `column: c_…`。
+B站投稿成功后立即加入合集，审核中也行；找不到合集或加不进只在结果 `message` 里注明，照常发布。
+不要擅自新建合集。**本机适配**：把你的合集名、专栏 id 整理成一张表放进全局 skill。
 
 ## 8. 校验、dry-run、确认卡片（到这里停）
 
