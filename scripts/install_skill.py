@@ -176,8 +176,9 @@ class Installer:
             else:
                 kept.append(rel)
                 record[rel] = installed[rel]
-        own = [r for r in _files(self.dest, skip_local=True) if r not in record and r not in removed] \
-            if self.dest.is_dir() else []
+        # 仓库里有的文件（包括这次因冲突没覆盖的）都不算本机自己加的
+        not_own = set(record) | set(removed) | set(repo_files)
+        own = [r for r in _files(self.dest, skip_local=True) if r not in not_own] if self.dest.is_dir() else []
 
         if not check:
             manifest_path.parent.mkdir(parents=True, exist_ok=True)

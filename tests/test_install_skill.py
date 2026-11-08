@@ -104,8 +104,11 @@ def test_hand_edits_and_clashes_are_not_overwritten(tmp_path: Path, capsys):
     (other / "references").mkdir(parents=True)
     (other / "references" / "prepare.md").write_text("以前手动复制、改过的", encoding="utf-8")
     capsys.readouterr()
-    assert run(other) == 1
-    assert "不是本脚本装的" in capsys.readouterr().out
+    for args in (("--check",), ()):
+        assert run(other, *args) == 1
+        out = capsys.readouterr().out
+        assert "references/prepare.md（目标目录里已有同名文件（不是本脚本装的））" in out
+        assert "本机自己加的文件" not in out  # 冲突的仓库文件不能同时算成本机文件
     assert (other / "SKILL.md").is_file()  # 其他文件照常装上
 
 
