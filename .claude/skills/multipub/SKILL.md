@@ -203,11 +203,26 @@ uv run mpub publish posts/<名字> --yes --json
 Copy-Item -Recurse .claude\skills\multipub "$env:USERPROFILE\.claude\skills\multipub"
 ```
 
-然后在复制出来的 SKILL.md 里，把所有 `uv run mpub` 换成带仓库路径的写法（`--project` 只指定环境，不改变当前目录，
-所以 post.yaml 的相对路径仍按当前目录解析），例如仓库在 `C:\Users\me\multipub`：
+本 skill 里的命令都默认当前目录是仓库根目录；全局使用时当前目录是你的作品目录，所以要在复制出来的那一份里
+（SKILL.md 和 `references/` 下的 .md，不只是 SKILL.md）把两种命令换成带仓库路径的写法。下面假设仓库在 `C:\Users\me\multipub`：
 
-```bash
-uv run --project "C:\Users\me\multipub" mpub check --json
-```
+1. **`uv run mpub`** → `uv run --project "C:\Users\me\multipub" mpub`，例如：
 
-仓库更新后记得重新复制。
+   ```bash
+   uv run --project "C:\Users\me\multipub" mpub check --json
+   ```
+
+2. **`uv run python <脚本>`**，其中脚本写的是 `.claude/skills/multipub/scripts/` 下的相对路径（正文渲染检查 `content_check.py`，
+   出现在 SKILL.md、`references/content-check.md`、`references/prepare.md`）→ 脚本也写成绝对路径，例如用复制出来的那份：
+
+   ```bash
+   uv run --project "C:\Users\me\multipub" python "C:\Users\me\.claude\skills\multipub\scripts\content_check.py" <post.yaml 或其目录> --topics
+   ```
+
+   只换第 1 种不够：`.claude/skills/multipub/scripts/` 是相对仓库根目录的路径，在作品目录里会报找不到文件。
+   脚本要用 multipub 的环境（它调用 multipub 的知乎解析器），所以同样要带 `--project`。
+
+`--project` 只指定用哪个项目的环境，不改变当前目录，所以 post.yaml 和清单里的相对路径仍按当前目录（作品目录）解析。
+换完可以搜一下复制出来的目录里还有没有 `uv run mpub`、`uv run python .claude` 没换到。
+
+仓库更新（`git pull`）后要重新复制、重新替换；自己补的本机内容按上一节「本机适配」补回去。
