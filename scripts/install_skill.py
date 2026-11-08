@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -34,7 +35,7 @@ from typing import Callable, Union
 
 Repl = Union[str, Callable[[re.Match[str]], str]]
 
-REPO =Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent
 SKILL_REL = Path(".claude/skills/multipub")
 DEFAULT_DEST = Path.home() / ".claude" / "skills" / "multipub"
 MANIFEST = "local/.installed.json"
@@ -209,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--check", action="store_true", help="只列出会改哪些文件，不写")
     ap.add_argument("--force", action="store_true", help="覆盖装过之后被改过的文件、和同名的已有文件")
     a = ap.parse_args(argv)
-    return Installer(REPO, a.dest.expanduser().resolve()).run(check=a.check, force=a.force)
+    return Installer(REPO, Path(os.path.abspath(a.dest.expanduser()))).run(check=a.check, force=a.force)
 
 
 if __name__ == "__main__":
