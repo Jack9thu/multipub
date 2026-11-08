@@ -8,14 +8,10 @@ It ships with a [Claude Code skill](#using-it-with-claude-code) so Claude can pr
 
 > **First time? Read the [Windows tutorial](docs/tutorial-windows.md)** (Chinese): installation, login, first post, scheduled posts and FAQ, step by step.
 
-> [!WARNING]
-> **Most features are covered by offline tests only and have not been verified one by one on real accounts. Test with a throwaway account first.**
-> Platform pages and APIs change at any time; each platform document ends with a list of what has not been verified on a real account, with confidence levels.
-
 > [!NOTE]
-> **Real-account test (2026-10-25)**: basic publishing succeeded on all four platforms (one Bilibili video, one Douyin video, one Xiaohongshu image note and one Zhihu column article, each with a content label).
-> Douyin `collection`, Xiaohongshu `collection` and Zhihu `column` (adding to a collection / column while publishing) were also used in real publishes the same day: the Douyin and Xiaohongshu logs show the collection was selected, and the Zhihu column API confirmed the article was added.
-> Bilibili `collection` (tested 2026-10-26): about 3 seconds after the submission succeeded the video was added to the collection while still under review; it already appeared in the collection's video list (marked as pending review), with no need to wait for approval.
+> **Working on real accounts**: basic publishing on all four platforms (2026-10-25: a Bilibili video, a Douyin video, a Xiaohongshu image note and a Zhihu column article, each with a content label),
+> and adding to a collection / column while publishing (Douyin and Xiaohongshu `collection`, Zhihu `column`; Bilibili `collection` tested 2026-10-26, works while the video is still under review).
+> Everything else is covered by offline tests; each platform document ends with what has not yet been checked on a real account, with confidence levels. Platform pages and APIs can change at any time, so for your first run, try one post on a spare account.
 
 ## Platforms and content types
 
