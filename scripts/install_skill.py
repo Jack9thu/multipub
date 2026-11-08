@@ -210,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--check", action="store_true", help="只列出会改哪些文件，不写")
     ap.add_argument("--force", action="store_true", help="覆盖装过之后被改过的文件、和同名的已有文件")
     a = ap.parse_args(argv)
+    # 目标路径只做字面上的规范化，不解析链接：~/.claude 常是指向别处的链接，命令里应该写用户平时用的那条路径
     return Installer(REPO, Path(os.path.abspath(a.dest.expanduser()))).run(check=a.check, force=a.force)
 
 

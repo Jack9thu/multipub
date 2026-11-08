@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -131,6 +132,27 @@ def test_paths_with_spaces_are_quoted(tmp_path: Path):
     assert run(dest) == 0
     skill = (dest / "SKILL.md").read_text(encoding="utf-8")
     assert f'python "{(dest / "scripts").as_posix()}/content_check.py"' in skill
+
+
+def test_dest_path_is_not_resolved_through_links(tmp_path: Path):
+    """~/.claude 常是链接：命令里写用户给的路径（只去掉 ..），不写链接指向的真实位置。"""
+    assert run(tmp_path / "a" / ".." / "b") == 0
+    assert f'python {(tmp_path / "b" / "scripts").as_posix()}/' in (tmp_path / "b" / "SKILL.md").read_text(encoding="utf-8")
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except OSError:
+        if sys.platform != "win32":
+            pytest.skip("这台机器不允许创建符号链接")
+        import _winapi  # Windows 上建符号链接要管理员权限，改用目录链接（Junction），不需要权限
+
+        _winapi.CreateJunction(str(real), str(link))
+    assert run(link / "multipub") == 0
+    skill = (real / "multipub" / "SKILL.md").read_text(encoding="utf-8")
+    assert f'python {(link / "multipub" / "scripts").as_posix()}/' in skill
+    assert (real / "multipub" / "scripts").as_posix() not in skill
 
 
 def test_bad_replacements_file(tmp_path: Path):
