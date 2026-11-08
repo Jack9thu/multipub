@@ -255,7 +255,8 @@ checks how Zhihu articles render as Markdown (e.g. bold that breaks when Chinese
 and stops at the confirmation summary without publishing (see [prepare.md](.claude/skills/multipub/references/prepare.md) and [content-check.md](.claude/skills/multipub/references/content-check.md), in Chinese).
 
 To use it from any directory, copy `.claude\skills\multipub` to `%USERPROFILE%\.claude\skills\multipub`
-and change the commands in SKILL.md to include the repository path (see "全局安装" at the end of SKILL.md).
+and, in that copy (SKILL.md and the docs under `references/`), change both `uv run mpub` and the script commands `uv run python .claude/skills/multipub/scripts/...`
+to include the repository path; changing only the former leaves the pre-publish render check unable to find its script (see "全局安装" at the end of SKILL.md).
 Your own style guides, work-directory conventions, cover tools, collection tables and so on can be added to that global copy; see "本机适配" in SKILL.md for what fits where.
 
 ## Development

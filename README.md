@@ -260,7 +260,8 @@ patchright 的 Chromium 装在它自己的目录（Windows：`%LOCALAPPDATA%\ms-
 做到确认卡片为止，不发布（见 [prepare.md](.claude/skills/multipub/references/prepare.md)、[content-check.md](.claude/skills/multipub/references/content-check.md)）。
 
 想在任何目录都能用，把 `.claude\skills\multipub` 复制到 `%USERPROFILE%\.claude\skills\multipub`，
-并在 SKILL.md 里把命令改成带仓库路径的形式（见 SKILL.md 末尾「全局安装」）。
+并在复制出来的那一份里（SKILL.md 和 `references/` 下的文档）把 `uv run mpub` 和脚本命令 `uv run python .claude/skills/multipub/scripts/...`
+都改成带仓库路径的形式，只改前者的话正文渲染检查会找不到脚本（见 SKILL.md 末尾「全局安装」）。
 自己的写作规范、作品目录约定、封面工具、合集表等可以补进全局那一份，哪些适合补、补在哪，见 SKILL.md「本机适配」。
 
 ## 开发
