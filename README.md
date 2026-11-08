@@ -259,10 +259,11 @@ patchright 的 Chromium 装在它自己的目录（Windows：`%LOCALAPPDATA%\ms-
 检查知乎文章的 Markdown 渲染（如中文标点紧贴 `**` 导致加粗失效）、小红书等纯文本正文里残留的 Markdown 符号、知乎话题有没有同名的，
 做到确认卡片为止，不发布（见 [prepare.md](.claude/skills/multipub/references/prepare.md)、[content-check.md](.claude/skills/multipub/references/content-check.md)）。
 
-想在任何目录都能用，把 `.claude\skills\multipub` 复制到 `%USERPROFILE%\.claude\skills\multipub`，
-并在复制出来的那一份里（SKILL.md 和 `references/` 下的文档）把 `uv run mpub` 和脚本命令 `uv run python .claude/skills/multipub/scripts/...`
-都改成带仓库路径的形式，只改前者的话正文渲染检查会找不到脚本（见 SKILL.md 末尾「全局安装」）。
-自己的写作规范、作品目录约定、封面工具、合集表等可以补进全局那一份，哪些适合补、补在哪，见 SKILL.md「本机适配」。
+想在任何目录都能用，在仓库根目录运行 `uv run python scripts/install_skill.py`（先加 `--check` 看会装什么）：
+它把 skill 装到 `%USERPROFILE%\.claude\skills\multipub`，并把 `uv run mpub` 和脚本命令 `uv run python .claude/skills/multipub/scripts/...`
+这类依赖仓库根目录的命令换成带仓库路径的写法。仓库更新（`git pull`）后重新运行一次即可。
+自己的写作规范、作品目录约定、封面工具、合集表等可以补进全局那一份，放在哪里重新安装时才不会丢，见 SKILL.md「本机适配」；
+不用脚本的手动做法见 SKILL.md「全局安装」。
 
 ## 开发
 
