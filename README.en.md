@@ -254,10 +254,11 @@ You can also ask for **pre-publish preparation** only, e.g. "do the pre-publish 
 checks how Zhihu articles render as Markdown (e.g. bold that breaks when Chinese punctuation touches `**`), leftover Markdown symbols in plain-text bodies (Xiaohongshu etc.) and whether Zhihu topics have exact matches,
 and stops at the confirmation summary without publishing (see [prepare.md](.claude/skills/multipub/references/prepare.md) and [content-check.md](.claude/skills/multipub/references/content-check.md), in Chinese).
 
-To use it from any directory, copy `.claude\skills\multipub` to `%USERPROFILE%\.claude\skills\multipub`
-and, in that copy (SKILL.md and the docs under `references/`), change both `uv run mpub` and the script commands `uv run python .claude/skills/multipub/scripts/...`
-to include the repository path; changing only the former leaves the pre-publish render check unable to find its script (see "全局安装" at the end of SKILL.md).
-Your own style guides, work-directory conventions, cover tools, collection tables and so on can be added to that global copy; see "本机适配" in SKILL.md for what fits where.
+To use it from any directory, run `uv run python scripts/install_skill.py` in the repository root (add `--check` first to see what it will install).
+It installs the skill to `%USERPROFILE%\.claude\skills\multipub` and rewrites commands that assume the repository root, such as `uv run mpub` and `uv run python .claude/skills/multipub/scripts/...`,
+to include the repository path. After updating the repository (`git pull`), run it again.
+Your own style guides, work-directory conventions, cover tools, collection tables and so on can be added to that global copy; see "本机适配" in SKILL.md for where to put them so reinstalling keeps them.
+For the manual way without the script, see "全局安装" in SKILL.md.
 
 ## Development
 

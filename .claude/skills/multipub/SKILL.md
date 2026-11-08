@@ -178,9 +178,15 @@ uv run mpub publish posts/<名字> --yes --json
 
 ## 本机适配（可选）
 
-本 skill 只写通用的部分。各人的环境不同，下面这些适合在自己的**全局 skill**（复制到用户目录的那一份，见下节）里补充，
-补充的文件放进 `references/` 或 `scripts/`，并在 SKILL.md 末尾记一段「本机安装说明」，列出本机加了哪些文件、哪些段落，
-仓库更新、重新复制 SKILL.md 后照着补回去（本机加的文件不会被覆盖）。
+本 skill 只写通用的部分。各人的环境不同，下面这些适合在自己的**全局 skill**（装到用户目录的那一份，见下节）里补充。
+用 `scripts/install_skill.py` 安装时，本机内容这样放，仓库更新后重新运行脚本会自动补回去：
+
+- 新的文件（如 `references/my-notes.md`、自己的脚本）直接放进全局 skill 目录：仓库里没有的文件脚本一律不碰；
+- 要接在 SKILL.md 末尾的段落写进 `local/SKILL.local.md`（第一个标题会在开头的说明里被引用）；
+- 要加进 description 的触发说明写进 `local/description.txt`（插在「Use when」之前）；
+- 要改仓库文档里的某句话（比如换成指向本机文件的链接），写进 `local/replacements.json`：`[["仓库里的原文", "换成"], ...]`。
+
+不要直接改从仓库装过来的文件：脚本会发现并拒绝覆盖，但改动也就卡在那里了。
 
 | 可以适配的 | 写什么 | 用在哪一步 |
 |---|---|---|
@@ -193,11 +199,27 @@ uv run mpub publish posts/<名字> --yes --json
 | 声明习惯 | 常用的内容标注（仍要每次请用户确认，铁律 4） | prepare.md 第 4 步 |
 | 从一个视频出发 | 只给视频路径时：转写（whisper 等，注意 GPU / 解释器路径）、抽帧、推章节，再接 prepare.md | prepare.md 开头 |
 | B站分区表 | 从创作中心刷新的 tid 列表缓存 | prepare.md 第 3 步 |
-| 命令写法 | 全局使用时把 `uv run mpub`、`uv run python .claude/...` 换成带仓库路径的写法 | 全篇 |
+| 命令写法 | 全局使用时把 `uv run mpub`、`uv run python .claude/...` 换成带仓库路径的写法（`install_skill.py` 自动换，手动安装见下节） | 全篇 |
 
 ## 全局安装（在任何目录使用）
 
-把本目录复制到用户级 skills 目录：
+本 skill 里的命令默认当前目录是仓库根目录，全局使用时当前目录是你的作品目录，所以不能原样复制。在仓库根目录运行：
+
+```powershell
+uv run python scripts/install_skill.py --check   # 先看会装哪些文件
+uv run python scripts/install_skill.py           # 装到 %USERPROFILE%\.claude\skills\multipub（--dest 可换目录）
+```
+
+脚本按自己所在的位置找到仓库，复制本目录，并把命令换成带仓库路径的写法（见下面「手动安装」）；
+再按上一节补回 `local/` 里的本机内容，并在 `local/.installed.json` 记下装了什么。仓库更新（`git pull`）后重新运行即可：
+
+- 装过之后被手改过的文件、和目标目录里已有的同名文件不会被覆盖，会列出来，退出码 1（确认不要那些改动后加 `--force`）；
+- 仓库里删掉的文件，没改过的会一起删掉；
+- 第一次装到以前手动复制的目录时，内容不同的文件都会被当成冲突，核对后加 `--force`。
+
+### 手动安装
+
+不用脚本的话，把本目录复制到用户级 skills 目录：
 
 ```powershell
 Copy-Item -Recurse .claude\skills\multipub "$env:USERPROFILE\.claude\skills\multipub"
@@ -223,6 +245,7 @@ Copy-Item -Recurse .claude\skills\multipub "$env:USERPROFILE\.claude\skills\mult
    脚本要用 multipub 的环境（它调用 multipub 的知乎解析器），所以同样要带 `--project`。
 
 `--project` 只指定用哪个项目的环境，不改变当前目录，所以 post.yaml 和清单里的相对路径仍按当前目录（作品目录）解析。
-换完可以搜一下复制出来的目录里还有没有 `uv run mpub`、`uv run python .claude` 没换到。
+换完可以搜一下复制出来的目录里还有没有 `uv run mpub`、`uv run python .claude` 没换到；
+文档里指向 `docs/` 的路径同样是相对仓库根目录的，需要时也换成绝对路径。
 
-仓库更新（`git pull`）后要重新复制、重新替换；自己补的本机内容按上一节「本机适配」补回去。
+手动安装的话，仓库更新（`git pull`）后要重新复制、重新替换，自己补的本机内容也要自己补回去。
