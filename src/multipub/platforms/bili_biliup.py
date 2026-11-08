@@ -420,10 +420,13 @@ def creation_statement_for(options: dict[str, Any], ai_generated: bool) -> int |
     return 1 if ai_generated else None
 
 
-def build_upload_args(exe: Path, cookie_file: Path, post: Any, *, rust_log: bool = True) -> list[str]:
+def build_upload_args(exe: Path, cookie_file: Path, post: Any, *, rust_log: bool = True,
+                      cover43_url: str | None = None) -> list[str]:
     """拼 `biliup -u <file> upload ...`。字符串一律用 --opt=value，避免值以 - 开头被误解析。
 
-    rust_log=False：本机 biliup 太旧、不认识全局 --rust-log 时去掉它（见 bili_locate.supports_rust_log）。"""
+    rust_log=False：本机 biliup 太旧、不认识全局 --rust-log 时去掉它（见 bili_locate.supports_rust_log）。
+    cover43_url：已经传到 cover/up 的 4:3 封面地址。biliup 没有对应参数，放进 --extra-fields 的 cover43；
+    extra_fields 里自己写了 cover43 时以它为准（和 creation_statement 一样）。"""
     o = post.options
     title = post.title.strip()
     desc = post.body.strip() or title  # B站简介不能为空：没写就用标题
@@ -449,6 +452,8 @@ def build_upload_args(exe: Path, cookie_file: Path, post: Any, *, rust_log: bool
     statement = creation_statement_for(o, post.ai_generated)
     if statement is not None and "creation_statement" not in extra:
         extra["creation_statement"] = {"id": statement}
+    if cover43_url and "cover43" not in extra:
+        extra["cover43"] = cover43_url
     if extra:
         args.append("--extra-fields=" + json.dumps(extra, ensure_ascii=False, separators=(",", ":")))
     if o.get("line"):

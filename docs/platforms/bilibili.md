@@ -43,6 +43,7 @@
 上面 5 个开关**必须是 YAML 布尔值** `true` / `false`（不写或 `null` 等于 false）。`"false"`、`"no"`、`0`、`1`
 这类字符串或数字会在 validate 时报 error，不会被当成 true（否则 `is_only_self: "false"` 会把视频发成仅自己可见）。
 | `collection` | 无 | 投稿成功后立即加入已有合集（合集名精确匹配；合集有多个小节时加入第一个）。审核中就能加入，不用等过审；找不到合集或加入失败只告警，照常投稿。见下文「加入合集」 |
+| `cover43` | 无 | 首页推荐流的 **4:3 封面**（jpg/png，路径相对 post.yaml）。上传视频前用登录态传到 `member.bilibili.com/x/vu/web/cover/up`（biliup 传 `--cover` 用的同一个接口），拿到的地址经 `--extra-fields '{"cover43":"<地址>"}'` 提交（biliup 没有对应参数）。不填时 B站从 `cover` 裁。传失败只告警、照常投稿；`extra_fields` 里自己写了 `cover43` 时以它为准，不上传这张图。见下文「封面」 |
 | `extra_fields` | 无 | 映射，原样 JSON 合并进投稿参数 → `--extra-fields`（高级用法） |
 | `line` | 自动探测 | 上传线路：`bldsa cnbldsa andsa atdsa bda2 cnbd anbd atbd tx cntx antx attx txa alia estx akbd` → `--line` |
 | `limit` | 3（biliup 默认） | 单文件并发分片数 → `--limit` |
@@ -50,6 +51,27 @@
 
 其他映射：`title` → `--title`；`body` → `--desc`（**为空时用标题**，B站要求简介非空）；`tags` → `--tag a,b`；
 `cover` → `--cover`；`schedule` → `--dtime <本地时间转成的 epoch 秒>`。
+
+#### 封面：`cover` 传 16:9，`cover43` 传 4:3
+
+B站投稿参数里有两个封面字段：`cover` 是 **16:9 主封面**（稿件页、个人空间、搜索结果），`cover43` 是**首页推荐流的 4:3 封面**，
+空着时 B站从 `cover` 裁。所以清单这样写：
+
+```yaml
+platforms:
+  bilibili:
+    cover: cover_16x9.jpg      # 1920×1080
+    cover43: cover_4x3.jpg     # 1440×1080
+```
+
+validate 会检查：`cover43` 文件存在、只能 jpg/png；`cover` 宽高比不是约 16:9、`cover43` 不是约 4:3 时给 warning（误差 3% 以内不报）；
+设了 `cover43` 却没有 `cover` 时给 warning。
+
+依据（2026-11-08 查证）：biliup v1.3.1 源码 `crates/biliup/src/uploader/bilibili.rs` 的 `Studio` 只有 `cover`，另有
+`#[serde(flatten)] extra_fields`，`cover_up()` 调 `x/vu/web/cover/up`（表单 `cover=data:image/jpeg;base64,…` + `csrf`，返回 `data.url`）；
+Xinrea/bili-shadowreplay 投稿时两张图都先传 `cover/up` 拿地址，再把 4:3 那张填进 `cover43`。
+实测：以前把 4:3 图当 `cover` 传上去，`x/vupre/web/archive/view` 里 `cover` 是那张 4:3 图、`cover43` 为空。
+`cover43` 本身**还没有在真实投稿里核对**。
 
 ```yaml
 platforms:
@@ -165,6 +187,10 @@ platforms:
 | `line` / `submit` / `limit` | 见上表取值；`limit` 1–64 | error |
 | 视频格式 | `.mp4 .flv .avi .wmv .mov .webm .mpeg .mpg .mkv .m4v .ts .rm .rmvb .3gp` 以外 | warning |
 | 封面 | 只能 jpg/png；>5MB | error / warning |
+| `cover` / `cover43` 宽高比 | `cover` 不是约 16:9、`cover43` 不是约 4:3（误差 > 3%） | warning |
+| `cover43` | 文件不存在、不是 jpg/png | error |
+| `cover43` 与 `extra_fields.cover43` 同时写 | 以 `extra_fields` 为准，不上传图片 | warning |
+| 设了 `cover43`、没有 `cover` | 主封面会由B站从视频里截取 | warning |
 | 视频定时 | 晚于现在 ≥2 小时、≤15 天；不足 2.5 小时给 warning（上传耗时会吃掉余量） | error / warning |
 | 动态标题 | ≤20 字 | error |
 | 动态正文 | 正文 + 追加的 `#标签#` ≤1000 字（超过时网页会弹「转为专栏」） | error |
@@ -414,7 +440,7 @@ mpub login bilibili --account main
 
 下表各项大多**没有在真实账号上逐一核对**，置信度沿用调研时的判断。
 
-> **真实账号实测（2026-10-25）**：视频投稿在真实账号上走通过：biliup 上传、分区 `tid`、自制 `copyright: 1`、创作声明 `creation_statement`、4:3 封面、投稿成功并过审；过审后用 `biliup season add` 加入合集成功。
+> **真实账号实测（2026-10-25）**：视频投稿在真实账号上走通过：biliup 上传、分区 `tid`、自制 `copyright: 1`、创作声明 `creation_statement`、封面（当时把 4:3 图当 `cover` 传，见上文「封面」）、投稿成功并过审；过审后用 `biliup season add` 加入合集成功。
 > **真实账号实测（2026-10-26）**：审核中（state -30）的稿件，用创作中心接口 `/x/vupre/web/archive/view` 取到 cid，调 `episodes/add` 加入合集成功，合集里显示为待审核（公开接口同一时刻返回 -404，这正是 `biliup season add` 在审核中失败的原因）；APP 投稿接口带 `season_id` 不会自动加入合集。
 > **真实账号实测（2026-10-26，`collection`）**：清单写 `collection: <已有合集名>`，`mpub publish` 结果为「投稿成功，等待B站审核；已加入合集「…」」，投稿后约 3 秒完成；随后独立核对：稿件审核中（state -30），`season/aid` 返回该合集，小节稿件列表里有这条（状态 -30）。
 > 声明在创作中心显示是否正确、动态（opus）发布没有在这次核对。
@@ -425,6 +451,7 @@ mpub login bilibili --account main
 | 项 | 选择器 / 接口 / 做法 | 置信度 |
 |---|---|---|
 | biliup v1.3.1 命令行参数 | `-u`、`--rust-log`、`upload --title --desc --tid --tid-v2 --tag --cover --dtime --copyright --source --dynamic --no-reprint --is-only-self --up-*-reply --up-close-danmu --extra-fields --line --limit --submit`、`renew`、`login`（对照 v1.3.1 源码 `cli.rs` / `Studio`） | 高 |
+| 4:3 封面 `cover43` | 先 `POST member.bilibili.com/x/vu/web/cover/up`（与 biliup `cover_up()` 相同）拿地址，再经 `--extra-fields` 提交 `cover43`（字段名来自 bili-shadowreplay；离线测试覆盖，**未在真实投稿里核对**） | 中 |
 | biliup 发布包文件名与 sha256 | 见上表（实际下载核对） | 高 |
 | biliup 能否启动 | `biliup --version` 输出 `biliup-cli 1.3.1`、退出码 0（Linux 版真实运行）；Windows 版 `biliup.exe` 导入表里有 `VCRUNTIME140.dll`（检查二进制得到）；缺 DLL 时退出码 0xC0000135 是 Windows 加载器的标准行为，未在干净 Windows 上实测 | 高 / 中高 |
 | 投稿成功输出 | target `biliup::uploader::bilibili` 的 tracing 日志 `ResponseData { code: 0, data: Some(Object {"aid": Number(..), "bvid": String("BV..")}) … }`、`APP接口投稿成功` / `Web 接口投稿成功` / `BCUT接口投稿成功`（据源码 `info!("{:?}", ret)` 与 tracing-subscriber 默认格式推断，未实际运行；时间戳取不到时是 `<unknown time>`） | 中 |
