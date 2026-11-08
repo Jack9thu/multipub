@@ -1169,6 +1169,7 @@ class FakeBili:
         self.episode_codes: list[int] = []
         self.section_aids: dict[int, list[int]] = {}  # 小节 id → 稿件 aid（episodes/add 成功时加入）
         self.add_takes_effect = True
+        self.cover_response: httpx.Response | None = None
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -1196,6 +1197,9 @@ class FakeBili:
         if path == "/x/dynamic/feed/create/dyn":
             return self.create_response or httpx.Response(200, json={"code": 0, "data": {
                 "dyn_id": 1, "dyn_id_str": "1234567890123456789", "dyn_type": 2}})
+        if path == "/x/vu/web/cover/up":
+            return self.cover_response or httpx.Response(200, json={"code": 0, "data": {
+                "url": "http://i0.hdslb.com/bfs/archive/cover43.jpg"}})
         if path == "/x2/creative/web/seasons":
             return httpx.Response(200, json={"code": 0, "data": {"seasons": self.seasons, "total": len(self.seasons)}})
         if path == "/x/vupre/web/archive/view":
@@ -2085,3 +2089,130 @@ async def test_publish_video_collection_join_failure_keeps_result(video_env, med
     assert "加入合集「科技小课堂」失败" in result.message
     assert "biliup season add 11 --vid BV1Ab4y1C7xY" in result.message
     assert any("2 个小节，加入第一个「正片」" in e.get("message", "") for e in events)
+
+
+# ------------------------------------------------------------------ 4:3 首页推荐封面（cover43）
+
+def cover43_post(media: Path, size: tuple[int, int] = (1440, 1080), **opts: Any) -> PlatformPost:
+    from PIL import Image
+
+    Image.new("RGB", size, (1, 2, 3)).save(media / "cover43.jpg", "JPEG")
+    return video_post(media, source=str(media / "post.yaml"), options={"tid": 231, "cover43": "cover43.jpg", **opts})
+
+
+def test_validate_video_cover43(media: Path):
+    """cover43 相对 post.yaml 解析；文件、格式、比例、和 extra_fields 冲突都要提示。"""
+    from multipub.platforms.bilibili import option_path
+
+    post = cover43_post(media)
+    assert option_path(post, "cover43") == (media / "cover43.jpg").resolve()
+    issues = BilibiliAdapter.validate(post)
+    assert not errors_of(issues) and not warnings_of(issues)  # 1280×720 主封面 + 1440×1080 cover43
+
+    src = str(media / "post.yaml")
+    for bad in ("nope.jpg", "a.gif", 43):
+        post = video_post(media, source=src, options={"tid": 231, "cover43": bad})
+        assert "platforms.bilibili.cover43" in errors_of(BilibiliAdapter.validate(post))
+
+    assert "platforms.bilibili.cover43" in warnings_of(BilibiliAdapter.validate(cover43_post(media, (1280, 720))))
+    both = cover43_post(media, extra_fields={"cover43": "http://i0.hdslb.com/bfs/archive/x.jpg"})
+    assert "platforms.bilibili.cover43" in warnings_of(BilibiliAdapter.validate(both))
+    no_main = cover43_post(media)
+    no_main.cover = None
+    assert "cover" in warnings_of(BilibiliAdapter.validate(no_main))
+    # 主封面传成 4:3（以前文档的写法）要提醒
+    four_three = video_post(media, cover=media / "images" / "3.jpg")
+    assert "cover" in warnings_of(BilibiliAdapter.validate(four_three))
+    assert "platforms.bilibili.cover43" in warnings_of(
+        BilibiliAdapter.validate(note_post(media, options={"cover43": "cover43.jpg"})))
+
+
+def test_manifest_keeps_cover43_as_text(media: Path):
+    from multipub.manifest import load_manifest
+
+    (media / "post.yaml").write_text("kind: video\ntitle: t\ntags: [a]\nvideo: video.mp4\n"
+                                     "platforms:\n  bilibili:\n    tid: 231\n    cover43: 2026\n", encoding="utf-8")
+    assert load_manifest(media / "post.yaml").for_platform("bilibili").options["cover43"] == "2026"
+
+
+def test_build_upload_args_cover43(media: Path):
+    url = "http://i0.hdslb.com/bfs/archive/cover43.jpg"
+    args = bb.build_upload_args(Path("biliup"), Path("c.json"), video_post(media), cover43_url=url)
+    extra = next(a for a in args if a.startswith("--extra-fields="))
+    assert json.loads(extra.split("=", 1)[1]) == {"cover43": url}
+    assert f"--cover={media / 'cover.jpg'}" in args  # 16:9 主封面照常交给 biliup
+    # extra_fields 里自己写的 cover43 优先
+    mine = video_post(media, options={"tid": 231, "extra_fields": {"cover43": "http://mine.jpg"}})
+    extra = next(a for a in bb.build_upload_args(Path("biliup"), Path("c.json"), mine, cover43_url=url)
+                 if a.startswith("--extra-fields="))
+    assert json.loads(extra.split("=", 1)[1]) == {"cover43": "http://mine.jpg"}
+
+
+async def test_upload_cover_request_shape(fake_bili, media: Path):
+    import base64
+
+    async with bh.make_client({"SESSDATA": "s"}, referer=bh.COVER_UP_REFERER) as client:
+        url = await bh.upload_cover(client, media / "cover.jpg", "csrf123", account="main")
+    assert url == "http://i0.hdslb.com/bfs/archive/cover43.jpg"
+    req = fake_bili.by_path("/x/vu/web/cover/up")[0]
+    assert req.url.host == "member.bilibili.com" and req.method == "POST"
+    form = urllib.parse.parse_qs(req.content.decode())
+    assert form["csrf"] == ["csrf123"]
+    assert form["cover"][0] == "data:image/jpeg;base64," + base64.b64encode((media / "cover.jpg").read_bytes()).decode()
+
+    fake_bili.cover_response = httpx.Response(200, json={"code": -101, "message": "账号未登录"})
+    async with bh.make_client({}) as client:
+        with pytest.raises(LoginRequired):
+            await bh.upload_cover(client, media / "cover.jpg", "c", account="main")
+    fake_bili.cover_response = httpx.Response(200, json={"code": 0, "data": {}})
+    async with bh.make_client({}) as client:
+        with pytest.raises(PublishError, match="没有返回地址"):
+            await bh.upload_cover(client, media / "cover.jpg", "c", account="main")
+
+
+async def test_publish_video_cover43(video_env, media: Path, monkeypatch, fake_bili):
+    """上传前（未标记投稿）先传 4:3 封面，地址进 --extra-fields 的 cover43；cover 仍是 16:9 那张。"""
+    calls: list[Any] = []
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, calls))
+    ctx, events = make_ctx(video_env)
+    fake_bili.ctx = ctx
+    result = await BilibiliAdapter(ctx).publish(cover43_post(media))
+    assert result.status is Status.SUBMITTED and result.message == "投稿成功，等待B站审核"
+    assert fake_bili.marks["/x/vu/web/cover/up"] is False
+    req = fake_bili.by_path("/x/vu/web/cover/up")[0]
+    assert "SESSDATA=sess%2Cabc" in req.headers["cookie"]
+    assert urllib.parse.parse_qs(req.content.decode())["csrf"] == ["csrf123"]
+    args = calls[0]
+    assert f"--cover={media / 'cover.jpg'}" in args
+    extra = next(a for a in args if a.startswith("--extra-fields="))
+    assert json.loads(extra.split("=", 1)[1]) == {"cover43": "http://i0.hdslb.com/bfs/archive/cover43.jpg"}
+
+
+async def test_publish_video_cover43_extra_fields_wins(video_env, media: Path, monkeypatch, fake_bili):
+    calls: list[Any] = []
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, calls))
+    ctx, events = make_ctx(video_env)
+    post = cover43_post(media, extra_fields={"cover43": "http://i0.hdslb.com/bfs/archive/mine.jpg"})
+    await BilibiliAdapter(ctx).publish(post)
+    assert not fake_bili.by_path("/x/vu/web/cover/up")
+    extra = next(a for a in calls[0] if a.startswith("--extra-fields="))
+    assert json.loads(extra.split("=", 1)[1]) == {"cover43": "http://i0.hdslb.com/bfs/archive/mine.jpg"}
+    assert any("以它为准" in e.get("message", "") for e in events)
+
+
+async def test_publish_video_cover43_upload_failure_still_publishes(video_env, media: Path, monkeypatch, fake_bili):
+    """4:3 封面传失败：照常投稿（B站从 cover 裁），结果里说明；登录失效则在上传视频前就报。"""
+    calls: list[Any] = []
+    monkeypatch.setattr(bb, "run_streaming", fake_run(SUCCESS_LINES, 0, calls))
+    fake_bili.cover_response = httpx.Response(200, json={"code": 21001, "message": "图片格式不正确"})
+    ctx, _ = make_ctx(video_env)
+    result = await BilibiliAdapter(ctx).publish(cover43_post(media))
+    assert result.status is Status.SUBMITTED and "4:3 封面没传上" in result.message and "21001" in result.message
+    assert not any(a.startswith("--extra-fields=") for a in calls[0])
+
+    calls.clear()
+    fake_bili.cover_response = httpx.Response(200, json={"code": -101, "message": "账号未登录"})
+    ctx, _ = make_ctx(video_env)
+    with pytest.raises(LoginRequired):
+        await BilibiliAdapter(ctx).publish(cover43_post(media))
+    assert not calls and not ctx.submit_started

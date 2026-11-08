@@ -35,6 +35,9 @@ CREATE_DYN_URL = f"{API}/x/dynamic/feed/create/dyn"
 TV_AUTH_CODE_URL = "https://passport.bilibili.com/x/passport-tv-login/qrcode/auth_code"
 TV_POLL_URL = "https://passport.bilibili.com/x/passport-tv-login/qrcode/poll"
 OAUTH_INFO_URL = "https://passport.bilibili.com/x/passport-login/oauth2/info"
+# 视频封面图床：biliup 传 --cover 用的也是它（v1.3.1 bilibili.rs cover_up）
+COVER_UP_URL = "https://member.bilibili.com/x/vu/web/cover/up"
+COVER_UP_REFERER = "https://member.bilibili.com/platform/upload/video/frame"
 
 # 云视听小电视（TV 端）appkey，与 biliup 的扫码登录一致；拿到的 token 能被 biliup 直接使用
 TV_APPKEY = "4409e2ce8ffd12b8"
@@ -321,6 +324,20 @@ async def upload_image(client: httpx.AsyncClient, path: Path, csrf: str, *, acco
     if "ai_gen_pic" in d:
         pic["ai_gen_pic"] = d["ai_gen_pic"]
     return pic
+
+
+async def upload_cover(client: httpx.AsyncClient, path: Path, csrf: str, *, account: str) -> str:
+    """传一张视频封面，返回图片地址（投稿参数 cover / cover43 填的就是它）。
+
+    请求和 biliup 的 cover_up 一样：表单 cover=data:image/jpeg;base64,...（png 也这样写，biliup 一直如此）+ csrf。"""
+    what = f"上传封面「{path.name}」"
+    form = {"cover": "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode("ascii"), "csrf": csrf}
+    data = await request_json(client, "POST", COVER_UP_URL, data=form, what=what, timeout=60)
+    raise_for_code(data, what=what, account=account)
+    url = (data.get("data") or {}).get("url")
+    if not isinstance(url, str) or not url:
+        raise PublishError(f"{what}没有返回地址", retryable=True)
+    return url
 
 
 async def submit_check(client: httpx.AsyncClient, dyn_req: dict[str, Any], csrf: str, *, account: str) -> None:

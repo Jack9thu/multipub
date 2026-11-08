@@ -90,7 +90,7 @@ platforms:
 
 ## 路径
 
-- `video` `cover` `images` `body_file` 以及抖音的 `thumbnail_portrait` / `thumbnail_landscape`：
+- `video` `cover` `images` `body_file` 以及抖音的 `thumbnail_portrait` / `thumbnail_landscape`、B站的 `cover43`：
   相对路径按 **post.yaml 所在目录** 解析；支持绝对路径和 `~`。
 - Windows 路径在 YAML 里请用单引号或正斜杠：`'D:\素材\第12期.mp4'` 或 `D:/素材/第12期.mp4`。
   双引号里的反斜杠是转义符，要写成 `"D:\\素材\\第12期.mp4"`。中文和空格都没问题。
@@ -124,7 +124,8 @@ platforms:
 | `is_only_self` | `false` | 仅自己可见 |
 | `selection_reply` / `close_reply` / `close_danmu` | `false` | 精选评论 / 关闭评论 / 关闭弹幕 |
 | `collection` | 无 | 投稿成功后立即加入已有合集（名称精确匹配；审核中就能加入；找不到或加不进只告警，照常投稿） |
-| `extra_fields` | 无 | 映射，原样合并进投稿参数（高级用法） |
+| `cover43` | 无 | 首页推荐的 4:3 封面（jpg/png，路径相对 post.yaml），上传前传到B站图床后提交；不填时 B站从 `cover` 裁。`cover` 是 16:9 主封面 |
+| `extra_fields` | 无 | 映射，原样合并进投稿参数（高级用法）；写了 `cover43` 时优先于上面的 `cover43` |
 | `line` | 自动 | 上传线路：`bldsa cnbldsa andsa atdsa bda2 cnbd anbd atbd tx cntx antx attx txa alia estx akbd` |
 | `limit` | 3 | 单文件并发分片数（1–64） |
 | `submit` | `app` | 投稿接口：`app` / `web` / `b-cut-android` |
@@ -179,7 +180,7 @@ platforms:
 
 | 平台 | 发成 | 字段怎么用 |
 |---|---|---|
-| B站 | 视频投稿（biliup） | `title` 必填 ≤80；`body` → 简介 ≤2000（为空用标题）；`tags` 1–12 个、每个 ≤20 字、不能含逗号；`cover` jpg/png；`schedule` 晚于现在 2 小时~15 天；`ai_generated` → `creation_statement: 1` |
+| B站 | 视频投稿（biliup） | `title` 必填 ≤80；`body` → 简介 ≤2000（为空用标题）；`tags` 1–12 个、每个 ≤20 字、不能含逗号；`cover` → 16:9 主封面、`cover43` → 4:3 首页推荐封面，jpg/png；`schedule` 晚于现在 2 小时~15 天；`ai_generated` → `creation_statement: 1` |
 | 抖音 | 视频 | `title` 必填 ≤30；`body` → 作品描述（>1000 字警告）；`tags` → 话题（>5 个警告）；`cover` → 横/竖封面；`schedule` 晚于现在 2 小时以上（>14 天警告）；`ai_generated` → 自主声明「内容由AI生成」（`declaration` 优先） |
 | 小红书 | 视频笔记 | `title` 必填 ≤20；`body` ≤1000；`tags` ≤10 个话题；`cover` → 封面；`schedule` 晚于现在 2 小时以上；`ai_generated` → 尽力选「笔记含AI合成内容」（选不上只告警，仍发布；`declaration` 优先，选不上拒绝发布） |
 | 知乎 | ✘ | 暂不支持视频 |

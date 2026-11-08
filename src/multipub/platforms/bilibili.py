@@ -38,6 +38,8 @@ VIDEO_EXTS = {".mp4", ".flv", ".avi", ".wmv", ".mov", ".webm", ".mpeg", ".mpg", 
               ".m4v", ".ts", ".rm", ".rmvb", ".3gp"}
 COVER_EXTS = {".jpg", ".jpeg", ".png"}
 COVER_BYTES_WARN = 5 * 1024 * 1024
+# cover 是 16:9 主封面，cover43 是首页推荐流的 4:3 封面（不填时 B站从 cover 裁）；宽高比差这么多以内算对
+COVER_RATIO_TOLERANCE = 0.03
 CREATION_STATEMENTS = {-1, 1, 2, 3, 4}
 
 # ---- 图文（动态）限制，来自线上发布器配置：标题 20、正文 1000、9 张图、单张 20MB、定时 5 分钟~7 天
@@ -54,7 +56,7 @@ NOTE_MODES = ("browser", "http")
 
 VIDEO_OPTIONS = frozenset({"tid", "tid_v2", "copyright", "source", "dynamic", "no_reprint", "is_only_self",
                            "selection_reply", "close_reply", "close_danmu", "creation_statement",
-                           "extra_fields", "line", "limit", "submit", "collection"})
+                           "extra_fields", "line", "limit", "submit", "collection", "cover43"})
 NOTE_OPTIONS = frozenset({"mode", "pic_mode", "tags_in_text", "confirm_rules"})
 # config.toml [platforms.bilibili] 里的同意项：允许 multipub 代为确认《动态发布规范》
 CONFIRM_RULES_CONFIG = "confirm_dynamic_rules"
@@ -68,6 +70,7 @@ VIDEO_MIN_BUDGET = 60
 TOKEN_PRECHECK_TIMEOUT = 10  # 上传前的令牌预检（每个网络阶段；整体最多两倍）
 COLLECTION_LOOKUP_TIMEOUT = 20  # 上传前按名称查合集
 COLLECTION_JOIN_MAX = 60  # 投稿后加入合集最多用这么久（还受本次任务剩余时间限制）
+COVER43_UPLOAD_TIMEOUT = 30  # 上传前把 4:3 封面传到 cover/up
 
 
 def _login_hint(account: str) -> str:
@@ -82,6 +85,37 @@ def _as_int(value: Any) -> int | None:
     if isinstance(value, str) and value.strip().lstrip("-").isdigit():
         return int(value.strip())
     return None
+
+
+def option_path(post: PlatformPost, key: str) -> Path | None:
+    """平台私有参数里的文件路径：相对于 post.yaml 所在目录（与抖音的 thumbnail_* 相同）。"""
+    value = post.options.get(key)
+    if value in (None, "", False):
+        return None
+    p = Path(str(value)).expanduser()
+    if p.is_absolute():
+        return p
+    base = Path(post.source).parent if post.source else Path.cwd()
+    return (base / p).resolve()
+
+
+def _aspect(path: Path) -> float | None:
+    """图片宽高比；读不出来（不是图片、文件坏了）返回 None，交给 B站判断。"""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            w, h = im.size
+    except Exception:  # noqa: BLE001 - 只用于告警
+        return None
+    return w / h if h else None
+
+
+def _ratio_off(path: Path, target: float) -> float | None:
+    ratio = _aspect(path)
+    if ratio is None or abs(ratio - target) / target <= COVER_RATIO_TOLERANCE:
+        return None
+    return ratio
 
 
 def note_text(post: PlatformPost) -> str:
@@ -235,6 +269,10 @@ class BilibiliAdapter(PlatformAdapter):
                 err("cover", "B站封面只支持 jpg / png")
             elif post.cover.is_file() and post.cover.stat().st_size > COVER_BYTES_WARN:
                 warn("cover", "封面超过 5MB，可能被拒")
+            elif post.cover.is_file() and (r := _ratio_off(post.cover, 16 / 9)) is not None:
+                warn("cover", f"cover 是 16:9 主封面，这张宽高比约 {r:.2f}，B站会裁剪；"
+                              "首页推荐的 4:3 封面写在 platforms.bilibili.cover43")
+        BilibiliAdapter._validate_cover43(post, err, warn)
         if post.schedule is not None:
             delta = post.schedule - datetime.now()
             if delta < VIDEO_SCHEDULE_MIN:
@@ -243,6 +281,33 @@ class BilibiliAdapter(PlatformAdapter):
                 err("schedule", "B站定时投稿最多提前 15 天")
             elif delta < VIDEO_SCHEDULE_SAFE:
                 warn("schedule", "距现在不到 2.5 小时：上传耗时可能让投稿时不足 2 小时而被拒")
+
+    @staticmethod
+    def _validate_cover43(post: PlatformPost, err: Callable[[str, str], None],
+                          warn: Callable[[str, str], None]) -> None:
+        o = post.options
+        raw = o.get("cover43")
+        if raw in (None, ""):
+            return
+        field = "platforms.bilibili.cover43"
+        if not isinstance(raw, str):
+            err(field, f"应为 4:3 封面图片的路径（字符串），收到 {raw!r}")
+            return
+        path = option_path(post, "cover43")
+        assert path is not None
+        if path.suffix.lower() not in COVER_EXTS:
+            err(field, "B站封面只支持 jpg / png")
+        elif not path.is_file():
+            err(field, f"文件不存在: {path}")
+        elif path.stat().st_size > COVER_BYTES_WARN:
+            warn(field, "封面超过 5MB，可能被拒")
+        elif (r := _ratio_off(path, 4 / 3)) is not None:
+            warn(field, f"cover43 是首页推荐的 4:3 封面，这张宽高比约 {r:.2f}，B站会裁剪")
+        extra = o.get("extra_fields")
+        if isinstance(extra, dict) and "cover43" in extra:
+            warn(field, "extra_fields 里也写了 cover43：以 extra_fields 为准，这张图不会上传")
+        if post.cover is None:
+            warn("cover", "设了 cover43 却没有 cover（16:9 主封面），主封面会由B站从视频里截取")
 
     @staticmethod
     def _validate_note(post: PlatformPost, err: Callable[[str, str], None],
@@ -475,8 +540,10 @@ class BilibiliAdapter(PlatformAdapter):
         except (PublishError, asyncio.TimeoutError) as exc:  # 网络 / 风控：交给 biliup 自己校验
             self.ctx.log(f"预先校验登录令牌失败（{str(exc) or '超时'}），交给 biliup 处理", level="warning")
         section = await self._lookup_collection(post, cred)
+        cover43_url, cover43_note = await self._upload_cover43(post, cred)
         rust_log = await asyncio.to_thread(bili_locate.supports_rust_log, exe)
-        args = bili_biliup.build_upload_args(exe, self.account_file, post, rust_log=rust_log)
+        args = bili_biliup.build_upload_args(exe, self.account_file, post, rust_log=rust_log,
+                                             cover43_url=cover43_url)
         missing = await asyncio.to_thread(bili_locate.unsupported_flags, exe, args)
         if missing:
             raise PublishError(f"当前 biliup（{res.detail}）不支持参数 {', '.join(missing)}；没有启动上传（尚未投稿）。"
@@ -505,9 +572,37 @@ class BilibiliAdapter(PlatformAdapter):
         if outcome.uploaded or outcome.submitted or outcome.response_code is not None or rc == 0:
             self.ctx.mark_submit_started()  # 兜底：只有「确定没传完就失败了」才保持未投稿
         result = self._video_result(post, outcome, timeout)
+        result.message += cover43_note
         if section is not None and outcome.submitted:
             result.message += await self._join_collection(post, section, outcome)
         return result
+
+    async def _upload_cover43(self, post: PlatformPost, cred: Any) -> tuple[str | None, str]:
+        """上传前把 4:3 封面传到 cover/up（与 biliup 传 cover 用同一个接口），返回 (图片地址, 追加到结果里的话)。
+
+        extra_fields 里自己写了 cover43 时以它为准、不上传；上传失败只告警，照常投稿（B站会从 cover 裁）。"""
+        from . import bili_http
+
+        path = option_path(post, "cover43")
+        if path is None:
+            return None, ""
+        extra = post.options.get("extra_fields") or {}
+        if "cover43" in extra:
+            self.ctx.log("extra_fields 里写了 cover43，以它为准，不上传 platforms.bilibili.cover43 的图片",
+                         level="warning")
+            return None, ""
+        try:
+            async with bili_http.make_client(cred.cookie_dict, referer=bili_http.COVER_UP_REFERER) as client:
+                url = await asyncio.wait_for(
+                    bili_http.upload_cover(client, path, cred.csrf, account=self.ctx.account), COVER43_UPLOAD_TIMEOUT)
+        except LoginRequired:
+            raise
+        except (PublishError, asyncio.TimeoutError) as exc:
+            reason = str(exc) or "超时"
+            self.ctx.log(f"4:3 封面上传失败（{reason}），照常投稿，首页推荐封面由B站从 cover 裁", level="warning")
+            return None, f"；4:3 封面没传上（{reason}），首页推荐封面由B站从 cover 裁，可到创作中心手动换"
+        self.ctx.log("4:3 封面已上传，投稿时填进 cover43")
+        return url, ""
 
     async def _lookup_collection(self, post: PlatformPost, cred: Any) -> Any:
         """上传前按名称查合集（只读）。找不到 / 查询失败只告警，照常投稿，不加入合集。"""

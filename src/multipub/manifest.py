@@ -105,7 +105,7 @@ TEXT_KEYS = frozenset({
     "title", "body", "body_file", "tags", "video", "cover", "images", "account",
     # 平台私有的文字参数
     "dynamic", "source", "collection", "product_title", "repost_source", "bgm",
-    "thumbnail_portrait", "thumbnail_landscape",
+    "thumbnail_portrait", "thumbnail_landscape", "cover43",
 })
 
 
